@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from . import format as fmt
-from . import intake, rules
+from . import info, intake, rules
 from .config import COUNT_EMPLOYEE_ID
 from .errors import ApiError, LightspeedError, WriteRefused
 from .reader import InventoryReader, batches, id_filter, relations
@@ -2710,3 +2710,104 @@ class InventoryWriter:
             return Plan("adjust_stock", summary, requests, warnings, after, basis={"shop": shop, "stock": read})
 
         return self._run("adjust_stock", dry_run, confirm_code, build)
+
+    # ---- 26. tags on items ------------------------------------------------------------------------------
+    # Tags hold what a category can't: fabric, finish, construction ("wool", "super-150s", "non-iron",
+    # "half-canvas"). Lightspeed's current Item docs list tags only as a relation (TagRelations) and
+    # show no way to write them; the request here is the older API's form, an item update with
+    # {"Tags": {"tag": [...]}} holding the item's whole tag list. Sending the whole list (tags kept +
+    # added) gives the same result whether Lightspeed replaces the list or adds to it. Unconfirmed
+    # until a first write is checked: see NOTES.md.
+
+    TAG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+    @staticmethod
+    def _item_tags(item: dict) -> list[str]:
+        """An item's tags as read with load_relations Tags ({"tag": [...]}) or TagRelations."""
+        found: list[str] = []
+        legacy = item.get("Tags")
+        for tag in fmt.as_list(legacy.get("tag") if isinstance(legacy, dict) else None):
+            if fmt.text(tag) and fmt.text(tag) not in found:
+                found.append(fmt.text(tag))
+        linked = item.get("TagRelations")
+        for relation in fmt.as_list(linked.get("TagRelation") if isinstance(linked, dict) else None):
+            name = fmt.text(((relation or {}).get("Tag") or {}).get("name"))
+            if name and name not in found:
+                found.append(name)
+        return found
+
+    def _check_tag(self, tag) -> str:
+        """Store tags are lowercase words joined by hyphens, so 'Wool' and 'wool' never become two tags."""
+        text = rules.clean(tag)
+        if not self.TAG_PATTERN.fullmatch(text):
+            suggestion = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+            raise RuleViolation(f"Refused: tag '{tag}' should be lowercase words joined by hyphens"
+                                + (f", e.g. '{suggestion}'." if suggestion else "."))
+        return text
+
+    def _tags_confirmed(self) -> bool:
+        return any(e.get("tool") == "set_item_tags" and e.get("event") == "done"
+                   for e in self.writes.write_log.entries())
+
+    def set_item_tags(self, items: list[dict], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            first = not self._tags_confirmed()
+            limit = 1 if first else MAX_REQUESTS_PER_CALL
+            if len(items) > limit:
+                raise RuleViolation(
+                    f"Refused: {len(items)} items; the limit is {limit} per call"
+                    + (". Lightspeed's docs don't show how tags are written, so until a first tag write has been "
+                       "done and checked it is one item per call." if first else "."))
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            found: dict[str, dict] = {}
+            for batch in batches(sorted(set(ids), key=int)):
+                rows, _ = self.client.get_all("Item.json", {"itemID": id_filter(batch), "archived": "true",
+                                                            "load_relations": relations("Tags", "TagRelations")})
+                found.update({str(r.get("itemID")): r for r in rows})
+            requests, warnings = [], []
+            for entry, item_id in zip(items, ids):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                add = [self._check_tag(t) for t in entry.get("add") or []]
+                remove = [rules.clean(t).lower() for t in entry.get("remove") or []]
+                if set(add) & set(remove):
+                    raise RuleViolation(f"Refused: {item_label(item)}: a tag can't be added and removed at once.")
+                current = self._item_tags(item)
+                missing = [t for t in remove if t not in {c.lower() for c in current}]
+                if missing:
+                    raise RuleViolation(f"Refused: {item_label(item)} has no tag {', '.join(missing)} "
+                                        f"(its tags: {', '.join(current) or 'none'}).")
+                kept = [t for t in current if t.lower() not in remove]
+                new = kept + [t for t in add if t not in {k.lower() for k in kept}]
+                if new == current:
+                    raise RuleViolation(f"Refused: nothing to change on {item_label(item)}'s tags.")
+                changes = [f"+{t}" for t in new if t not in current] + [f"-{t}" for t in current if t not in new]
+                requests.append(PlannedRequest(f"{item_label(item)}: tags {', '.join(new) or '(none)'} "
+                                               f"({' '.join(changes)})", "PUT", f"Item/{item_id}.json",
+                                               {"Tags": {"tag": new}}, before={"itemID": item_id, "tags": current}))
+            warnings.append("Lightspeed's current docs don't show how tags are written; this uses the older API's "
+                            "form ({\"Tags\": {\"tag\": [...]}}, the item's whole tag list). If Lightspeed refuses it, "
+                            "nothing changes." if first else
+                            "Each item's whole tag list is sent: the tags it keeps and the new ones.")
+            scopes = info.token_summary(self.writes.tokens.store).get("scopes")
+            if isinstance(scopes, list) and scopes and "employee:tags" not in scopes:
+                warnings.append("This computer's Lightspeed login doesn't have the employee:tags permission yet, so "
+                                "Lightspeed may refuse it: re-run bootstrap.py first (server_info lists the login's "
+                                "permissions).")
+            summary = (f"Set the tags of {len(requests)} item(s) as listed. Only the tags are sent; the items' tags "
+                       "before are kept in the write log.")
+            after = None
+            if first:
+                after = ("This is the first tag write. Afterwards check the item (api_get Item/<id>.json with "
+                         "load_relations [\"Tags\",\"TagRelations\"]) to see that the tags are there.")
+            return Plan("set_item_tags", summary, requests, warnings, after,
+                        basis={"tags": {i: self._item_tags(found[i]) for i in ids}})
+
+        return self._run("set_item_tags", dry_run, confirm_code, build)

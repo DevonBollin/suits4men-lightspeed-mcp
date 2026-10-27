@@ -43,6 +43,7 @@ SCOPES = [
     "employee:register_read",    # sales history, for sell-through (read-only scope)
     "employee:special_orders",   # customer special orders
     "employee:vendor_returns",   # returns to vendors
+    "employee:tags",             # product tags (fabric, finish, construction) on items
 ]
 
 # The employee that inventory-count entries are recorded under (Lightspeed requires one per

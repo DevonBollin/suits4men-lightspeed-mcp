@@ -149,6 +149,8 @@ DELETE_CATEGORY = Route("DELETE", re.compile(r"Category/\d+\.json"), frozenset()
 # else. Lightspeed's Item update takes ItemShops; the ItemShop endpoint itself only takes reorder
 # settings. Only adjust_stock may send it (README, "Changing stock").
 ITEM_STOCK = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"ItemShops"}))
+# An item's whole tag list ({"Tags": {"tag": [...]}}), and nothing else.
+ITEM_TAGS = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"Tags"}))
 # A category's place in the tree: its new parent and the path that goes with it. Never its name.
 MOVE_CATEGORY = Route("PUT", re.compile(r"Category/\d+\.json"), frozenset({"parentID", "fullPathName"}))
 # Attribute sets (matrix types): a name and up to three attribute names. Never `archived` or `system`.
@@ -236,6 +238,7 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "set_upcs": (ITEM_UPC,),
     "move_category": (MOVE_CATEGORY,),
     "adjust_stock": (ITEM_STOCK,),
+    "set_item_tags": (ITEM_TAGS,),
 }
 
 
@@ -416,6 +419,11 @@ class WriteClient:
                     or str(rows[0]["itemShopID"]) == "0" or not re.fullmatch(r"-?\d+", str(rows[0]["qoh"])):
                 raise WriteBlockedError(f"{tool}: a stock change is exactly one stock row: its itemShopID and the new "
                                         "whole-number qoh.")
+        if "Tags" in body:
+            tags = body["Tags"]
+            if not isinstance(tags, dict) or set(tags) != {"tag"} or not isinstance(tags["tag"], list) \
+                    or not all(isinstance(t, str) and t.strip() for t in tags["tag"]):
+                raise WriteBlockedError(f"{tool}: Tags must be {{\"tag\": [tag names]}}.")
 
     def send(self, tool: str, method: str, path: str, body: dict | None, confirm_code: str,
              before: dict | None = None) -> dict:

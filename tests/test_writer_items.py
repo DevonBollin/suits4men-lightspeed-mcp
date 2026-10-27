@@ -231,3 +231,42 @@ def test_still_negative_and_large_changes_are_flagged(writer, stock_rows, confir
     result = writer.adjust_stock([{"item_id": 1644, "change": 2}, {"item_id": 1345, "set_to": 150}], "Recount")
     assert any("stock would be -25, still negative" in w for w in result["warnings"])
     assert any("+150 units" in w for w in result["warnings"])
+
+
+# ---- set_item_tags ------------------------------------------------------------------------------------------
+
+
+def test_first_tag_write_is_one_item_with_its_whole_list(writer, reads):
+    by_id = {i["itemID"]: i for i in reads.data["Item"]}
+    by_id["1346"]["Tags"] = {"@attributes": {"count": "1"}, "tag": "wool"}       # one tag comes as a string
+    result = writer.set_item_tags([{"item_id": 1346, "add": ["super-150s", "wool"]}])
+    [request] = result["requests"]
+    assert request["method"] == "PUT" and request["path"].endswith("/Item/1346.json")
+    assert request["body"] == {"Tags": {"tag": ["wool", "super-150s"]}}
+    assert "+super-150s" in request["does"]
+    assert any("older API's form" in w for w in result["warnings"]) and "first tag write" in result["after"]
+    with pytest.raises(RuleViolation, match="one item per call"):
+        writer.set_item_tags([{"item_id": 1346, "add": ["wool"]}, {"item_id": 1644, "add": ["wool"]}])
+
+
+def test_tags_are_removed_and_read_from_tag_relations_too(writer, reads, write_log):
+    write_log.append({"write_id": "x", "tool": "set_item_tags", "event": "done", "status": 200})
+    by_id = {i["itemID"]: i for i in reads.data["Item"]}
+    by_id["1346"]["TagRelations"] = {"TagRelation": [{"Tag": {"name": "wool"}}, {"Tag": {"name": "stretch"}}]}
+    result = writer.set_item_tags([{"item_id": 1346, "remove": ["Stretch"], "add": ["non-iron"]},
+                                   {"item_id": 1644, "add": ["wool"]}])
+    assert [r["body"] for r in result["requests"]] == [{"Tags": {"tag": ["wool", "non-iron"]}},
+                                                       {"Tags": {"tag": ["wool"]}}]
+
+
+@pytest.mark.parametrize("entry, message", [
+    ({"item_id": 1346, "add": ["Super 150s"]}, "e.g. 'super-150s'"),
+    ({"item_id": 1346, "add": ["wool"], "remove": ["wool"]}, "added and removed"),
+    ({"item_id": 1346, "remove": ["linen"]}, "has no tag linen"),
+    ({"item_id": 1346}, "nothing to change"),
+    ({"item_id": 1700, "add": ["wool"]}, "archived"),
+])
+def test_tag_rules(writer, fake_api, entry, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.set_item_tags([entry])
+    assert fake_api.requests == []

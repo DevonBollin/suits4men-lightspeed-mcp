@@ -89,13 +89,14 @@ prompts to keep the saved ones. Re-authorize when:
 - the scopes change (`SCOPES` in `lightspeed_mcp/config.py`).
 
 Phase 2 changed the scopes (`employee:inventory` replaces
-`employee:inventory_read`), and bootstrap was re-run on 2026-10-26: the
-saved token has those 9 scopes.
+`employee:inventory_read`, plus `employee:manufacturers`), and bootstrap was
+re-run afterwards.
 
-**Pending:** creating or renaming brands needs `employee:manufacturers`, added
-afterwards. Run bootstrap once more before the first brand change (everything
-else, vendors and categories included, works with the current token). Re-authorizing changes no inventory data. Run it
-from a normal PowerShell window: from the Claude app's Terminal panel, open one with
+**Pending:** tags (`set_item_tags`) need `employee:tags`, added afterwards. Run
+bootstrap once more on each computer before the first tag change (everything
+else works with the current token; `server_info` lists the login's
+permissions). Re-authorizing changes no inventory data. Run it from a normal
+PowerShell window: from the Claude app's Terminal panel, open one with
 `Start-Process powershell -WorkingDirectory "C:\Development\Suits 4 Men Inventory"`.
 
 ## Two computers: developing here, running at the store
@@ -263,6 +264,7 @@ across several entries and switched over atomically. See
 | `create_category` / `rename_category` / `delete_category` | `POST`/`PUT Category` (name, path, parent) / `DELETE` (for good) | Rename one with subcategories; delete one with items, matrices or subcategories |
 | `move_category` | `PUT Category/<id>.json`: new parent and path; its items and matrices move with it | Move one with subcategories (rebuild a branch leaf by leaf), or rename it |
 | `adjust_stock` | `PUT Item/<id>.json` per item with one stock row: its `itemShopID` and the new `qoh` | Change stock without a reason, overwrite a sale made after the dry run, or (until a first change is checked) touch more than one item |
+| `set_item_tags` | `PUT Item/<id>.json` per item with its whole tag list, `{"Tags": {"tag": [...]}}` | Send anything but tags; (until a first tag write is checked) touch more than one item |
 | `create_inventory_count` | `POST InventoryCount.json` + one `POST InventoryCountItem.json` per counted item | **Reconcile** (the step that changes stock stays a click in Lightspeed) |
 | `create_attribute_set` / `update_attribute_set` | `POST`/`PUT ItemAttributeSet`: a set's name and its 1-3 attribute names (one is always Color) | Touch Lightspeed's built-in sets 1-4; remove, swap or move Color in a set that matrices use |
 | `reassign_items` | `PUT Item/<id>.json` per item: default vendor, brand and/or category, only what changes | Touch an item in a matrix (`update_matrix` does the whole matrix), or prices, cost, stock and vendor numbers |
@@ -347,6 +349,20 @@ stock as it was.
   Cost control help describe it), so it moves **one item per call until a first
   change has been done and checked**: take a snapshot before, then compare and
   look at the item's stock history.
+
+#### Tags
+
+`set_item_tags` adds and removes tags on items: what a category can't hold,
+such as fabric, finish and construction (`wool`, `super-150s`, `non-iron`,
+`half-canvas`). Tags are lowercase words joined by hyphens, so `Wool` and
+`wool` never become two tags. Each item's whole tag list is sent (kept + added),
+which gives the same result whether Lightspeed replaces the list or adds to it.
+Lightspeed's current docs show tags only as a relation (`TagRelations`) and no
+way to write them, so the tool uses the older API's form and does **one item per
+call until a first tag write has been done and checked**. A matrix's tags in
+Lightspeed's screen only reach its items through Reset Items To Defaults, so a
+matrix is tagged item by item. Needs the login's `employee:tags` permission (see
+Re-authorize).
 
 #### Inventory counts
 

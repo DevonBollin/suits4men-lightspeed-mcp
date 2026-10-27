@@ -81,7 +81,7 @@ def test_exactly_these_write_tools():
         "update_matrix", "create_vendor", "create_brand", "update_item_prices", "set_reorder_levels",
         "archive_purchase_order", "correct_vendor_numbers", "update_vendor", "archive_vendor", "rename_brand",
         "create_category", "rename_category", "delete_category", "create_inventory_count", "create_attribute_set",
-        "update_attribute_set", "reassign_items", "set_upcs", "move_category", "adjust_stock"}
+        "update_attribute_set", "reassign_items", "set_upcs", "move_category", "adjust_stock", "set_item_tags"}
 
 
 def test_attribute_sets_send_names_only_and_are_never_deleted():
@@ -151,6 +151,16 @@ def test_a_stock_change_is_refused_even_in_a_reorder_request(make_write_client, 
     fake_api.handler = created
     with pytest.raises(WriteBlockedError, match="qoh"):
         client.send("set_reorder_levels", "PUT", "ItemShop/5.json", {"reorderPoint": "1", "qoh": "40"}, "code")
+    assert fake_api.requests == []
+
+
+@pytest.mark.parametrize("tags", [{"tag": "wool"}, {"tag": ["wool", 5]}, {"tag": [""]}, {"tag": [], "x": 1}, ["wool"]])
+def test_tags_are_a_list_of_names(make_write_client, fake_api, write_switch, tags):
+    turn_on(write_switch)
+    client = make_write_client()
+    fake_api.handler = created
+    with pytest.raises(WriteBlockedError, match="Tags must be"):
+        client.send("set_item_tags", "PUT", "Item/1644.json", {"Tags": tags}, "code")
     assert fake_api.requests == []
 
 

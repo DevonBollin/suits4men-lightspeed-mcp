@@ -1037,6 +1037,27 @@ def adjust_stock(
     return run(lambda w: w.adjust_stock([i.model_dump() for i in items], reason, dry_run, confirm_code), writer)
 
 
+class TagChange(BaseModel):
+    item_id: Annotated[int, Field(description="The item.")]
+    add: Annotated[list[str] | None, Field(description="Tags to add: lowercase words joined by hyphens, e.g. ['wool', 'super-150s', 'half-canvas'].")] = None
+    remove: Annotated[list[str] | None, Field(description="Tags to take off.")] = None
+
+
+@write_tool
+def set_item_tags(
+    items: Annotated[list[TagChange], Field(description="Items and the tags to add or remove (max 100; one until a first tag write has been checked).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Add or remove tags on items: fabric, finish, construction, season (e.g. 'wool', 'super-150s',
+    'non-iron', 'stretch', 'half-canvas'), which categories don't hold. Tags are lowercase words
+    joined by hyphens. Each item's whole tag list is sent (kept + added). Lightspeed's current docs
+    don't show how tags are written, so this uses the older API's form, one item per call until a
+    first tag write has been done and checked; it needs the login's employee:tags permission
+    (server_info lists them). For a matrix, tag each of its items."""
+    return run(lambda w: w.set_item_tags([i.model_dump() for i in items], dry_run, confirm_code), writer)
+
+
 class CountedItem(BaseModel):
     item_id: Annotated[int, Field(description="The item counted.")]
     counted: Annotated[int, Field(description="How many were counted (0 or more).")]
