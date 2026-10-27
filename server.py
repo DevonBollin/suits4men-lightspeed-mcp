@@ -1,15 +1,19 @@
-"""MCP server for Claude Desktop: read-only tools for the Suits 4 Men Lightspeed account.
+"""MCP server for Claude Desktop: tools for the Suits 4 Men Lightspeed account.
 
 Claude Desktop starts this file over stdio (see README.md). Do not print() in
 here: stdout carries the MCP protocol. Logging goes to stderr, which Claude
 Desktop saves in its MCP logs (%APPDATA%\\Claude\\logs\\mcp-server-lightspeed.log).
 
-The tool logic lives in lightspeed_mcp/reader.py. This file only describes
-the tools for Claude and turns results into compact JSON text.
+The read tools' logic lives in lightspeed_mcp/reader.py and only ever sends
+GET. The five write tools' logic lives in lightspeed_mcp/writer.py: they
+default to dry runs, and a real write needs the master write switch
+(lightspeed_mcp/write_path.py) plus the confirm code of an approved dry run.
+This file only describes the tools for Claude and turns results into compact JSON text.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import sys
@@ -20,7 +24,7 @@ import httpx
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from lightspeed_mcp.client import LightspeedClient
 from lightspeed_mcp.config import HTTP_TIMEOUT_SECONDS
@@ -28,6 +32,8 @@ from lightspeed_mcp.errors import LightspeedError, NotBootstrappedError
 from lightspeed_mcp.reader import PO_STATUSES, InventoryReader
 from lightspeed_mcp.secret_store import SecretStore
 from lightspeed_mcp.tokens import TokenManager
+from lightspeed_mcp.write_path import WriteClient
+from lightspeed_mcp.writer import InventoryWriter
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # httpx logs every request URL at INFO; keep the log about our own events.
@@ -36,18 +42,25 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 mcp = MCPServer(
     "suits4men-lightspeed",
     instructions=(
-        "Read-only access to the Suits 4 Men Lightspeed Retail (R-Series) account: items, item matrices, "
-        "attribute sets, vendors, manufacturers, categories, purchase orders, stock and stock history, sales "
-        "history, inventory counts, special orders, vendor returns and vendor catalogs. Nothing here can change "
-        "Lightspeed. Results are trimmed JSON with IDs; long lists come as {columns, rows} tables. Use api_get "
-        "for any field the other tools leave out."
+        "Access to the Suits 4 Men Lightspeed Retail (R-Series) account: items, item matrices, attribute sets, "
+        "vendors, manufacturers, categories, purchase orders, stock and stock history, sales history, inventory "
+        "counts, special orders, vendor returns and vendor catalogs. Results are trimmed JSON with IDs; long lists "
+        "come as {columns, rows} tables. Use api_get for any field the other tools leave out. The read tools and "
+        "api_get can never change anything. Five write tools (create_matrix, add_matrix_variants, "
+        "update_item_fields, add_po_lines, receive_po_lines) default to dry runs that send nothing. Never make a "
+        "real write unless the user, in this chat, has approved that exact dry run; an approval covers one write "
+        "only. Real writes are refused while the store owner has writes turned off."
     ),
 )
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
+# Tells Claude Desktop these tools can change data (even though they default to dry runs).
+WRITES =ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
 
 _reader: InventoryReader | None = None
 _reader_lock = threading.Lock()
+_writer: InventoryWriter | None = None
+_writer_lock = threading.Lock()
 
 
 def reader() -> InventoryReader:
@@ -64,10 +77,21 @@ def reader() -> InventoryReader:
         return _reader
 
 
-def run(call) -> str:
+def writer() -> InventoryWriter:
+    """The write tools' logic. Its WriteClient shares the read client's tokens and rate limiter."""
+    global _writer
+    read = reader()
+    with _writer_lock:
+        if _writer is None:
+            client = read.client
+            _writer = InventoryWriter(read, WriteClient(client.account_id, client.tokens, client.limiter))
+        return _writer
+
+
+def run(call, logic=reader) -> str:
     """Run one tool call; return compact JSON, or raise ToolError with a readable message."""
     try:
-        result = call(reader())
+        result = call(logic())
     except (LightspeedError, ValueError) as e:
         raise ToolError(str(e)) from e
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
@@ -75,6 +99,32 @@ def run(call) -> str:
 
 def tool(fn):
     return mcp.tool(annotations=READ_ONLY, structured_output=False)(fn)
+
+
+# Appended to every write tool's description.
+WRITE_STEPS = """
+How every write tool works:
+1. Call it with dry_run=true (the default). Nothing is sent. It returns the exact method, path and JSON body of
+   each request, a plain-language summary, warnings, and a confirm_code.
+2. Show the user the summary, the warnings and the request bodies, and ask whether to make this change.
+3. Only if the user approves in this chat, call the tool again with the same arguments, dry_run=false and that
+   confirm_code. An approval covers that one change only. If anything changed in between, the code no longer
+   matches and the call is refused: run the dry run again.
+Real writes are refused while the store owner has writes turned off on this computer; say so and stop. The
+store's rules (attribute set 5 Color/Size/Fit, matrices by garment type not color, vendor naming kept as is,
+pants by waist only, no 3-piece or boys' items, plain descriptions, one unique 6-digit custom SKU per item) are
+enforced: a refusal says which rule.
+"""
+
+
+def write_tool(fn):
+    description = inspect.cleandoc(fn.__doc__ or "") + "\n" + WRITE_STEPS
+    return mcp.tool(annotations=WRITES, description=description, structured_output=False)(fn)
+
+
+DryRun = Annotated[bool, Field(description="True (default): only show what would be sent. False: send it, which needs "
+                                           "confirm_code and the user's approval of the dry run.")]
+ConfirmCode = Annotated[str | None, Field(description="With dry_run=false: the confirm_code from the approved dry run.")]
 
 
 # ---- items ------------------------------------------------------------------------
@@ -322,6 +372,110 @@ def api_get(
     records (and relations that load them) are refused. Filter syntax: field=value,
     field=~,%text% (like), field=IN,[1,2], field=>,5. See developers.lightspeedhq.com/retail."""
     return run(lambda r: r.api_get(path, params, all_pages, max_records))
+
+
+# ---- write tools (dry run by default) --------------------------------------------------------
+
+
+class Variant(BaseModel):
+    color: Annotated[str, Field(description="Color exactly as the vendor names it, e.g. 'Midnight Blue'. Sent as given, never re-cased.")]
+    size: Annotated[str, Field(description="Size, e.g. '42R' for suits. Pants: waist only, e.g. '34'.")]
+    fit: Annotated[str, Field(description="Fit exactly as the vendor names it, e.g. 'Slim'. May be blank.")] = ""
+    custom_sku: Annotated[str, Field(description="A new, unused 6-digit custom SKU, as text so leading zeros stay, e.g. '013471'.")]
+
+
+class NewPoLine(BaseModel):
+    item_id: Annotated[int, Field(description="The item to order.")]
+    quantity: Annotated[int, Field(description="Units to order.")]
+    unit_cost: Annotated[float | None, Field(description="Unit cost on this PO. Default: the item's default cost.")] = None
+
+
+class Receipt(BaseModel):
+    quantity: Annotated[int, Field(description="Units that arrived now (added to what the line already shows as received).")]
+    order_line_id: Annotated[int | None, Field(description="The PO line (get_purchase_order lists order_line_id).")] = None
+    item_id: Annotated[int | None, Field(description="Instead of order_line_id: the item, if it is on one line of the PO.")] = None
+
+
+@write_tool
+def create_matrix(
+    description: Annotated[str, Field(description="Plain-language matrix description naming the garment type, no vendor codes or colors, e.g. 'Giorgio Fiorelli Vest'.")],
+    garment_type: Annotated[str, Field(description="One of: suit (2-piece), tuxedo, vest, pants, sport coat. No 3-piece.")],
+    category_id: Annotated[int, Field(description="Category for the matrix (list_categories), e.g. 83 Suits/Suit.")],
+    vendor_id: Annotated[int, Field(description="Default vendor (list_vendors).")],
+    manufacturer_id: Annotated[int | None, Field(description="Manufacturer / brand (list_manufacturers).")] = None,
+    default_cost: Annotated[float | None, Field(description="The matrix's default cost.")] = None,
+    price: Annotated[float | None, Field(description="The matrix's Default selling price. Left unset unless given.")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Create a new, empty item matrix under the store's attribute set 5 (Color/Size/Fit).
+    One matrix per brand line and garment type; colors, sizes and fits are added later by
+    add_matrix_variants (Lightspeed adds each variant's values to the matrix by itself).
+    Refuses a description with a vendor code or a color, a 3-piece or boys' matrix, or a
+    description that is already used."""
+    return run(lambda w: w.create_matrix(description, garment_type, category_id, vendor_id, manufacturer_id,
+                                         default_cost, price, dry_run, confirm_code), writer)
+
+
+@write_tool
+def add_matrix_variants(
+    matrix_id: Annotated[int, Field(description="The matrix to add items to (must use attribute set 5).")],
+    variants: Annotated[list[Variant], Field(description="The new items: color, size, fit and custom SKU each (max 100).")],
+    price: Annotated[float, Field(description="Default selling price for every new item (not the matrix's own price).")],
+    cost: Annotated[float, Field(description="Default cost for every new item.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Add new child items (variants) to a Color/Size/Fit matrix: one item per color/size/fit,
+    each with its own new custom SKU, the given price and cost, and the matrix's category,
+    vendor, manufacturer and tax. Descriptions are '<matrix description> <color> <size> <fit>'.
+    Stock starts at 0. Never changes the matrix or its existing items. Refuses duplicate SKUs
+    or variants, pants sizes that are not waist-only, and 3-piece or boys' values. Warns about
+    new color/size/fit spellings and prices that differ from the matrix's other items."""
+    return run(lambda w: w.add_matrix_variants(matrix_id, [v.model_dump() for v in variants], price, cost,
+                                               dry_run, confirm_code), writer)
+
+
+@write_tool
+def update_item_fields(
+    item_id: Annotated[int, Field(description="The item to change.")],
+    custom_sku: Annotated[str | None, Field(description="New 6-digit custom SKU (must be unused).")] = None,
+    cost: Annotated[float | None, Field(description="New default cost.")] = None,
+    description: Annotated[str | None, Field(description="New plain-language description (no vendor codes).")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Change an item's custom SKU, default cost and/or description. Only the fields given (and
+    actually different) are sent. Prices, stock and everything else are never touched."""
+    return run(lambda w: w.update_item_fields(item_id, custom_sku, cost, description, dry_run, confirm_code), writer)
+
+
+@write_tool
+def add_po_lines(
+    order_id: Annotated[int, Field(description="An open (not finished) purchase order.")],
+    lines: Annotated[list[NewPoLine], Field(description="Items, quantities and optional unit costs (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Add lines to an open purchase order: one line per item. Refuses items already on the PO,
+    archived items, and 3-piece or boys' items. Warns about catch-all items not in a matrix, items
+    without a custom SKU, negative stock, and items from another vendor. Receives nothing."""
+    return run(lambda w: w.add_po_lines(order_id, [line.model_dump() for line in lines], dry_run, confirm_code), writer)
+
+
+@write_tool
+def receive_po_lines(
+    order_id: Annotated[int, Field(description="An open (not finished) purchase order.")],
+    lines: Annotated[list[Receipt], Field(description="What arrived: order_line_id (or item_id) and quantity per line.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Record goods received against purchase-order lines (sets each line's numReceived to its
+    new running total). Refuses receiving more than was ordered. Stock on hand does not change
+    until someone finishes the check-in in Lightspeed ('Add Received To Inventory' on the PO):
+    Lightspeed's API has no call for that step. Tell the user so."""
+    return run(lambda w: w.receive_po_lines(order_id, [line.model_dump() for line in lines], dry_run, confirm_code),
+               writer)
 
 
 if __name__ == "__main__":

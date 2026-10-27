@@ -21,18 +21,20 @@ AUTHORIZE_URL = "https://cloud.lightspeedapp.com/auth/oauth/authorize"
 TOKEN_URL = "https://cloud.lightspeedapp.com/auth/oauth/token"
 API_ROOT = "https://api.lightspeedapp.com/API/V3/"
 
-# Phase 1 scopes: everything inventory management needs to READ.
+# Scopes: everything inventory management needs to read, plus item writes.
 #
-# Only inventory_read and register_read are read-only scopes. Lightspeed has
-# no read-only version of the others, so they also allow writes; the HTTP
-# client's GET-only guard is what keeps Phase 1 read-only.
+# Phase 2 swapped employee:inventory_read for employee:inventory, which also
+# lets the token create and update items. Holding a scope does not make a
+# write possible on its own: the read client only sends GET, and writes go
+# through write_path.py, which is off until the store owner turns it on.
 #
-# Phase 2 swaps inventory_read for employee:inventory (and adds
-# employee:product_edit if creating matrices needs it), then bootstrap.py is
-# re-run. Changing this list always means re-running bootstrap.py.
+# employee:product_edit is not requested: the ItemMatrix docs name only
+# employee:product_cost. If creating a matrix ever answers 403, add it here.
+#
+# Changing this list only takes effect after re-running bootstrap.py.
 SCOPES = [
-    "employee:inventory_read",   # items, stock (ItemShop), attribute sets
-    "employee:product_cost",     # ItemMatrix (403 without it), InventoryLog, vendor catalogs
+    "employee:inventory",        # items, stock (ItemShop), attribute sets; create and update items
+    "employee:product_cost",     # ItemMatrix (403 without it), InventoryLog, vendor catalogs, editing cost
     "employee:purchase_orders",  # purchase orders, lines, received shipments
     "employee:vendors",          # vendors
     "employee:categories",       # categories

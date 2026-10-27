@@ -35,7 +35,21 @@ class AuthError(LightspeedError):
 
 
 class WriteBlockedError(LightspeedError):
-    """Raised for any attempt to send a non-GET request. Phase 1 is read-only."""
+    """A request that this server never sends: a non-GET on the read client, or a
+    write that is not one of the write tools' own requests (see write_path.py)."""
+
+
+class WritesDisabledError(LightspeedError):
+    """The master write switch is off, so no write may be sent (see write_path.py)."""
+
+
+class WriteRefused(LightspeedError, ValueError):
+    """A write tool refused to go ahead, e.g. the confirm code does not match the dry run."""
+
+
+class WriteOutcomeUnknown(LightspeedError):
+    """A write was sent but no clear answer came back (network error or 5xx).
+    Lightspeed may or may not have made the change, so it must be checked before retrying."""
 
 
 class RateLimitedError(LightspeedError):

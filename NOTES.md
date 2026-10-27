@@ -1,9 +1,10 @@
-# Notes for Phase 2
+# Notes: the Lightspeed API and the store's data
 
 What the docs say, what the live Suits 4 Men account actually does, and what
-that means for the write tools. When the two disagree, observed behaviour wins.
+that means for the tools. When the two disagree, observed behaviour wins.
 Live checks were run on 2026-10-26 against account 304581 ("Suits 4 Men Inc"),
-GET only.
+GET only. **No write has ever been sent to Lightspeed** from this project
+(Phase 2 was built and checked with dry runs and mocked tests only).
 
 ## Summary of surprises
 
@@ -233,14 +234,133 @@ could use set 2 (size in attribute2), or set 5 with color.
 - **Paging is complete:** `count=1` matched the paged totals for Item (790
   active, 830 incl. archived), Order (828) and Vendor (677 incl. archived).
 
-## Phase 2 scope plan
+## Phase 2: writes (2026-10-26)
 
-The current 9 scopes, with `employee:inventory_read` replaced by `employee:inventory`.
+### What the docs say about write requests
 
-- If creating a matrix fails with that, add `employee:product_edit`.
-- `get_matrix` already prefers the matrix record when it's readable.
+From developers.lightspeedhq.com/retail (endpoint pages ItemMatrix, Item,
+Order, OrderLine, Shipment, the scopes page, the rate-limit page, and the
+ItemMatrix and inventory tutorials). **None of this has been tried on the live
+account yet**: the first real write (with the owner's approval) is the first test.
+
+| Request | Body (bare JSON object, not wrapped in `{"Item": …}`) |
+|---|---|
+| `POST ItemMatrix.json` | Only `description` and `itemAttributeSetID` are required. Also `itemType`, `tax`, `taxClassID`, `categoryID`, `manufacturerID`, `defaultVendorID`, `defaultCost`, `Prices: {ItemPrice: [{amount, useTypeID, useType}]}` |
+| `POST Item.json` (matrix child) | `itemMatrixID` plus `ItemAttributes: {itemAttributeSetID, attribute1, attribute2, attribute3}`; `customSku`, `description`, `defaultCost`, `Prices`, IDs as above |
+| `PUT Item/{id}.json` | **Merges**: omitted fields keep their values, empty or null blanks a field. Send only what changes |
+| `POST OrderLine.json` | `orderID`, `itemID`, `quantity`, `price` (unit cost), `originalPrice`, `numReceived`, `vendorCost` |
+| `PUT OrderLine/{id}.json` | Same fields. **`checkedIn` is not writable** |
+
+- **Matrix attribute values are not writable.** `attribute1Values` etc. fill in
+  automatically when a child Item with those values is created. So a matrix is
+  created empty, and each color/size/fit is created as its own Item. Matrices 8
+  and 11 (values but no items) were probably set up in the Lightspeed UI.
+- A matrix child's description is `<matrix description> <attr1> <attr2> <attr3>`
+  (docs). The tools send it that way. Whether Lightspeed overwrites a different
+  description is **unconfirmed**.
+- **DELETE on ItemMatrix archives the matrix and all of its items.** The write
+  path has no route for DELETE at all.
+- Price propagation from a matrix to its children is **not documented**.
+  No tool updates a matrix, so it can't happen.
+- Whether Lightspeed rejects a duplicate `customSku` is **not documented**. The
+  tools check every item, archived ones too, before sending.
+- Values: endpoint samples send strings (`"20"`), the tutorials send numbers. The
+  tools send strings, matching what GET returns.
+- Success status codes aren't documented; 400, 403 (missing scope), 409, 422
+  (validation) and 429 are. POST and PUT return the full record under its key.
+- **Rate cost:** since 2026-03-17 every request costs 1 drip (writes used to
+  cost 10), plus 0.5 per nested record in the body. The write client budgets 2.
+
+### Receiving against a purchase order
+
+- `numReceived` = received but **not** checked in (not in stock yet).
+  `checkedIn` = added to inventory. A PUT sets `numReceived` to an absolute
+  value; it is not a delta.
+- **There is no documented API call that checks stock in.** The inventory
+  tutorial sets `numReceived` and says the PO "must now be finished in Retail
+  POS", i.e. the **Add Received To Inventory** button on the PO, then Finished.
+- Order `receivedDate` / `orderedDate` only change the PO's status
+  (Check-In / Ordered); `complete` is not in the writable list.
+- Shipment (`OrderShipment`) records are read-only receipts that check-in creates.
+- Stock could be set directly (`PUT Item` with `ItemShops.ItemShop.qoh`, or a
+  count + reconcile), but that skips PO and cost history. **No tool does that**,
+  and the write path refuses `ItemShops` in any body.
+- So `receive_po_lines` only sets `numReceived`, and says that stock changes
+  only when someone finishes the check-in in Lightspeed. Whether `numReceived`
+  goes back to 0 after check-in (moving into `checkedIn`) is **unconfirmed**;
+  the over-receipt check counts `checkedIn + numReceived`.
+
+### Scopes
+
+- `SCOPES` now has `employee:inventory` (view, create, update and archive items)
+  in place of `employee:inventory_read`. **Takes effect only after bootstrap.py
+  is re-run**; until then the saved token still has `inventory_read`, which is
+  enough for every read and dry run.
+- `employee:product_edit` exists ("create, update and archive products") but
+  is **not requested**: the ItemMatrix page names only `employee:product_cost`
+  (held). If the first matrix creation answers 403, add it and re-run bootstrap.
+- The Item page's scope list is odd (cfd, register, product_cost, reports,
+  workbench, customers, admin) and looks incomplete. `employee:inventory_base`
+  appears on the ItemAttributeSet page only.
+- The approving employee's rights also cap the token: run bootstrap as the owner.
+
+### How the write path is built
+
+See README.md ("Write tools" and "Turning writes on and off") and the comments
+in `lightspeed_mcp/write_path.py`. In short: separate WriteClient that only
+the five write tools hold; master switch file `state/WRITES_ENABLED` (shipped
+absent = off); one route per tool with a field allowlist (no DELETE, no matrix
+update, prices only on new records, never `ItemShops`); dry run by default;
+real calls need the dry run's confirm code (a hash of the exact requests);
+append-only log `state/write_log.jsonl`; 5xx and network errors are never
+retried, since a write might have gone through.
+
+### To confirm on the first real writes (each approved by the owner)
+
+1. Status code of a successful POST/PUT (200 or 201?) and the response shape.
+2. Creating a matrix with `employee:product_cost` + `employee:inventory`, without `product_edit`.
+3. A new child sent with only a Default price: what MSRP and Online become.
+4. Whether a child's description is kept as sent.
+5. Whether a duplicate `customSku` is refused by Lightspeed itself.
+6. What `numReceived` and `checkedIn` show after "Add Received To Inventory".
+7. The real request cost of a write (`x-ls-api-request-cost`).
+
+Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
+
+### Data findings (2026-10-26, from the snapshot)
+
+- **Custom SKUs:** 771 of the 830 items (archived included) have one; all are 6 digits and
+  none is duplicated. The highest is **013470**. 57 active items (and 2 archived) have none (e.g. 2321 "Caravelli
+  Burgundy 58L Slim", 2322 "Bryant Black", 2331 "Ralph Lauren Pants").
+- Item 2321 "Caravelli Burgundy 58L Slim" is **not in matrix 7** (itemMatrixID 0),
+  and matrix 7 has no Burgundy color.
+- Matrix 7's children all sell at 599.95 (Default), but their **MSRP varies (695 or 995)**,
+  Online is 549.95 or 599.95, and **cost varies** (63.50, 65.94, 75.06, …). The matrix's
+  own Default price and cost are both 61.21. Matrix 7's record changed on 2026-10-21.
+- Each brand has a **catch-all pants item outside any matrix** (e.g. 1485
+  "Caravelli Pants", 1479 "Angelo Rossi Pants", 1483 "BN-5851 Pants", 1475
+  "320-PE0-1 Pants"), several with vendor codes in the description.
+- Boys' items exist: "Giorgio Fiorelli Boys Shirt" and "Boy's Suit".
+- Brand names can contain color words: manufacturer "Ascott Brown"; vendors
+  "White Sierra", "Blue Generation", "Red Kap" and others. The color check
+  ignores the matrix's own vendor and manufacturer names for this reason.
+- Order.json with `archived=true` has **853** POs (828 without). OrderLine: 2,538. Shipment: 820.
+- One tax class: 1 "Item". Every matrix is `tax: true`, `taxClassID: 1`.
+- The 11 open POs have no `orderedDate`; PO 853 (San Malone, ref 112423) has 12
+  lines, nothing received. Line 2692 orders catch-all item 1186 "Caravelli Suits".
+
+### Snapshots
+
+- `backup_lightspeed.py` saves every Item (with stock, attributes, vendor
+  numbers, notes), ItemMatrix, ItemAttributeSet, Category, Manufacturer,
+  Vendor, Shop, TaxClass, Order, OrderLine and Shipment record to
+  `backups/<date_time>/` (about 5.5 MB, about 75 s, GET only). Not in git.
+- `--compare A B` lists records added, removed or changed (field by field).
+- Taken at 20:22 and 20:39 on 2026-10-26, before and after building Phase 2:
+  **identical, 0 differences in every record type.**
 
 ## Tooling
 
-- `check_tools.py` calls every tool over stdio against the live account (GET only, 26 calls, about 90 s).
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (106 tests).
+- `check_tools.py` calls every read tool over stdio against the live account (GET only, 26 calls, about 90 s).
+  `check_tools.py --dry-runs` calls the five write tools on real records, always with `dry_run=true`.
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (296 tests).

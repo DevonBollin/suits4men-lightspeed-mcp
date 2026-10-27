@@ -3,9 +3,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from lightspeed_mcp.client import LightspeedClient
+from lightspeed_mcp.client import BucketLimiter, LightspeedClient
 from lightspeed_mcp.secret_store import AppConfig, SecretStore, Tokens
 from lightspeed_mcp.tokens import TokenManager
+from lightspeed_mcp.write_path import WRITE_LOG_PATH, WRITE_SWITCH_PATH, WriteClient, WriteLog, WriteSwitch
 from tests.fakes import FakeTokenServer, MemoryKeyring, long_token
 
 ACCOUNT_ID = "12345"
@@ -97,4 +98,48 @@ def make_client(fake_api, clock):
         client = LightspeedClient(ACCOUNT_ID, tokens, transport=httpx.MockTransport(fake_api),
                                   sleep=sleep, now=clock, **kwargs)
         return client, sleeps
+    return make
+
+
+# ---- the write path, always in a temporary folder ----------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def real_write_switch_untouched():
+    """No test may create, remove or use the real write switch or write log in state/."""
+    switch_before = WRITE_SWITCH_PATH.exists()
+    log_before = WRITE_LOG_PATH.stat().st_size if WRITE_LOG_PATH.exists() else None
+    yield
+    assert WRITE_SWITCH_PATH.exists() == switch_before, "a test changed the real write switch"
+    assert (WRITE_LOG_PATH.stat().st_size if WRITE_LOG_PATH.exists() else None) == log_before, \
+        "a test wrote to the real write log"
+
+
+@pytest.fixture
+def write_switch(tmp_path) -> WriteSwitch:
+    """A write switch in a temporary folder. OFF until a test calls turn_on()."""
+    return WriteSwitch(tmp_path / "state" / "WRITES_ENABLED")
+
+
+def turn_on(switch: WriteSwitch) -> None:
+    switch.path.parent.mkdir(parents=True, exist_ok=True)
+    switch.path.write_text("")
+
+
+@pytest.fixture
+def write_log(tmp_path) -> WriteLog:
+    return WriteLog(tmp_path / "state" / "write_log.jsonl")
+
+
+@pytest.fixture
+def make_write_client(store, token_server, make_manager, fake_api, clock, write_switch, write_log):
+    """A WriteClient whose requests go to fake_api (a mock), never to Lightspeed."""
+    def make() -> WriteClient:
+        seed_tokens(store, token_server, expires_at=clock() + 3600)
+
+        def sleep(seconds):
+            clock.advance(seconds)
+
+        return WriteClient(ACCOUNT_ID, make_manager(), BucketLimiter(sleep=sleep, now=clock), switch=write_switch,
+                           write_log=write_log, transport=httpx.MockTransport(fake_api), sleep=sleep)
     return make

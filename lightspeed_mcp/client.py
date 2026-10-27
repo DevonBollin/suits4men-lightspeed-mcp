@@ -1,11 +1,12 @@
-"""HTTP client for the Lightspeed R-Series V3 API. Phase 1: GET requests only.
+"""HTTP client for the Lightspeed R-Series V3 API, used by every read tool. GET requests only.
 
 Three things happen here:
 
   * GET-only guard. LightspeedClient has no method that can send anything but
     GET, and the underlying httpx client has a request hook that refuses any
-    other method before it leaves the computer. Both have to be removed on
-    purpose before a write is possible.
+    other method before it leaves the computer. The read tools and api_get
+    can therefore never write. Writes have their own, separate path
+    (write_path.py) that only the write tools hold.
   * Rate limiting. Lightspeed uses a "leaky bucket": each request adds drips
     (1 for a simple GET, more with load_relations), the bucket drains at a
     steady rate (1 drip/second for a one-register store), and when it is full
@@ -36,9 +37,9 @@ MAX_PAGE_SIZE = 100
 
 
 def _refuse_non_get(request: httpx.Request) -> None:
-    """httpx request hook: the last line of defence for read-only Phase 1."""
+    """httpx request hook: the last line of defence that keeps the read client read-only."""
     if request.method != "GET":
-        raise WriteBlockedError(f"Blocked a {request.method} request: this server is read-only (Phase 1).")
+        raise WriteBlockedError(f"Blocked a {request.method} request: the read client only sends GET.")
 
 
 def make_api_http(transport: httpx.BaseTransport | None = None) -> httpx.Client:
@@ -138,7 +139,7 @@ class BucketLimiter:
 
 
 class LightspeedClient:
-    """Read-only access to one Lightspeed account."""
+    """Read-only access to one Lightspeed account. Writes go through write_path.WriteClient instead."""
 
     def __init__(
         self,
@@ -164,7 +165,7 @@ class LightspeedClient:
     def request(self, method: str, path: str, params: dict | None = None) -> dict:
         """The single entry point. Refuses every method except GET."""
         if method.upper() != "GET":
-            raise WriteBlockedError(f"Refused {method.upper()} {path}: this server is read-only (Phase 1).")
+            raise WriteBlockedError(f"Refused {method.upper()} {path}: the read client only sends GET.")
         return self._get_url(self.url_for(path), params)
 
     def get(self, path: str, params: dict | None = None) -> dict:

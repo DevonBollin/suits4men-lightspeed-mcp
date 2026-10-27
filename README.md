@@ -1,11 +1,17 @@
 # Suits 4 Men – Lightspeed MCP server
 
-A local MCP server that lets Claude Desktop **read** the Suits 4 Men Lightspeed
-Retail (R-Series) account: items, matrices, attribute sets, vendors,
-categories, purchase orders and stock.
+A local MCP server that lets Claude Desktop read the Suits 4 Men Lightspeed
+Retail (R-Series) account (items, matrices, attribute sets, vendors,
+categories, purchase orders and stock) and, with your approval, make five
+narrow kinds of change.
 
-Phase 1 is read-only. The HTTP client refuses every request except GET, so
-nothing here can change Lightspeed.
+- **Read tools** (Phase 1) use a client that refuses every request except GET.
+  They can never change Lightspeed.
+- **Write tools** (Phase 2) default to dry runs: they show exactly what they
+  would send and send nothing. A real write needs **all** of the following:
+  you have turned writes on by hand, you have seen that write's dry run and
+  said yes in chat, and the call carries that dry run's confirm code.
+  **Writes ship turned off.**
 
 Secrets (client ID, client secret, tokens) are kept only in Windows Credential
 Manager, under entries named `suits4men-lightspeed/...`. They are not in any
@@ -18,11 +24,18 @@ file in this folder, and not in the Claude Desktop config.
 | `bootstrap.py` | One-time authorization (and re-authorization) |
 | `server.py` | The MCP server Claude Desktop runs |
 | `install_claude_desktop.py` | Adds the server to Claude Desktop's config |
-| `check_tools.py` | Calls every tool against the live account (read-only) |
-| `lightspeed_mcp/` | Token handling, GET-only client, tool logic |
-| `tests/` | Unit tests against a mocked Lightspeed |
-| `state/` | Lock file used during token refresh (no secrets) |
-| `NOTES.md` | Findings about the real API, for Phase 2 |
+| `check_tools.py` | Calls the read tools against the live account; `--dry-runs` calls the write tools as dry runs |
+| `backup_lightspeed.py` | Saves a read-only snapshot of the inventory data; `--compare` diffs two snapshots |
+| `lightspeed_mcp/client.py`, `reader.py` | GET-only client and the read tools' logic |
+| `lightspeed_mcp/write_path.py` | The only code that can write: master switch, allowed requests, write log |
+| `lightspeed_mcp/writer.py`, `rules.py` | The write tools' logic and the store's business rules |
+| `tests/` | Unit tests against a mocked Lightspeed (nothing reaches the real one) |
+| `state/` | Token-refresh lock, the write switch (when on) and the write log. Not in git |
+| `backups/` | Snapshots from `backup_lightspeed.py`. Not in git (they contain costs) |
+| `NOTES.md` | How the real API and the store's data behave |
+
+The folder is a git repository (branch `main`, nothing pushed anywhere).
+`.venv/`, `state/` and `backups/` are never committed, and no secrets are in any file.
 
 ## Install
 
@@ -70,8 +83,14 @@ prompts to keep the saved ones. Re-authorize when:
 - a tool says Lightspeed rejected the refresh token (`invalid_grant`), or says to run bootstrap.py;
 - access was revoked in Lightspeed;
 - the server wasn't used for **30 days**, which is how long Lightspeed lets an unused refresh token live;
-- the scopes change. Phase 2 needs write scopes, which means editing `SCOPES` in
-  `lightspeed_mcp/config.py` and re-running bootstrap.
+- the scopes change (`SCOPES` in `lightspeed_mcp/config.py`).
+
+**Pending:** Phase 2 changed the scopes (`employee:inventory` replaces
+`employee:inventory_read`). Reads and dry runs work with the current token,
+but run bootstrap once more before the first real write. Re-authorizing
+changes no inventory data. Run it from a normal PowerShell window: from the
+Claude app's Terminal panel, open one with
+`Start-Process powershell -WorkingDirectory "C:\Development\Suits 4 Men Inventory"`.
 
 ## Revoke access
 
@@ -119,6 +138,83 @@ across several entries and switched over atomically. See
 | `search_vendor_catalog` | Exact UPC or style-number lookups in Lightspeed's vendor catalogs |
 | `api_get` | Read-only GET of an inventory endpoint, raw JSON. Customer, employee and payment data are refused |
 
+### Write tools
+
+| Tool | What it sends | What it never does |
+|---|---|---|
+| `create_matrix` | `POST ItemMatrix.json`: a new, empty matrix under attribute set 5 Color/Size/Fit | Update or archive an existing matrix |
+| `add_matrix_variants` | `POST Item.json` per new child item (color, size, fit, own custom SKU, the price and cost you give) | Touch the matrix or its existing items |
+| `update_item_fields` | `PUT Item/<id>.json` with only the changed fields among custom SKU, default cost, description | Change prices, stock or anything else |
+| `add_po_lines` | `POST OrderLine.json` per new line on an open PO | Receive anything |
+| `receive_po_lines` | `PUT OrderLine/<id>.json` with the line's new `numReceived` total | Change stock (see below) |
+
+`receive_po_lines` marks goods as received on the PO. Stock on hand changes
+only when someone presses **Add Received To Inventory** on that PO in
+Lightspeed: the API has no call for that step.
+
+The tools refuse (and say which rule) anything that breaks the store's rules:
+
+- a matrix outside attribute set 5;
+- a matrix description that names a color, lacks the garment type, or holds a vendor code;
+- 3-piece or boys' items;
+- pants sizes that aren't waist-only;
+- a custom SKU that isn't 6 digits or is already used (archived items included);
+- a duplicate variant;
+- receiving more than was ordered.
+
+Color and fit values are sent exactly as given, never re-cased. Prices are
+only ever set on new records, and only to the price you give. Matrix 7's own
+price (61.21, equal to its cost) is never copied. The patterns behind the text
+rules are at the top of `lightspeed_mcp/rules.py`.
+
+#### Making a change
+
+1. Ask Claude for the change. It runs the tool as a dry run. The result shows the
+   summary, warnings, each request's method, path and JSON body, and a confirm code.
+2. Read it. If it is right, say so in chat. A yes covers that one change only.
+3. Claude calls the tool again with `dry_run=false` and the confirm code. If
+   anything changed in between (your arguments or the data in Lightspeed), the code
+   no longer matches and the call is refused until a fresh dry run is approved.
+
+It is a good habit to take a snapshot before and after a real write:
+
+```powershell
+.venv\Scripts\python.exe backup_lightspeed.py
+```
+
+#### Turning writes on and off
+
+Writes are **off** while the file `state\WRITES_ENABLED` does not exist. Nothing
+in this project creates it. It is checked on every request, so no restart is needed.
+
+Turn writes on (PowerShell, in the project folder):
+
+```powershell
+New-Item state\WRITES_ENABLED -ItemType File
+```
+
+Turn writes off again:
+
+```powershell
+Remove-Item state\WRITES_ENABLED
+```
+
+Turning writes on does not approve anything. Each write still needs its own
+dry run and your yes in chat. Leaving writes off between jobs is the safe default.
+
+#### Write log
+
+Every write that is sent is appended to `state\write_log.jsonl`, one JSON
+object per line, and the file is never rewritten. A `sending` line (tool, method,
+path, payload, confirm code) is written just before the request goes out. A
+`done` line (HTTP status, affected IDs) or a `failed` line (status, error) follows.
+Tokens are never logged.
+
+If a write ends in a network error or a 5xx, it is **not retried**: it may have
+gone through. Check the record in Lightspeed first.
+
+### Read access
+
 The token can technically read customer and employee records: they come with
 one of the scopes. No tool returns them, and `api_get` only accepts the
 inventory endpoints listed in `API_GET_ENDPOINTS` (in `lightspeed_mcp/reader.py`).
@@ -134,14 +230,43 @@ store-wide month takes about 5–25 s, and a year takes longer.
 .venv\Scripts\python.exe -m pytest
 ```
 
-To check every tool against the live account (GET only), the way Claude Desktop calls them:
+The tests never touch the real write switch or write log, and fail if
+anything does. To check every read tool against the live account (GET only),
+the way Claude Desktop calls them:
 
 ```powershell
 .venv\Scripts\python.exe check_tools.py
 ```
 
+To see each write tool's dry run on real records (GET only, nothing is sent):
+
+```powershell
+.venv\Scripts\python.exe check_tools.py --dry-runs
+```
+
+## Backups
+
+```powershell
+.venv\Scripts\python.exe backup_lightspeed.py
+.venv\Scripts\python.exe backup_lightspeed.py --compare 2026-10-26_202204 2026-10-26_203912
+```
+
+The first command saves every item (with stock, prices, costs, SKUs and
+attributes), matrix, attribute set, category, manufacturer, vendor, tax class,
+purchase order, PO line and receipt to `backups\<date_time>\` as JSON. It takes
+about 75 seconds and sends GET only. The second lists what was added, removed or
+changed between two snapshots, field by field.
+
+Lightspeed has no "restore from file", so a snapshot is not a one-click undo.
+It is an exact record of every value, to check changes against and, if needed,
+to build an approved write that puts a value back.
+
 ## Troubleshooting
 
 - Server log: `%APPDATA%\Claude\logs\mcp-server-lightspeed.log`
-- A "Blocked a POST request" error means something tried to write. Phase 1 refuses all writes; this is by design.
+- After updating the code, **fully quit and restart Claude Desktop** so it sees new or changed tools.
+- "Blocked a POST request" or "not one of the write tools' requests": something tried to send a request the
+  server never sends. This is by design.
+- "Writes to Lightspeed are turned OFF": the master switch is off (see "Turning writes on and off").
+- "confirm_code … does not match": the arguments or the data changed since the dry run. Ask for a new dry run.
 - "Timed out waiting for another process to finish refreshing": a refresh got stuck. Restart Claude Desktop.

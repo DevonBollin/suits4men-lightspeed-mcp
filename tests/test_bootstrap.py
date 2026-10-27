@@ -13,7 +13,7 @@ def test_authorize_url_matches_documented_format():
     assert url.endswith("&state=xyz")
     scope = url.split("scope=")[1].split("&")[0]
     # Scopes joined by a literal '+' (as in Lightspeed's example), colons not encoded.
-    assert scope.split("+")[:2] == ["employee:inventory_read", "employee:product_cost"]
+    assert scope.split("+")[:2] == ["employee:inventory", "employee:product_cost"]
     assert "%" not in scope
 
 
