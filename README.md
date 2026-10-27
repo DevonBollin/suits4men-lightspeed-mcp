@@ -178,6 +178,7 @@ across several entries and switched over atomically. See
 | `rename_brand` | `PUT Manufacturer/<id>.json`: name | Take another brand's name |
 | `create_category` / `rename_category` / `delete_category` | `POST`/`PUT Category` (name, path, parent) / `DELETE` (for good) | Rename one with subcategories; delete one with items, matrices or subcategories |
 | `create_inventory_count` | `POST InventoryCount.json` + one `POST InventoryCountItem.json` per counted item | **Reconcile** (the step that changes stock stays a click in Lightspeed) |
+| `create_attribute_set` / `update_attribute_set` | `POST`/`PUT ItemAttributeSet`: a set's name and its 1-3 attribute names (one is always Color) | Touch Lightspeed's built-in sets 1-4; remove, swap or move Color in a set that matrices use |
 
 `receive_po_lines` marks goods as received on the PO. Stock on hand changes
 only when someone presses **Add Received To Inventory** on that PO in
@@ -239,8 +240,7 @@ adjusting each item, so it stays your click. Entries are recorded under employee
 
 Not available through Lightspeed's API at all: creating or changing vendor
 returns (read-only), and special orders other than as a customer sale line (kept
-out, like all customer data). Attribute sets stay read-only by choice: the store
-uses set 5 for everything.
+out, like all customer data).
 
 #### Updating a matrix
 
@@ -253,9 +253,27 @@ unless someone clicks Reset Items To Defaults, which is not confirmed for the
 API, so the dry run also shows what the items sell at today. Take a snapshot
 before the first matrix update and compare after.
 
+#### Attribute sets (matrix types)
+
+An attribute set names the 1–3 dimensions a matrix's items differ by: set 5
+is Color / Size / Fit. **Suits, tuxedos, vests, pants and sport coats always use
+set 5.** Other garments (shirts, shoes) may use a set the store makes with
+`create_attribute_set`, e.g. Color / Neck / Sleeve, never one of Lightspeed's
+built-in sets 1–4, and **every set has Color**, so a matrix never splits by color.
+`create_matrix` takes `attribute_set_id` (5 by default); variants and moves take
+their values by the matrix's attribute names (`{"Neck": "15.5"}`), or
+color/size/fit for set 5.
+
+While matrices use a set, `update_attribute_set` may rename it or its attributes
+(every matrix on it shows the new names; the dry run lists them) or add one, but
+refuses removing an attribute (Lightspeed is reported to refuse item updates
+afterwards), moving Color, or swapping names between slots (items' values would
+show under the wrong names). Lightspeed's docs on writing sets contradict
+themselves, so the first one may be refused.
+
 The tools refuse (and say which rule) anything that breaks the store's rules:
 
-- a matrix outside attribute set 5;
+- suiting outside attribute set 5; a built-in set, or a set without Color, for any matrix;
 - a matrix description that names a color, lacks the garment type, or holds a vendor code;
 - 3-piece or boys' items;
 - pants sizes that aren't waist-only;

@@ -5,8 +5,11 @@ RuleViolation with a message that says what was refused and why, so Claude
 can pass it straight on. Nothing here talks to Lightspeed.
 
 The rules (from the store owner):
-  * Use the store's own attribute set 5 "Color/Size/Fit". Color is an
-    attribute value, never a separate matrix.
+  * Suits, tuxedos, vests, pants and sport coats use the store's attribute set
+    5 "Color/Size/Fit". Other garments (shirts, shoes, ...) may use another set
+    the store made, never one of Lightspeed's built-in sets (owner, 2026-10-26).
+  * Every attribute set the store uses has Color: color is an attribute
+    value, never a separate matrix.
   * Matrices are split by garment type (suit, tuxedo, pants, ...), never by color.
   * Color and fit values use each vendor's own naming. They are sent exactly
     as given (outer spaces trimmed), never re-cased or "corrected".
@@ -27,7 +30,7 @@ import re
 
 from .errors import LightspeedError
 
-# The store's own attribute set: attribute1 = Color, attribute2 = Size, attribute3 = Fit.
+# The store's suiting set: attribute1 = Color, attribute2 = Size, attribute3 = Fit.
 STORE_ATTRIBUTE_SET_ID = 5
 
 # Custom SKUs in this store are 6-digit numbers, e.g. "012911" (NOTES.md).
@@ -46,7 +49,12 @@ GARMENT_WORDS = {
     "vest": ("vest", "vests"),
     "pants": ("pant", "pants", "trouser", "trousers", "slacks"),
     "sport coat": ("sport coat", "sportcoat", "blazer", "jacket"),
+    "shirt": ("shirt", "shirts"),
+    "shoes": ("shoe", "shoes", "oxford", "oxfords", "loafer", "loafers"),
 }
+
+# These garments always use set 5 (Color/Size/Fit); the others may use another store set.
+SUITING_GARMENTS = ("suit", "tuxedo", "vest", "pants", "sport coat")
 
 PANTS_WORDS = re.compile(r"\b(pant|pants|trouser|trousers|slack|slacks)\b", re.IGNORECASE)
 
@@ -159,12 +167,50 @@ def check_garment_type(garment_type: str, description: str) -> str:
     return garment
 
 
-def check_attribute_set(attribute_set_id) -> None:
-    if str(attribute_set_id) != str(STORE_ATTRIBUTE_SET_ID):
-        raise RuleViolation(
-            f"Refused: this uses attribute set {attribute_set_id}. New matrices and variants use the store's own "
-            f"attribute set {STORE_ATTRIBUTE_SET_ID} 'Color/Size/Fit' (color is an attribute, never its own matrix)."
-        )
+def is_suiting(description: str) -> bool:
+    """Does a matrix description name a suit, tuxedo, vest, pants or sport coat?"""
+    return any(re.search(rf"\b{re.escape(w)}\b", description or "", re.IGNORECASE)
+               for garment in SUITING_GARMENTS for w in GARMENT_WORDS[garment])
+
+
+def check_matrix_attribute_set(attribute_set: dict | None, suiting: bool) -> dict[int, str]:
+    """The set a matrix may use: set 5 for suiting; otherwise a store-made set with Color.
+    Returns its attribute names by slot, e.g. {1: "Color", 2: "Size", 3: "Fit"}."""
+    if not attribute_set:
+        raise RuleViolation("Refused: that attribute set doesn't exist.")
+    set_id = str(attribute_set.get("itemAttributeSetID"))
+    label = f"attribute set {set_id} '{attribute_set.get('name')}'"
+    if suiting and set_id != str(STORE_ATTRIBUTE_SET_ID):
+        raise RuleViolation(f"Refused: this uses {label}. Suits, tuxedos, vests, pants and sport coats use the store's "
+                            f"set {STORE_ATTRIBUTE_SET_ID} 'Color/Size/Fit'.")
+    if set_id != str(STORE_ATTRIBUTE_SET_ID) and str(attribute_set.get("system")).lower() == "true":
+        raise RuleViolation(f"Refused: this uses {label}, one of Lightspeed's built-in sets. Matrices use the store's "
+                            "own sets (set 5, or one made with create_attribute_set).")
+    if str(attribute_set.get("archived")).lower() == "true":
+        raise RuleViolation(f"Refused: {label} is archived.")
+    slots = {i: clean(attribute_set.get(f"attributeName{i}")) for i in (1, 2, 3)}
+    slots = {i: name for i, name in slots.items() if name}
+    if not any(name.lower() == "color" for name in slots.values()):
+        raise RuleViolation(f"Refused: {label} has no Color attribute. Color is always an attribute, never its own "
+                            "matrix.")
+    return slots
+
+
+def check_attribute_names(names: list) -> list[str]:
+    """1 to 3 distinct attribute names for a set, one of them Color."""
+    cleaned = [clean(n) for n in names or [] if clean(n)]
+    if not 1 <= len(cleaned) <= 3:
+        raise RuleViolation("Refused: an attribute set has 1 to 3 attributes.")
+    if len({n.lower() for n in cleaned}) != len(cleaned):
+        raise RuleViolation("Refused: an attribute set can't have the same attribute twice.")
+    if not any(n.lower() == "color" for n in cleaned):
+        raise RuleViolation("Refused: every store attribute set has Color (color is an attribute, never its own "
+                            "matrix).")
+    for n in cleaned:
+        if "/" in n or len(n) > 50:
+            raise RuleViolation(f"Refused: attribute name '{n}' (no '/', at most 50 characters).")
+        check_not_boys(n)
+    return cleaned
 
 
 def check_values(kind: str, values: list[str], required: bool = True) -> list[str]:

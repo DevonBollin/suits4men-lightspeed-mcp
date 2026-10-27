@@ -39,10 +39,40 @@ class LineMatch:
     status: str  # existing / new_variant / new_item / unresolved
     item: dict | None = None  # the existing item
     matrix: dict | None = None  # for new_variant
-    values: tuple[str, str, str] | None = None  # color, size, fit
+    values: tuple[str, str, str] | None = None  # by slot: attribute1-3 (for set 5: color, size, fit)
+    slots: dict[int, str] = field(default_factory=dict)  # the matrix's attribute names, e.g. {1: "Color", ...}
     reason: str = ""
     candidates: list[dict] = field(default_factory=list)
     vendor_number_known: bool = False  # the item already has this vendor number saved
+
+
+LEGACY_FIELDS = {1: "color", 2: "size", 3: "fit"}  # set 5's names; for any set they mean slots 1, 2, 3
+
+
+def resolve_values(entry: dict, slots: dict[int, str]) -> tuple[tuple[str, str, str], list[str], list[str]]:
+    """An entry's attribute values by slot (1-3) for a set with these slots ({1: "Color", ...}).
+
+    Values come from entry["values"] by attribute name, ignoring case ({"Neck": "15.5"}), or from
+    color / size / fit for slots 1 / 2 / 3. Returns (values, required names left empty, names or
+    fields that don't fit the set). Every named slot is required except one called "Fit".
+    Values are trimmed, never re-cased (vendor naming).
+    """
+    by_name = {str(k).strip().lower(): clean(v) for k, v in (entry.get("values") or {}).items()}
+    known = {name.lower() for name in slots.values()}
+    unexpected = [k for k in by_name if k not in known]
+    values, missing = [], []
+    for i in (1, 2, 3):
+        name = slots.get(i)
+        legacy = clean(entry.get(LEGACY_FIELDS[i]))
+        value = (by_name.get(name.lower()) if name else "") or legacy
+        if not name:
+            if value:
+                unexpected.append(LEGACY_FIELDS[i])
+            value = ""
+        elif not value and name.lower() != "fit":
+            missing.append(name)
+        values.append(value)
+    return (values[0], values[1], values[2]), missing, unexpected
 
 
 def vendor_numbers(item: dict) -> list[dict]:
@@ -80,6 +110,10 @@ class InvoiceMatcher:
     def children(self, matrix_id) -> list[dict]:
         return [i for i in self.items if str(i.get("itemMatrixID")) == str(int(matrix_id))]
 
+    def slots(self, attribute_set_id) -> dict[int, str]:
+        """A set's attribute names by slot, e.g. {1: "Color", 2: "Size", 3: "Fit"}."""
+        return fmt.attribute_slots(self.reader.attribute_sets().get(str(attribute_set_id)))
+
     def with_vendor_number(self, vendor_id, number: str) -> list[dict]:
         number = number.lower()
         return [i for i in self.items if not fmt.flag(i.get("archived")) and any(
@@ -106,7 +140,7 @@ class InvoiceMatcher:
         return [self._match_one(vendor_id, n, line) for n, line in enumerate(lines, 1)]
 
     def _match_one(self, vendor_id, number: int, line: dict) -> LineMatch:
-        values = tuple(clean(line.get(k)) for k in ("color", "size", "fit"))
+        given = any(clean(line.get(k)) for k in LEGACY_FIELDS.values()) or bool(line.get("values"))
         vendor_number = clean(line.get("vendor_number"))
 
         def found(item: dict) -> LineMatch:
@@ -126,12 +160,14 @@ class InvoiceMatcher:
 
         if vendor_number:
             by_number = self.with_vendor_number(vendor_id, vendor_number)
-            if len(by_number) == 1 and not any(values):
+            if len(by_number) == 1 and not given:
                 return found(by_number[0])
-            if by_number and values[0] and values[1]:
+            if by_number and given:
+                set_id = (by_number[0].get("ItemAttributes") or {}).get("itemAttributeSetID")
+                values, missing, _ = resolve_values(line, self.slots(set_id))
                 same = [i for i in by_number if tuple(v.lower() for v in attribute_values(i)) ==
                         tuple(v.lower() for v in values)]
-                if len(same) == 1:
+                if len(same) == 1 and not missing:
                     return found(same[0])
                 if line.get("matrix_id") is None:
                     matrix_ids = {fmt.ref_id(i.get("itemMatrixID")) for i in by_number} - {None}
@@ -142,22 +178,29 @@ class InvoiceMatcher:
             matrix = self.matrix(line["matrix_id"])
             if matrix is None:
                 return LineMatch(number, line, "unresolved", reason=f"Matrix {line['matrix_id']} was not found.")
-            if not values[0] or not values[1]:
-                return LineMatch(number, line, "unresolved", matrix=matrix,
-                                 reason="A matrix line needs its color and size (and fit, if the matrix uses one).")
+            slots = self.slots(matrix.get("itemAttributeSetID"))
+            values, missing, unexpected = resolve_values(line, slots)
+            names = " / ".join(slots.values()) or "no attributes"
+            if missing or unexpected:
+                return LineMatch(number, line, "unresolved", matrix=matrix, slots=slots,
+                                 reason=f"Matrix {matrix.get('itemMatrixID')} is {names}: "
+                                        + (f"give {', '.join(missing)}. " if missing else "")
+                                        + (f"It has no {', '.join(unexpected)}." if unexpected else ""))
             wanted = tuple(v.lower() for v in values)
             for child in self.children(line["matrix_id"]):
                 if tuple(v.lower() for v in attribute_values(child)) == wanted:
                     return found(child)
-            return LineMatch(number, line, "new_variant", matrix=matrix, values=values)
+            return LineMatch(number, line, "new_variant", matrix=matrix, values=values, slots=slots)
 
         if line.get("new_item"):
             return LineMatch(number, line, "new_item")
 
-        text = " ".join(p for p in (clean(line.get("description")), vendor_number, *values) if p)
+        given_values = [clean(v) for v in (line.get("values") or {}).values()]
+        text = " ".join(p for p in (clean(line.get("description")), vendor_number,
+                                    *(clean(line.get(k)) for k in LEGACY_FIELDS.values()), *given_values) if p)
         return LineMatch(number, line, "unresolved", candidates=self.candidates(text),
-                         reason="Not matched: give item_id, a matrix_id with color/size/fit, or new_item. "
-                                "Candidates by description are listed.")
+                         reason="Not matched: give item_id, a matrix_id with its attribute values (e.g. "
+                                "color/size/fit), or new_item. Candidates by description are listed.")
 
 
 def match_report(matches: list[LineMatch]) -> dict:
@@ -175,7 +218,7 @@ def match_report(matches: list[LineMatch]) -> dict:
             row["matrix"] = {"matrix_id": fmt.integer(m.matrix.get("itemMatrixID")),
                              "description": fmt.text(m.matrix.get("description"))}
         if m.values:
-            row["color_size_fit"] = list(m.values)
+            row["attributes"] = {m.slots.get(i, f"attribute{i}"): v for i, v in enumerate(m.values, 1) if v}
         if m.reason:
             row["reason"] = m.reason
         if m.candidates:

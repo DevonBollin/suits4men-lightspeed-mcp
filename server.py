@@ -411,6 +411,11 @@ def suggest_custom_skus(
     return run(lambda r: r.suggest_custom_skus(count))
 
 
+AttributeValues = Annotated[dict[str, str] | None, Field(
+    description="Values by the matrix's attribute names, e.g. {'Color': 'White', 'Neck': '15.5', 'Sleeve': '32/33'}. "
+                "For a Color/Size/Fit matrix, color/size/fit can be used instead.")]
+
+
 class NewItemDetails(BaseModel):
     description: Annotated[str, Field(description="Plain-language description, sizes allowed, no vendor codes, e.g. 'Dress Shirt White 15.5 32/33'.")]
     category_id: Annotated[int, Field(description="Category (list_categories).")]
@@ -433,10 +438,11 @@ class InvoiceLine(BaseModel):
     unit_cost: Annotated[float, Field(description="Unit cost on the invoice.")]
     item_id: Annotated[int | None, Field(description="The item, when already known.")] = None
     vendor_number: Annotated[str | None, Field(description="The vendor's style / item number as printed.")] = None
-    matrix_id: Annotated[int | None, Field(description="For a suit, tux, vest or pants: its Color/Size/Fit matrix.")] = None
+    matrix_id: Annotated[int | None, Field(description="For an item in a matrix (suit, tux, vest, pants, or a shirt/shoe matrix): the matrix.")] = None
     color: Annotated[str | None, Field(description="With matrix_id: color exactly as the vendor names it.")] = None
     size: Annotated[str | None, Field(description="With matrix_id: size, e.g. '42R'; pants: waist only.")] = None
     fit: Annotated[str | None, Field(description="With matrix_id: fit as the vendor names it.")] = None
+    values: AttributeValues = None
     description: Annotated[str | None, Field(description="The invoice's own text for the line (helps suggest matches).")] = None
     price: Annotated[float | None, Field(description="For a matrix variant that doesn't exist yet: its selling price.")] = None
     custom_sku: Annotated[str | None, Field(description="For a new item: its 6-digit SKU; empty = the next free one.")] = None
@@ -491,10 +497,11 @@ def compare_snapshots(
 
 
 class Variant(BaseModel):
-    color: Annotated[str, Field(description="Color exactly as the vendor names it, e.g. 'Midnight Blue'. Sent as given, never re-cased.")]
-    size: Annotated[str, Field(description="Size, e.g. '42R' for suits. Pants: waist only, e.g. '34'.")]
-    fit: Annotated[str, Field(description="Fit exactly as the vendor names it, e.g. 'Slim'. May be blank.")] = ""
     custom_sku: Annotated[str, Field(description="A new, unused 6-digit custom SKU, as text so leading zeros stay, e.g. '013471'.")]
+    color: Annotated[str | None, Field(description="Color exactly as the vendor names it, e.g. 'Midnight Blue'. Sent as given, never re-cased.")] = None
+    size: Annotated[str | None, Field(description="Size, e.g. '42R' for suits. Pants: waist only, e.g. '34'.")] = None
+    fit: Annotated[str | None, Field(description="Fit exactly as the vendor names it, e.g. 'Slim'. May be blank.")] = None
+    values: AttributeValues = None
 
 
 class NewPoLine(BaseModel):
@@ -505,9 +512,10 @@ class NewPoLine(BaseModel):
 
 class MoveItem(BaseModel):
     item_id: Annotated[int, Field(description="The existing item to put into the matrix.")]
-    color: Annotated[str, Field(description="Its color, exactly as the vendor names it.")]
-    size: Annotated[str, Field(description="Its size, e.g. '58L'. Pants: waist only.")]
-    fit: Annotated[str, Field(description="Its fit, exactly as the vendor names it. May be blank.")] = ""
+    color: Annotated[str | None, Field(description="Its color, exactly as the vendor names it.")] = None
+    size: Annotated[str | None, Field(description="Its size, e.g. '58L'. Pants: waist only.")] = None
+    fit: Annotated[str | None, Field(description="Its fit, exactly as the vendor names it. May be blank.")] = None
+    values: AttributeValues = None
 
 
 class SkuAssignment(BaseModel):
@@ -524,22 +532,54 @@ class Receipt(BaseModel):
 @write_tool
 def create_matrix(
     description: Annotated[str, Field(description="Plain-language matrix description naming the garment type, no vendor codes or colors, e.g. 'Giorgio Fiorelli Vest'.")],
-    garment_type: Annotated[str, Field(description="One of: suit (2-piece), tuxedo, vest, pants, sport coat. No 3-piece.")],
+    garment_type: Annotated[str, Field(description="One of: suit (2-piece), tuxedo, vest, pants, sport coat, shirt, shoes. No 3-piece.")],
     category_id: Annotated[int, Field(description="Category for the matrix (list_categories), e.g. 83 Suits/Suit.")],
     vendor_id: Annotated[int, Field(description="Default vendor (list_vendors).")],
     manufacturer_id: Annotated[int | None, Field(description="Manufacturer / brand (list_manufacturers).")] = None,
     default_cost: Annotated[float | None, Field(description="The matrix's default cost.")] = None,
     price: Annotated[float | None, Field(description="The matrix's Default selling price. Left unset unless given.")] = None,
+    attribute_set_id: Annotated[int, Field(description="Its attribute set (list_attribute_sets): 5 Color/Size/Fit, required for suits, tuxedos, vests, pants and sport coats; shirts or shoes may use another store-made set with Color.")] = 5,
     dry_run: DryRun = True,
     confirm_code: ConfirmCode = None,
 ) -> str:
-    """Create a new, empty item matrix under the store's attribute set 5 (Color/Size/Fit).
-    One matrix per brand line and garment type; colors, sizes and fits are added later by
-    add_matrix_variants (Lightspeed adds each variant's values to the matrix by itself).
-    Refuses a description with a vendor code or a color, a 3-piece or boys' matrix, or a
-    description that is already used."""
+    """Create a new, empty item matrix. Suiting (suits, tuxedos, vests, pants, sport coats) uses the
+    store's attribute set 5 (Color/Size/Fit); other garments may use another set the store made
+    (create_attribute_set), never one of Lightspeed's built-in sets, and every set has Color.
+    One matrix per brand line and garment type; values are added later by add_matrix_variants
+    (Lightspeed adds each variant's values to the matrix by itself). Refuses a description with
+    a vendor code or a color, a 3-piece or boys' matrix, or a description that is already used."""
     return run(lambda w: w.create_matrix(description, garment_type, category_id, vendor_id, manufacturer_id,
-                                         default_cost, price, dry_run, confirm_code), writer)
+                                         default_cost, price, dry_run, confirm_code, attribute_set_id), writer)
+
+
+@write_tool
+def create_attribute_set(
+    name: Annotated[str, Field(description="The set's name, e.g. 'Color/Neck/Sleeve'.")],
+    attribute_names: Annotated[list[str], Field(description="1 to 3 attribute names in order, one of them 'Color', e.g. ['Color', 'Neck', 'Sleeve'].")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Create an attribute set (a matrix type: the 1-3 dimensions its items differ by) for garments
+    other than suiting, e.g. dress shirts by Color / Neck / Sleeve or shoes by Color / Size / Width.
+    Every set has Color. Refuses a name or a list of attributes another set already has.
+    Lightspeed's docs on writing sets are contradictory, so the first one may be refused."""
+    return run(lambda w: w.create_attribute_set(name, attribute_names, dry_run, confirm_code), writer)
+
+
+@write_tool
+def update_attribute_set(
+    attribute_set_id: Annotated[int, Field(description="A store-made attribute set (not one of Lightspeed's built-in 1-4).")],
+    name: Annotated[str | None, Field(description="New name.")] = None,
+    attribute_names: Annotated[list[str] | None, Field(description="All 1-3 attribute names, in order, as they should be.")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Rename an attribute set or its attributes, or add an attribute. While matrices use the set,
+    refuses removing an attribute, moving Color, and swapping attribute names between slots (items'
+    values would show under the wrong names); the dry run lists every matrix a rename reaches.
+    Lightspeed's built-in sets are never changed."""
+    return run(lambda w: w.update_attribute_set(attribute_set_id, name, attribute_names, dry_run, confirm_code),
+               writer)
 
 
 @write_tool

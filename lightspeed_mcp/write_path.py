@@ -139,6 +139,10 @@ RENAME_BRAND = Route("PUT", re.compile(r"Manufacturer/\d+\.json"), frozenset({"n
 NEW_CATEGORY = Route("POST", re.compile(r"Category\.json"), frozenset({"name", "fullPathName", "parentID"}))
 RENAME_CATEGORY = Route("PUT", re.compile(r"Category/\d+\.json"), frozenset({"name", "fullPathName"}))
 DELETE_CATEGORY = Route("DELETE", re.compile(r"Category/\d+\.json"), frozenset())
+# Attribute sets (matrix types): a name and up to three attribute names. Never `archived` or `system`.
+ATTRIBUTE_SET_FIELDS = frozenset({"name", "attributeName1", "attributeName2", "attributeName3"})
+NEW_ATTRIBUTE_SET = Route("POST", re.compile(r"ItemAttributeSet\.json"), ATTRIBUTE_SET_FIELDS)
+UPDATE_ATTRIBUTE_SET = Route("PUT", re.compile(r"ItemAttributeSet/\d+\.json"), ATTRIBUTE_SET_FIELDS)
 # An inventory count and its counted items. Stock changes only when the count is reconciled, which
 # is never sent from here (it stays a click in Lightspeed).
 NEW_COUNT = Route("POST", re.compile(r"InventoryCount\.json"), frozenset({"name", "shopID"}))
@@ -211,6 +215,8 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "rename_category": (RENAME_CATEGORY,),
     "delete_category": (DELETE_CATEGORY,),
     "create_inventory_count": (NEW_COUNT, NEW_COUNT_ITEM),
+    "create_attribute_set": (NEW_ATTRIBUTE_SET,),
+    "update_attribute_set": (UPDATE_ATTRIBUTE_SET,),
 }
 
 

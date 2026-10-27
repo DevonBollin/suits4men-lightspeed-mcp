@@ -29,6 +29,11 @@ ATTRIBUTE_SETS = [
      "system": "true", "archived": "false"},
     {"itemAttributeSetID": "5", "name": "Color/Size/Fit", "attributeName1": "Color", "attributeName2": "Size",
      "attributeName3": "Fit", "system": "false", "archived": "false"},
+    # Made by the store for shirts (create_attribute_set), and one without Color.
+    {"itemAttributeSetID": "6", "name": "Color/Neck/Sleeve", "attributeName1": "Color", "attributeName2": "Neck",
+     "attributeName3": "Sleeve", "system": "false", "archived": "false"},
+    {"itemAttributeSetID": "7", "name": "Neck/Sleeve", "attributeName1": "Neck", "attributeName2": "Sleeve",
+     "attributeName3": "", "system": "false", "archived": "false"},
 ]
 CATEGORIES = [
     {"categoryID": "79", "name": "Pants", "fullPathName": "Pants", "archived": "false"},
@@ -72,6 +77,7 @@ def fresh_data() -> dict:
             matrix(8, "Giorgio Fiorelli", 5, 83, ["Black", "Navy"], [], []),
             matrix(9, "Angelo Rossi", 3, 83, ["Black"]),
             matrix(12, "Caravelli Pants", 5, 79, ["Black"], ["34"], []),
+            matrix(13, "Christopher Lena Dress Shirt", 6, 116, ["White"], ["15.5"], ["32/33"]),
         ],
         "Item": [
             item(1644, "Caravelli Black 42R Slim", "002427", 7, ("Black", "42R", "Slim"), qoh=-27),
@@ -115,9 +121,11 @@ class CannedReads:
     def get(self, path, params=None):
         self.calls.append((path, dict(params or {})))
         name, _, record_id = path.removesuffix(".json").partition("/")
-        tables = {"InventoryCount": [], **self.data, "Vendor": VENDORS, "Manufacturer": MANUFACTURERS}
+        tables = {"InventoryCount": [], **self.data, "Vendor": VENDORS, "Manufacturer": MANUFACTURERS,
+                  "ItemAttributeSet": ATTRIBUTE_SETS}
         key = {"ItemMatrix": "itemMatrixID", "Item": "itemID", "Order": "orderID", "Vendor": "vendorID",
-               "Manufacturer": "manufacturerID", "InventoryCount": "inventoryCountID"}[name]
+               "Manufacturer": "manufacturerID", "InventoryCount": "inventoryCountID",
+               "ItemAttributeSet": "itemAttributeSetID"}[name]
         for record in tables[name]:
             if record[key] == record_id:
                 return {name: copy.deepcopy(record)}
@@ -285,7 +293,7 @@ def test_create_matrix_sets_no_price_unless_asked(writer):
     (dict(description="Giorgio Fiorelli Three Piece Suit", garment_type="suit"), "3-piece"),
     (dict(description="Giorgio Fiorelli Suit", garment_type="3pc suit"), "3-piece"),
     (dict(description="Giorgio Fiorelli Boys Vest"), "boys"),
-    (dict(description="Giorgio Fiorelli Shirt", garment_type="shirt"), "not one of"),
+    (dict(description="Giorgio Fiorelli Hat", garment_type="hat"), "not one of"),
     (dict(description="Caravelli Pants", garment_type="pants", category_id=79), "already called"),
     (dict(category_id=999), "category 999"),
     (dict(vendor_id=999), "vendor 999"),

@@ -636,6 +636,33 @@ Built on the owner's request (the rest of the CRUD table). Docs findings:
 - Category 83 holds items with vendor codes in their description, e.g. 1158
   "S62KR Suit Heather-Grey 34R Modern".
 
+## Attribute sets, and matrices on other sets (2026-10-26, late)
+
+The owner asked for Claude to be able to add and edit attribute sets. **Rule
+change (owner, 2026-10-26):** suits, tuxedos, vests, pants and sport coats stay
+on set 5 Color/Size/Fit; other garments (shirts, shoes) may use a store-made
+set; never a built-in set (1-4); every set has Color. `rules.py` holds it
+(`SUITING_GARMENTS`, `check_matrix_attribute_set`, `check_attribute_names`).
+
+- Docs (ItemAttributeSet page): "Allowed actions" lists GET only, yet POST and
+  PUT sections exist; `name` "Color/Size, Size, Color, 3 Attributes. These are
+  the only allowed values for now", contradicted by its own "Color/Size/Fabric"
+  example and by this store's set 5; scope `employee:inventory_base` (not on the
+  scopes page). Fields: name, attributeName1-3, archived, system. DELETE not
+  documented. **The first create/update is the test**; a 403 would mean adding a
+  scope (try `employee:inventory_base`) and re-running bootstrap.
+- A set used by matrices: removing an attribute is refused (a third-party
+  integration reports item writes failing after a set's attribute count was
+  reduced); moving Color or swapping names between slots is refused (items keep
+  values by slot, so they would show under the wrong names).
+- Matrix tools now read a matrix's set fresh and take values by slot:
+  `{"values": {"Neck": "15.5"}}` by attribute name, or color/size/fit for slots
+  1/2/3. Every named attribute is required except one called "Fit". Pants waist
+  sizes are checked on the attribute called "Size".
+- Live dry runs: creating "Color/Neck/Sleeve" plans one POST; a copy of set 5's
+  attributes is refused; renaming set 5's "Fit" lists matrices 7, 8 and 11;
+  removing "Fit" from set 5 and editing built-in set 1 are refused.
+
 ## Helper tools (2026-10-26, evening)
 
 - `suggest_custom_skus`, `show_write_log`, `take_snapshot`, `compare_snapshots`.
@@ -651,4 +678,4 @@ Built on the owner's request (the rest of the CRUD table). Docs findings:
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
   `check_tools.py --dry-runs` calls every write tool on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (551 tests).
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (588 tests).

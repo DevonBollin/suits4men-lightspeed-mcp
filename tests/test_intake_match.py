@@ -63,7 +63,7 @@ def test_new_variant_and_new_item(reads):
     ({"item_id": 99999, "quantity": 1, "unit_cost": 1}, "not found"),
     ({"item_id": 1700, "quantity": 1, "unit_cost": 1}, "archived"),
     ({"matrix_id": 404, "color": "Black", "size": "42R", "quantity": 1, "unit_cost": 1}, "Matrix 404"),
-    ({"matrix_id": 7, "color": "Black", "quantity": 1, "unit_cost": 1}, "color and size"),
+    ({"matrix_id": 7, "color": "Black", "quantity": 1, "unit_cost": 1}, "Color / Size / Fit: give Size"),
 ])
 def test_unresolved_lines_say_why(reads, line, reason):
     [m] = match(reads, line)

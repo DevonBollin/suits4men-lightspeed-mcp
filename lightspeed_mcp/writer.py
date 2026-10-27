@@ -470,31 +470,44 @@ class InventoryWriter:
 
     # ---- matrix checks shared by add_matrix_variants and move_items_into_matrix --------------
 
-    def _target_matrix(self, matrix_id: int) -> tuple[dict, str, bool]:
-        """The matrix items will go into: (record, description, is a pants matrix). Must be an active set-5 matrix."""
+    def _attribute_set(self, set_id) -> dict | None:
+        """An attribute set, read fresh (not from the reader's cache), so a set made moments ago is seen."""
+        return self._get_record(f"ItemAttributeSet/{int(set_id)}.json", "ItemAttributeSet")
+
+    def _target_matrix(self, matrix_id: int) -> tuple[dict, str, bool, dict[int, str]]:
+        """The matrix items will go into: (record, description, is a pants matrix, its attribute names by
+        slot). Must be active, on set 5 if it's suiting, otherwise on a store-made set with Color."""
         matrix = self.reader._matrix_record(int(matrix_id))
         if matrix is None:
             raise RuleViolation(f"Refused: matrix {matrix_id} was not found (or can't be read).")
         if fmt.flag(matrix.get("archived")):
             raise RuleViolation(f"Refused: matrix {matrix_id} is archived.")
-        rules.check_attribute_set(matrix.get("itemAttributeSetID"))
         matrix_desc = fmt.text(matrix.get("description")) or ""
+        slots = rules.check_matrix_attribute_set(self._attribute_set(matrix.get("itemAttributeSetID")),
+                                                 rules.is_suiting(matrix_desc))
         category_path = fmt.text((self.reader.categories().get(str(matrix.get("categoryID"))) or {}).get("fullPathName")) or ""
         rules.check_not_three_piece(matrix_desc)
         rules.check_not_boys(matrix_desc, category_path)
-        return matrix, matrix_desc, rules.is_pants(matrix_desc, category_path)
+        return matrix, matrix_desc, rules.is_pants(matrix_desc, category_path), slots
 
     @staticmethod
-    def _variant_body(matrix: dict, matrix_desc: str, values: tuple[str, str, str], sku: str, cost_text: str,
+    def _item_attributes(matrix: dict, values: tuple[str, str, str]) -> dict:
+        """ItemAttributes for an item in this matrix: its set, and each slot that has a value."""
+        attributes = {"itemAttributeSetID": str(matrix.get("itemAttributeSetID"))}
+        for i, value in enumerate(values, 1):
+            if value:
+                attributes[f"attribute{i}"] = value
+        return attributes
+
+    @classmethod
+    def _variant_body(cls, matrix: dict, matrix_desc: str, values: tuple[str, str, str], sku: str, cost_text: str,
                       price_text: str) -> dict:
-        """The POST Item.json body for a new item in a matrix: '<matrix description> <color> <size> <fit>',
-        the given SKU, cost and Default price, and the matrix's category, vendor, manufacturer and tax."""
-        color, size, fit = values
-        attributes = {"itemAttributeSetID": str(rules.STORE_ATTRIBUTE_SET_ID), "attribute1": color, "attribute2": size}
-        if fit:
-            attributes["attribute3"] = fit
+        """The POST Item.json body for a new item in a matrix: '<matrix description> <values>' (for set 5:
+        color, size, fit), the given SKU, cost and Default price, and the matrix's category, vendor,
+        manufacturer and tax."""
+        attributes = cls._item_attributes(matrix, values)
         body = {
-            "description": " ".join(p for p in (matrix_desc, color, size, fit) if p),
+            "description": " ".join(p for p in (matrix_desc, *values) if p),
             "itemMatrixID": str(matrix.get("itemMatrixID")),
             "itemType": fmt.text(matrix.get("itemType")) or "default",
             "customSku": sku,
@@ -556,28 +569,39 @@ class InventoryWriter:
         return {"ItemVendorNum": kept + [new]}
 
     @staticmethod
-    def _clean_values(entry: dict, what: str) -> tuple[str, str, str]:
-        """Color, size and fit, trimmed but otherwise exactly as given (vendor naming)."""
-        color, size, fit = (rules.clean(entry.get(k)) for k in ("color", "size", "fit"))
-        if not color or not size:
-            raise RuleViolation(f"Refused: {what} needs a color and a size (fit may be blank).")
-        rules.check_not_three_piece(color, size, fit)
-        rules.check_not_boys(color, size, fit)
-        return color, size, fit
+    def _clean_values(entry: dict, what: str, slots: dict[int, str]) -> tuple[str, str, str]:
+        """The entry's values for the matrix's attributes (by slot), trimmed but otherwise exactly as given
+        (vendor naming). Every named attribute is required except one called Fit."""
+        values, missing, unexpected = intake.resolve_values(entry, slots)
+        names = " / ".join(slots.values())
+        if unexpected:
+            raise RuleViolation(f"Refused: {what}: this matrix's attributes are {names}; it has no "
+                                f"{', '.join(unexpected)}.")
+        if missing:
+            raise RuleViolation(f"Refused: {what} needs a {' and a '.join(m.lower() for m in missing)} "
+                                f"(attributes: {names}; fit may be blank).")
+        rules.check_not_three_piece(*values)
+        rules.check_not_boys(*values)
+        return values
+
+    @staticmethod
+    def _combo_text(values: tuple[str, str, str]) -> str:
+        return " / ".join(v for v in values if v)
 
     def _check_matrix_values(self, matrix_id: int, matrix: dict, pants: bool, combos: list[tuple[str, str, str]],
-                             warnings: list[str]) -> list[dict]:
+                             warnings: list[str], slots: dict[int, str]) -> list[dict]:
         """Refuse waist-less pants sizes, repeated combinations, combinations the matrix already has
         (archived items too) and values that differ from the matrix's only in capitals. Warn about new
         values. Returns the matrix's items (archived included)."""
         if pants:
-            rules.check_waist_sizes([size for _, size, _ in combos])
+            size_slot = next((i for i, n in slots.items() if n.lower() == "size"), 2)
+            rules.check_waist_sizes([c[size_slot - 1] for c in combos])
         seen = set()
-        for color, size, fit in combos:
-            combo = (color.lower(), size.lower(), fit.lower())
-            if combo in seen:
-                raise RuleViolation(f"Refused: {color} / {size} / {fit or '(no fit)'} is listed twice.")
-            seen.add(combo)
+        for combo in combos:
+            key = tuple(v.lower() for v in combo)
+            if key in seen:
+                raise RuleViolation(f"Refused: {self._combo_text(combo)} is listed twice.")
+            seen.add(key)
 
         children, _ = self.client.get_all("Item.json", {
             "itemMatrixID": str(int(matrix_id)), "archived": "true", "load_relations": relations("ItemAttributes")})
@@ -585,15 +609,16 @@ class InventoryWriter:
         for c in children:
             attrs = c.get("ItemAttributes") or {}
             existing[tuple((fmt.text(attrs.get(f"attribute{i}")) or "").lower() for i in (1, 2, 3))] = c
-        for color, size, fit in combos:
-            child = existing.get((color.lower(), size.lower(), fit.lower()))
+        for combo in combos:
+            child = existing.get(tuple(v.lower() for v in combo))
             if child:
                 state = "an archived item" if fmt.flag(child.get("archived")) else "an item"
-                raise RuleViolation(f"Refused: matrix {matrix_id} already has {state} for {color} / {size} / "
-                                    f"{fit or '(no fit)'}: {item_label(child)}.")
+                raise RuleViolation(f"Refused: matrix {matrix_id} already has {state} for {self._combo_text(combo)}: "
+                                    f"{item_label(child)}.")
 
-        for index, kind, values in ((1, "color", [c[0] for c in combos]), (2, "size", [c[1] for c in combos]),
-                                    (3, "fit", [c[2] for c in combos if c[2]])):
+        for index, kind in slots.items():
+            kind = kind.lower()
+            values = [c[index - 1] for c in combos if c[index - 1]]
             offered = fmt.matrix_attribute_values(matrix, index)
             by_lower = {o.lower(): o for o in offered}
             new = []
@@ -622,10 +647,14 @@ class InventoryWriter:
         price: float | None = None,
         dry_run: bool = True,
         confirm_code: str | None = None,
+        attribute_set_id: int = rules.STORE_ATTRIBUTE_SET_ID,
     ) -> dict:
         def build() -> Plan:
             desc = rules.check_plain_description(description, "matrix description")
             garment = rules.check_garment_type(garment_type, desc)
+            attribute_set = self._attribute_set(attribute_set_id)
+            slots = rules.check_matrix_attribute_set(attribute_set, garment in rules.SUITING_GARMENTS)
+            set_label = f"attribute set {int(attribute_set_id)} '{fmt.text(attribute_set.get('name'))}'"
             warnings: list[str] = []
 
             category = self.reader.categories().get(str(int(category_id)))
@@ -661,7 +690,7 @@ class InventoryWriter:
 
             body: dict = {
                 "description": desc,
-                "itemAttributeSetID": str(rules.STORE_ATTRIBUTE_SET_ID),
+                "itemAttributeSetID": str(int(attribute_set_id)),
                 "itemType": "default",
                 "categoryID": str(int(category_id)),
                 "defaultVendorID": str(int(vendor_id)),
@@ -688,13 +717,13 @@ class InventoryWriter:
                                 "add_matrix_variants, never the matrix's.")
 
             summary = (
-                f"Create a new, empty item matrix '{desc}' ({garment}) using attribute set 5 Color/Size/Fit, in "
-                f"category '{category_path}', vendor '{vendor_name}'"
+                f"Create a new, empty item matrix '{desc}' ({garment}) using {set_label} "
+                f"({' / '.join(slots.values())}), in category '{category_path}', vendor '{vendor_name}'"
                 + (f", manufacturer '{manufacturer_name}'" if manufacturer_name else "")
                 + (f", default cost {cost_text}" if cost_text else "")
                 + (f", Default price {price_text}" if price_text else ", no price")
-                + ". No items are created: add them with add_matrix_variants. Each variant's color, size and fit are "
-                  "added to the matrix automatically when the variant is created."
+                + ". No items are created: add them with add_matrix_variants. Each variant's values are added to the "
+                  "matrix automatically when the variant is created."
             )
             return Plan("create_matrix", summary,
                         [PlannedRequest(f"create matrix '{desc}'", "POST", "ItemMatrix.json", body)], warnings)
@@ -717,16 +746,16 @@ class InventoryWriter:
                 raise RuleViolation("Refused: give at least one variant.")
             if len(variants) > MAX_REQUESTS_PER_CALL:
                 raise RuleViolation(f"Refused: {len(variants)} variants; the limit is {MAX_REQUESTS_PER_CALL} per call.")
-            matrix, matrix_desc, pants = self._target_matrix(matrix_id)
+            matrix, matrix_desc, pants, slots = self._target_matrix(matrix_id)
             price_text, cost_text = money(price, "price"), money(cost, "cost")
             warnings: list[str] = []
 
             cleaned = []
             for n, v in enumerate(variants, 1):
-                color, size, fit = self._clean_values(v, f"variant {n}")
-                cleaned.append((color, size, fit, rules.check_custom_sku_format(v.get("custom_sku"))))
+                values = self._clean_values(v, f"variant {n}", slots)
+                cleaned.append((*values, rules.check_custom_sku_format(v.get("custom_sku"))))
             rules.check_skus_unique_in_request([sku for *_, sku in cleaned])
-            children = self._check_matrix_values(matrix_id, matrix, pants, [c[:3] for c in cleaned], warnings)
+            children = self._check_matrix_values(matrix_id, matrix, pants, [c[:3] for c in cleaned], warnings, slots)
 
             taken = {sku: items for sku, items in self._items_with_skus([s for *_, s in cleaned]).items() if items}
             if taken:
@@ -742,8 +771,8 @@ class InventoryWriter:
                 warnings.append(f"Most items in this matrix sell at {common:.2f}; these would sell at {price_text}.")
 
             requests = []
-            for color, size, fit, sku in cleaned:
-                body = self._variant_body(matrix, matrix_desc, (color, size, fit), sku, cost_text, price_text)
+            for *values, sku in cleaned:
+                body = self._variant_body(matrix, matrix_desc, tuple(values), sku, cost_text, price_text)
                 requests.append(PlannedRequest(f"create '{body['description']}' (SKU {sku})", "POST", "Item.json", body))
 
             summary = (f"Create {len(requests)} new item(s) in matrix {matrix_id} '{matrix_desc}'"
@@ -978,7 +1007,7 @@ class InventoryWriter:
                         "don't describe it. Move one item first, check it (get_item, compare_snapshots), then move "
                         "the rest.")
                 raise RuleViolation(f"Refused: {len(items)} items; the limit is {limit} per call.")
-            matrix, matrix_desc, pants = self._target_matrix(matrix_id)
+            matrix, matrix_desc, pants, slots = self._target_matrix(matrix_id)
             ids = [str(int(entry.get("item_id"))) for entry in items]
             if len(set(ids)) != len(ids):
                 raise RuleViolation("Refused: the same item is listed twice.")
@@ -997,22 +1026,18 @@ class InventoryWriter:
                     raise RuleViolation(f"Refused: {item_label(item)} is already in matrix {matrix_id}.")
                 rules.check_not_three_piece(fmt.text(item.get("description")) or "")
                 rules.check_not_boys(fmt.text(item.get("description")) or "")
-                moves.append((item, *self._clean_values(entry, item_label(item)), current_matrix))
-            self._check_matrix_values(matrix_id, matrix, pants, [(c, s, f) for _, c, s, f, _ in moves], warnings)
+                moves.append((item, self._clean_values(entry, item_label(item), slots), current_matrix))
+            self._check_matrix_values(matrix_id, matrix, pants, [values for _, values, _ in moves], warnings, slots)
 
             matrix_price = fmt.prices(matrix).get("Default")
             requests = []
-            for item, color, size, fit, current_matrix in moves:
-                attributes = {"itemAttributeSetID": str(rules.STORE_ATTRIBUTE_SET_ID), "attribute1": color,
-                              "attribute2": size}
-                if fit:
-                    attributes["attribute3"] = fit
-                body: dict = {"itemMatrixID": str(int(matrix_id)), "ItemAttributes": attributes}
-                changes = [f"matrix {current_matrix or 'none'} -> {matrix_id}", f"{color} / {size} / {fit or '-'}"]
+            for item, values, current_matrix in moves:
+                body: dict = {"itemMatrixID": str(int(matrix_id)), "ItemAttributes": self._item_attributes(matrix, values)}
+                changes = [f"matrix {current_matrix or 'none'} -> {matrix_id}", self._combo_text(values)]
                 if not only_matrix_and_attributes:
                     # Like the matrix's other items: its description pattern, category, manufacturer and vendor.
                     old_desc = fmt.text(item.get("description")) or ""
-                    new_desc = " ".join(p for p in (matrix_desc, color, size, fit) if p)
+                    new_desc = " ".join(p for p in (matrix_desc, *values) if p)
                     if new_desc != old_desc:
                         body["description"] = new_desc
                         changes.append(f"description '{old_desc}' -> '{new_desc}'")
@@ -1495,11 +1520,12 @@ class InventoryWriter:
                                         for m in new_matches])
             matrix_info: dict[str, tuple[dict, str]] = {}
             for mid in dict.fromkeys(str(m.matrix.get("itemMatrixID")) for m in matches if m.status == "new_variant"):
-                matrix, matrix_desc, pants = self._target_matrix(mid)
+                matrix, matrix_desc, pants, slots = self._target_matrix(mid)
                 group = [m for m in matches if m.status == "new_variant" and str(m.matrix.get("itemMatrixID")) == mid]
+                # m.values are already by slot; color/size/fit stand for slots 1/2/3 in any set.
                 combos = [self._clean_values({"color": m.values[0], "size": m.values[1], "fit": m.values[2]},
-                                             f"line {m.number}") for m in group]
-                self._check_matrix_values(mid, matrix, pants, combos, warnings)
+                                             f"line {m.number}", slots) for m in group]
+                self._check_matrix_values(mid, matrix, pants, combos, warnings, slots)
                 matrix_info[mid] = (matrix, matrix_desc)
             tax = self._tax_fields(warnings) if any(m.status == "new_item" for m in matches) else {}
             taken_desc = self._active_descriptions(skus)
@@ -2274,3 +2300,110 @@ class InventoryWriter:
             return Plan("create_inventory_count", summary, requests, lines, after)
 
         return self._run("create_inventory_count", dry_run, confirm_code, build)
+
+    # ---- 21. attribute sets (matrix types) ----------------------------------------------------------------
+
+    ATTRIBUTE_SET_DOCS_WARNING = (
+        "Lightspeed's docs for attribute sets are contradictory: they list reading as the only allowed action, say a "
+        "set's name may only be one of the built-in ones ('Color/Size', 'Size', 'Color', '3 Attributes') although "
+        "their own example and this store's set 5 'Color/Size/Fit' differ, and name a permission "
+        "(employee:inventory_base) that isn't on the scopes page. Lightspeed may refuse this; if it does, nothing "
+        "changes.")
+
+    def _all_attribute_sets(self) -> list[dict]:
+        rows, _ = self.client.get_all("ItemAttributeSet.json", {"archived": "true"})
+        return rows
+
+    def create_attribute_set(self, name: str, attribute_names: list[str], dry_run: bool = True,
+                             confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            set_name = rules.check_record_name(name, "attribute set")
+            names = rules.check_attribute_names(attribute_names)
+            for s in self._all_attribute_sets():
+                if (fmt.text(s.get("name")) or "").lower() == set_name.lower():
+                    raise RuleViolation(f"Refused: attribute set {s.get('itemAttributeSetID')} is already called "
+                                        f"'{set_name}'.")
+                theirs = [n.lower() for n in fmt.attribute_slots(s).values()]
+                if theirs == [n.lower() for n in names]:
+                    raise RuleViolation(f"Refused: attribute set {s.get('itemAttributeSetID')} '{s.get('name')}' already "
+                                        f"has these attributes ({' / '.join(names)}). Use it.")
+            body = {"name": set_name, **{f"attributeName{i}": n for i, n in enumerate(names, 1)}}
+            summary = (f"Create the attribute set '{set_name}' with attributes {' / '.join(names)}. Matrices for "
+                       "shirts, shoes and other non-suiting garments can then use it (create_matrix with "
+                       "attribute_set_id). Suits, tuxedos, vests, pants and sport coats stay on set 5.")
+            return Plan("create_attribute_set", summary,
+                        [PlannedRequest(f"create attribute set '{set_name}'", "POST", "ItemAttributeSet.json", body)],
+                        [self.ATTRIBUTE_SET_DOCS_WARNING])
+
+        return self._run("create_attribute_set", dry_run, confirm_code, build)
+
+    def update_attribute_set(self, attribute_set_id: int, name: str | None = None,
+                             attribute_names: list[str] | None = None, dry_run: bool = True,
+                             confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            set_id = str(int(attribute_set_id))
+            current = self._attribute_set(set_id)
+            if current is None:
+                raise RuleViolation(f"Refused: attribute set {set_id} does not exist.")
+            if str(current.get("system")).lower() == "true":
+                raise RuleViolation(f"Refused: attribute set {set_id} '{current.get('name')}' is one of Lightspeed's "
+                                    "built-in sets; those aren't changed.")
+            if fmt.flag(current.get("archived")):
+                raise RuleViolation(f"Refused: attribute set {set_id} is archived.")
+            in_use = [m for m in self._all_matrices() if str(m.get("itemAttributeSetID")) == set_id]
+            body: dict = {}
+            changes: list[str] = []
+            warnings: list[str] = [self.ATTRIBUTE_SET_DOCS_WARNING]
+
+            if name is not None and rules.clean(name) != fmt.text(current.get("name")):
+                new_name = rules.check_record_name(name, "attribute set")
+                for s in self._all_attribute_sets():
+                    if str(s.get("itemAttributeSetID")) != set_id and (fmt.text(s.get("name")) or "").lower() == new_name.lower():
+                        raise RuleViolation(f"Refused: attribute set {s.get('itemAttributeSetID')} is already called "
+                                            f"'{new_name}'.")
+                body["name"] = new_name
+                changes.append(f"name '{current.get('name')}' -> '{new_name}'")
+
+            if attribute_names is not None:
+                names = rules.check_attribute_names(attribute_names)
+                old = {i: fmt.text(current.get(f"attributeName{i}")) or "" for i in (1, 2, 3)}
+                new = {i: names[i - 1] if i <= len(names) else "" for i in (1, 2, 3)}
+                if in_use:
+                    for i in (1, 2, 3):
+                        if old[i] and not new[i]:
+                            raise RuleViolation(
+                                f"Refused: matrices use this set, so its attribute '{old[i]}' can't be removed (after "
+                                "an attribute is removed, Lightspeed is reported to refuse updates to the items).")
+                        if old[i].lower() == "color" and new[i].lower() != "color":
+                            raise RuleViolation("Refused: Color must stay in its slot while matrices use this set.")
+                        moved = [j for j in (1, 2, 3) if j != i and old[j] and new[i].lower() == old[j].lower()]
+                        if moved:
+                            raise RuleViolation(
+                                f"Refused: '{new[i]}' would move from attribute {moved[0]} to attribute {i}. Every item "
+                                "keeps its values in the same slots, so they would be shown under the wrong names.")
+                        if new[i] and not old[i]:
+                            warnings.append(f"Adds attribute {i} '{new[i]}': existing items have no value for it (how "
+                                            "Lightspeed shows that isn't documented).")
+                for i in (1, 2, 3):
+                    if new[i] != old[i]:
+                        body[f"attributeName{i}"] = new[i]
+                        changes.append(f"attribute {i} '{old[i] or '-'}' -> '{new[i] or '-'}'")
+
+            if not body:
+                raise RuleViolation(f"Refused: nothing to change on attribute set {set_id}.")
+            if in_use and any(k.startswith("attributeName") for k in body):
+                warnings.append("Every matrix on this set shows the new attribute names, with their items' values "
+                                "unchanged: " + ", ".join(f"{m.get('itemMatrixID')} '{fmt.text(m.get('description'))}'"
+                                                          + (" (archived)" if fmt.flag(m.get("archived")) else "")
+                                                          for m in in_use) + ".")
+            if set_id == str(rules.STORE_ATTRIBUTE_SET_ID) and any(k.startswith("attributeName") for k in body):
+                warnings.append("This is the suiting set. The tools' rules follow the attribute names: pants sizes are "
+                                "checked on 'Size', and only 'Fit' may be left blank.")
+            summary = (f"Change attribute set {set_id} '{current.get('name')}': " + "; ".join(changes)
+                       + f". {len(in_use)} matrix(es) use it. Items' values are not sent.")
+            return Plan("update_attribute_set", summary,
+                        [PlannedRequest(f"update attribute set {set_id}", "PUT", f"ItemAttributeSet/{set_id}.json",
+                                        body)],
+                        warnings, basis={"timeStamp": current.get("timeStamp"), "matrices": len(in_use)})
+
+        return self._run("update_attribute_set", dry_run, confirm_code, build)
