@@ -998,6 +998,21 @@ def delete_category(
     return run(lambda w: w.delete_category(category_id, dry_run, confirm_code), writer)
 
 
+@write_tool
+def move_category(
+    category_id: Annotated[int, Field(description="The category to move (one without subcategories).")],
+    parent_id: Annotated[int | None, Field(description="The category it goes under (list_categories); empty for top level.")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Move a category under another parent, or to the top level, e.g. Suits/Tuxedos under a new
+    Tuxedos department. Its items and matrices stay in it and move with it; its name stays (use
+    rename_category). Only categories without subcategories: to move a branch, create the new parent
+    and move the subcategories one by one, then delete the empty old parent. Refuses a name a
+    category under the new parent already has."""
+    return run(lambda w: w.move_category(category_id, parent_id, dry_run, confirm_code), writer)
+
+
 class CountedItem(BaseModel):
     item_id: Annotated[int, Field(description="The item counted.")]
     counted: Annotated[int, Field(description="How many were counted (0 or more).")]

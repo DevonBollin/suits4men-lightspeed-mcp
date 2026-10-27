@@ -2555,3 +2555,56 @@ class InventoryWriter:
             return Plan("set_upcs", summary, requests, warnings)
 
         return self._run("set_upcs", dry_run, confirm_code, build)
+
+    # ---- 24. move a category under another parent ----------------------------------------------------------
+
+    def move_category(self, category_id: int, parent_id: int | None, dry_run: bool = True,
+                      confirm_code: str | None = None) -> dict:
+        """Lightspeed's Category docs list parentID among the fields an update takes, and its Retail help
+        moves a category by changing its Parent. Whether the API also rewrites the full path names of
+        subcategories isn't documented, so only categories without subcategories are moved: a branch is
+        rebuilt by creating the new parent and moving the leaves into it."""
+
+        def build() -> Plan:
+            category = self._category(category_id)
+            cid = str(int(category_id))
+            if fmt.flag(category.get("archived")):
+                raise RuleViolation(f"Refused: category {cid} is archived.")
+            children = [c for c in self.reader.categories().values() if str(c.get("parentID")) == cid]
+            if children:
+                raise RuleViolation(f"Refused: category {cid} has {len(children)} subcategories. Lightspeed doesn't say "
+                                    "whether their paths follow a move, so only categories without subcategories are "
+                                    "moved: create the new parent (create_category) and move the subcategories one "
+                                    "by one, then delete the empty old one.")
+            parent = str(int(parent_id)) if parent_id else "0"
+            if parent == cid:
+                raise RuleViolation("Refused: a category can't go under itself.")
+            if parent == str(category.get("parentID") or "0"):
+                raise RuleViolation(f"Refused: category {cid} is already there.")
+            parent_path = ""
+            if parent != "0":
+                parent_record = self._category(parent)
+                if fmt.flag(parent_record.get("archived")):
+                    raise RuleViolation(f"Refused: category {parent} is archived.")
+                parent_path = fmt.text(parent_record.get("fullPathName")) or ""
+            name = fmt.text(category.get("name")) or ""
+            self._check_category_name(name, parent, except_id=cid)  # no sibling there with the same name
+            old_path = fmt.text(category.get("fullPathName")) or ""
+            path = f"{parent_path}/{name}" if parent_path else name
+            items, _ = self.client.get_all("Item.json", {"categoryID": cid, "archived": "true"})
+            matrices, _ = self.client.get_all("ItemMatrix.json", {"categoryID": cid, "archived": "true"})
+            summary = (f"Move category {cid} '{old_path}' -> '{path}'" + (" (top level)" if parent == "0" else "")
+                       + f". Its {len(items)} item(s) and {len(matrices)} matrix(es) stay in it, so they move with it. "
+                         "Only its parent and path are sent; its name stays.")
+            after = None
+            if not any(e.get("tool") == "move_category" and e.get("event") == "done"
+                       for e in self.writes.write_log.entries()):
+                after = ("This is the first category move through the API. Take a snapshot before (take_snapshot) and "
+                         "compare after (compare_snapshots) to check the category's path and that its items kept it.")
+            return Plan("move_category", summary,
+                        [PlannedRequest(f"move category {cid} " + (f"under '{parent_path}'" if parent_path
+                                                                   else "to the top level"), "PUT",
+                                        f"Category/{cid}.json", {"parentID": parent, "fullPathName": path})],
+                        after=after, basis={"timeStamp": category.get("timeStamp")})
+
+        return self._run("move_category", dry_run, confirm_code, build)

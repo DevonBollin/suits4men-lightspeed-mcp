@@ -261,6 +261,7 @@ across several entries and switched over atomically. See
 | `update_vendor` / `archive_vendor` | `PUT Vendor/<id>.json` (name, account number) / `DELETE` (archives) | Archive a vendor still used by an active item or an open PO |
 | `rename_brand` | `PUT Manufacturer/<id>.json`: name | Take another brand's name |
 | `create_category` / `rename_category` / `delete_category` | `POST`/`PUT Category` (name, path, parent) / `DELETE` (for good) | Rename one with subcategories; delete one with items, matrices or subcategories |
+| `move_category` | `PUT Category/<id>.json`: new parent and path; its items and matrices move with it | Move one with subcategories (rebuild a branch leaf by leaf), or rename it |
 | `create_inventory_count` | `POST InventoryCount.json` + one `POST InventoryCountItem.json` per counted item | **Reconcile** (the step that changes stock stays a click in Lightspeed) |
 | `create_attribute_set` / `update_attribute_set` | `POST`/`PUT ItemAttributeSet`: a set's name and its 1-3 attribute names (one is always Color) | Touch Lightspeed's built-in sets 1-4; remove, swap or move Color in a set that matrices use |
 | `reassign_items` | `PUT Item/<id>.json` per item: default vendor, brand and/or category, only what changes | Touch an item in a matrix (`update_matrix` does the whole matrix), or prices, cost, stock and vendor numbers |

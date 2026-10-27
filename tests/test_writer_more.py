@@ -160,6 +160,43 @@ def test_rename_category_with_subcategories_is_refused(writer, tree):
         writer.rename_category(82, "Suiting")
 
 
+def test_move_category_to_a_new_parent(writer, tree):
+    result = writer.move_category(84, 79)                 # Suits/Tuxedos under Pants, as a stand-in parent
+    [request] = result["requests"]
+    assert request["method"] == "PUT" and request["path"].endswith("/Category/84.json")
+    assert request["body"] == {"parentID": "79", "fullPathName": "Pants/Tuxedos"}
+    assert "first category move" in result["after"]
+    top = writer.move_category(84, None)["requests"][0]["body"]
+    assert top == {"parentID": "0", "fullPathName": "Tuxedos"}
+
+
+def test_move_category_names_its_items(writer, tree):
+    result = writer.move_category(83, None)              # the canned items are in 83
+    assert "Suits/Suit' -> 'Suit' (top level)" in result["summary"] and "item(s)" in result["summary"]
+
+
+@pytest.mark.parametrize("category, parent, message", [
+    (82, 79, "subcategories"),                           # a branch: rebuilt leaf by leaf
+    (84, 82, "already there"),
+    (84, 84, "under itself"),
+    (84, 999, "does not exist"),
+    (90, 79, None),                                       # fine: checked separately
+])
+def test_move_category_rules(writer, tree, category, parent, message):
+    if message is None:
+        assert writer.move_category(category, parent)["requests"]
+        return
+    with pytest.raises(RuleViolation, match=message):
+        writer.move_category(category, parent)
+
+
+def test_move_category_refuses_a_name_taken_under_the_new_parent(writer, tree, monkeypatch):
+    monkeypatch.setattr(canned, "CATEGORIES", canned.CATEGORIES + [
+        {"categoryID": "91", "name": "Tuxedos", "fullPathName": "Pants/Tuxedos", "parentID": "79"}])
+    with pytest.raises(RuleViolation, match="already has this name"):
+        writer.move_category(84, 79)
+
+
 def test_delete_only_an_empty_category(writer, tree):
     result = writer.delete_category(90)
     assert result["requests"][0]["method"] == "DELETE" and result["requests"][0]["path"].endswith("/Category/90.json")

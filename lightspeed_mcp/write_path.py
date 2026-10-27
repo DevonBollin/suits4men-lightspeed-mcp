@@ -143,6 +143,8 @@ RENAME_BRAND = Route("PUT", re.compile(r"Manufacturer/\d+\.json"), frozenset({"n
 NEW_CATEGORY = Route("POST", re.compile(r"Category\.json"), frozenset({"name", "fullPathName", "parentID"}))
 RENAME_CATEGORY = Route("PUT", re.compile(r"Category/\d+\.json"), frozenset({"name", "fullPathName"}))
 DELETE_CATEGORY = Route("DELETE", re.compile(r"Category/\d+\.json"), frozenset())
+# A category's place in the tree: its new parent and the path that goes with it. Never its name.
+MOVE_CATEGORY = Route("PUT", re.compile(r"Category/\d+\.json"), frozenset({"parentID", "fullPathName"}))
 # Attribute sets (matrix types): a name and up to three attribute names. Never `archived` or `system`.
 ATTRIBUTE_SET_FIELDS = frozenset({"name", "attributeName1", "attributeName2", "attributeName3"})
 NEW_ATTRIBUTE_SET = Route("POST", re.compile(r"ItemAttributeSet\.json"), ATTRIBUTE_SET_FIELDS)
@@ -226,6 +228,7 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "update_attribute_set": (UPDATE_ATTRIBUTE_SET,),
     "reassign_items": (ITEM_VENDOR_BRAND_CATEGORY,),
     "set_upcs": (ITEM_UPC,),
+    "move_category": (MOVE_CATEGORY,),
 }
 
 
