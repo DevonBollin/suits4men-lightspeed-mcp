@@ -1835,3 +1835,152 @@ class InventoryWriter:
         if record is None:
             raise RuleViolation(f"Refused: manufacturer {manufacturer_id} does not exist.")
         return fmt.text(record.get("name")) or ""
+
+    # ---- 13. item prices -------------------------------------------------------------------------------
+
+    PRICE_LEVELS = (("default", "1", "Default"), ("msrp", "2", "MSRP"), ("online", "3", "Online"))
+
+    def update_item_prices(self, items: list[dict], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        """The only tool that changes an existing item's prices: each change is asked for explicitly."""
+
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            found = self._items_by_id(ids)
+            requests, warnings = [], []
+            for entry, item_id in zip(items, ids):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                current = {str(p.get("useTypeID")): p for p in fmt.as_list((item.get("Prices") or {}).get("ItemPrice"))}
+                levels, changes = [], []
+                for key, type_id, use_type in self.PRICE_LEVELS:
+                    old = fmt.number((current.get(type_id) or {}).get("amount"))
+                    new_value = entry.get(key)
+                    if new_value is None:
+                        amount = (current.get(type_id) or {}).get("amount")
+                        if amount is not None:  # unchanged, but sent back so no level can be blanked
+                            levels.append({"amount": str(amount), "useTypeID": type_id, "useType": use_type})
+                        continue
+                    amount = money(new_value, f"{use_type} price") if key == "default" else money_or_zero(
+                        new_value, f"{use_type} price")
+                    levels.append({"amount": amount, "useTypeID": type_id, "useType": use_type})
+                    if old is None or abs(old - float(amount)) > 0.001:
+                        changes.append(f"{use_type} {old if old is not None else '(none)'} -> {amount}")
+                if not changes:
+                    raise RuleViolation(f"Refused: nothing to change on {item_label(item)}'s prices.")
+                new = {p["useType"]: float(p["amount"]) for p in levels}
+                cost = fmt.number(item.get("defaultCost")) or 0
+                if new.get("Default", 0) <= cost:
+                    warnings.append(f"{item_label(item)}: Default price {new.get('Default'):.2f} is not above its cost "
+                                    f"{cost:.2f}.")
+                if new.get("MSRP") and new.get("MSRP") < new.get("Default", 0):
+                    warnings.append(f"{item_label(item)}: MSRP {new['MSRP']:.2f} is below the Default price.")
+                if fmt.ref_id(item.get("itemMatrixID")):
+                    warnings.append(f"{item_label(item)} is in matrix {item.get('itemMatrixID')}; only this item's own "
+                                    "prices change, not the matrix or its other items.")
+                requests.append(PlannedRequest(f"{item_label(item)}: " + "; ".join(changes), "PUT",
+                                               f"Item/{item_id}.json", {"Prices": {"ItemPrice": levels}}))
+            summary = (f"Change the prices of {len(requests)} item(s) as listed. Each item's three price levels are "
+                       "sent together; levels not asked for are sent back unchanged. Nothing else on the items changes.")
+            return Plan("update_item_prices", summary, requests, warnings)
+
+        return self._run("update_item_prices", dry_run, confirm_code, build)
+
+    # ---- 14. reorder point and level ---------------------------------------------------------------------
+
+    def set_reorder_levels(self, items: list[dict], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        """reorder_point: order more when stock falls to this. reorder_level: order up to this many."""
+
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            shop = self._single_shop()
+            found = self._items_by_id(ids)
+            requests, warnings = [], []
+            for entry, item_id in zip(items, ids):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                row = next((s for s in fmt.as_list((item.get("ItemShops") or {}).get("ItemShop"))
+                            if str(s.get("shopID")) == shop), None)
+                if row is None or not fmt.ref_id(row.get("itemShopID")):
+                    raise RuleViolation(f"Refused: {item_label(item)} has no stock row for shop {shop}.")
+                record, changes = {"itemShopID": str(row.get("itemShopID"))}, []
+                for key, field_name, label in (("reorder_point", "reorderPoint", "reorder point"),
+                                               ("reorder_level", "reorderLevel", "reorder level")):
+                    if entry.get(key) is None:
+                        continue
+                    try:
+                        value = int(entry[key])
+                    except (TypeError, ValueError):
+                        raise RuleViolation(f"Refused: {label} '{entry[key]}' is not a whole number.") from None
+                    if value < 0 or value != float(entry[key]):
+                        raise RuleViolation(f"Refused: {label} must be a whole number of 0 or more.")
+                    old = fmt.integer(row.get(field_name)) or 0
+                    if value != old:
+                        record[field_name] = str(value)
+                        changes.append(f"{label} {old} -> {value}")
+                if not changes:
+                    raise RuleViolation(f"Refused: nothing to change on {item_label(item)}'s reorder settings.")
+                point = int(record.get("reorderPoint", fmt.integer(row.get("reorderPoint")) or 0))
+                level = int(record.get("reorderLevel", fmt.integer(row.get("reorderLevel")) or 0))
+                if level and level < point:
+                    warnings.append(f"{item_label(item)}: reorder level {level} is below its reorder point {point}.")
+                requests.append(PlannedRequest(f"{item_label(item)}: " + "; ".join(changes), "PUT", f"Item/{item_id}.json",
+                                               {"ItemShops": {"ItemShop": [record]}}))
+            summary = (f"Set the reorder point and/or level of {len(requests)} item(s) for shop {shop}. Only those "
+                       "two settings are sent, on the item's shop row: stock on hand is never sent.")
+            return Plan("set_reorder_levels", summary, requests, warnings)
+
+        return self._run("set_reorder_levels", dry_run, confirm_code, build)
+
+    # ---- 15. archive a purchase order --------------------------------------------------------------------
+
+    def archive_purchase_order(self, order_id: int, dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            order = self._get_record(f"Order/{int(order_id)}.json", "Order")
+            if order is None:
+                raise RuleViolation(f"Refused: purchase order {order_id} was not found.")
+            if fmt.flag(order.get("archived")):
+                raise RuleViolation(f"Refused: purchase order {order_id} is already archived.")
+            lines = self._order_lines(order_id)
+            touched = [line for line in lines if (fmt.integer(line.get("numReceived")) or 0)
+                       or (fmt.integer(line.get("checkedIn")) or 0)]
+            if touched:
+                raise RuleViolation(f"Refused: purchase order {order_id} has {len(touched)} line(s) with goods received "
+                                    "or checked in. Only POs where nothing arrived are archived here; finish this one "
+                                    "in Lightspeed instead.")
+            if fmt.flag(order.get("complete")):
+                raise RuleViolation(f"Refused: purchase order {order_id} is finished; it doesn't need archiving.")
+            vendor = self._vendor_name(order.get("vendorID"))
+            ordered = sum(fmt.integer(line.get("quantity")) or 0 for line in lines)
+            before = {"order": {k: order.get(k) for k in ("orderID", "vendorID", "refNum", "orderedDate", "createTime",
+                                                         "shipCost", "otherCost", "complete") if order.get(k) is not None},
+                      "lines": [{k: line.get(k) for k in ("orderLineID", "itemID", "quantity", "price", "originalPrice")}
+                                for line in lines]}
+            summary = (f"Archive purchase order {order_id} ({vendor}, ref {fmt.text(order.get('refNum')) or '-'}, created "
+                       f"{(fmt.date(order.get('createTime')) or '?')[:10]}): {len(lines)} line(s), {ordered} unit(s) "
+                       "ordered, nothing received. Lightspeed archives a PO on DELETE (it is not erased). Items and "
+                       "stock are not touched.")
+            warnings = ["Its lines and values are saved in the write log first."]
+            return Plan("archive_purchase_order", summary,
+                        [PlannedRequest(f"archive PO {order_id}", "DELETE", f"Order/{int(order_id)}.json", None,
+                                        before=before)],
+                        warnings, basis={"timeStamp": order.get("timeStamp"), "lines": len(lines)})
+
+        return self._run("archive_purchase_order", dry_run, confirm_code, build)

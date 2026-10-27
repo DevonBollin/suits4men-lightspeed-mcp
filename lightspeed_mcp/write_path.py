@@ -66,13 +66,42 @@ WRITES_OFF_MESSAGE = (
 WRITE_COST = 2.0
 
 
+# What a nested record in a body may contain, wherever it appears. A price can only carry an
+# amount and its level; a stock row (ItemShops) only its ID and reorder settings, never qoh.
+NESTED_FIELDS = {
+    ("Prices", "ItemPrice"): frozenset({"amount", "useTypeID", "useType"}),
+    ("ItemAttributes", None): frozenset({"itemAttributeSetID", "attribute1", "attribute2", "attribute3"}),
+    ("ItemVendorNums", "ItemVendorNum"): frozenset({"itemVendorNumID", "vendorID", "value", "cost"}),
+    ("ItemShops", "ItemShop"): frozenset({"itemShopID", "reorderPoint", "reorderLevel"}),
+}
+
+
 @dataclass(frozen=True)
 class Route:
     """One kind of request a write tool may send."""
 
     method: str
     path: re.Pattern  # relative to the account, e.g. Item/123.json
-    fields: frozenset[str]  # top-level JSON fields the body may contain
+    fields: frozenset[str]  # top-level JSON fields the body may contain (nested ones: NESTED_FIELDS)
+
+
+def nested_problem(body: dict) -> str | None:
+    """What is wrong with the body's nested records (see NESTED_FIELDS), or None."""
+    for (outer, inner), allowed in NESTED_FIELDS.items():
+        if outer not in body:
+            continue
+        value = body[outer]
+        if inner is not None:
+            if not isinstance(value, dict) or set(value) != {inner}:
+                return f"{outer} must hold only {inner}"
+            value = value[inner]
+        for record in value if isinstance(value, list) else [value]:
+            if not isinstance(record, dict):
+                return f"{outer} holds something that isn't a record"
+            extra = sorted(set(record) - allowed)
+            if extra:
+                return f"{outer} may not contain {', '.join(extra)}"
+    return None
 
 
 ITEM_FIELDS = {"description", "itemType", "tax", "taxClassID", "categoryID", "manufacturerID", "defaultVendorID",
@@ -96,6 +125,13 @@ ITEM_INTO_MATRIX = Route("PUT", re.compile(r"Item/\d+\.json"),
                          frozenset({"itemMatrixID", "ItemAttributes", "description", "categoryID", "manufacturerID",
                                     "defaultVendorID"}))
 ITEM_SKU = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"customSku"}))
+# An item's prices, and nothing else. Only update_item_prices may send this.
+ITEM_PRICES = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"Prices"}))
+# An item's reorder point and level on its shop row (ItemShops may then hold only itemShopID,
+# reorderPoint and reorderLevel: NESTED_FIELDS). Stock itself (qoh) can never be sent.
+ITEM_REORDER = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"ItemShops"}))
+# Lightspeed archives a PO on DELETE. Only POs with nothing received (archive_purchase_order checks).
+ARCHIVE_ORDER = Route("DELETE", re.compile(r"Order/\d+\.json"), frozenset())
 # A new item outside any matrix (shirts, ties, shoes): no itemMatrixID, no ItemAttributes.
 NEW_STANDALONE_ITEM = Route("POST", re.compile(r"Item\.json"), frozenset(ITEM_FIELDS | {"customSku", "ItemVendorNums"}))
 # The vendor's own item number(s) on an existing item. The body lists the item's existing vendor
@@ -150,6 +186,9 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "update_matrix": (UPDATE_MATRIX,),
     "create_vendor": (NEW_VENDOR,),
     "create_brand": (NEW_BRAND,),
+    "update_item_prices": (ITEM_PRICES,),
+    "set_reorder_levels": (ITEM_REORDER,),
+    "archive_purchase_order": (ARCHIVE_ORDER,),
 }
 
 
@@ -317,6 +356,9 @@ class WriteClient:
         if not any(set(body) <= r.fields for r in matching):
             extra = sorted(set(body) - frozenset().union(*(r.fields for r in matching)))
             raise WriteBlockedError(f"{tool} may not send the field(s) {', '.join(extra) or 'in this combination'}.")
+        problem = nested_problem(body)
+        if problem:
+            raise WriteBlockedError(f"{tool}: {problem}.")
 
     def send(self, tool: str, method: str, path: str, body: dict | None, confirm_code: str,
              before: dict | None = None) -> dict:

@@ -809,6 +809,55 @@ def create_brand(
     return run(lambda w: w.create_brand(name, allow_similar_name, dry_run, confirm_code), writer)
 
 
+class PriceChange(BaseModel):
+    item_id: Annotated[int, Field(description="The item.")]
+    default: Annotated[float | None, Field(description="New Default (selling) price.")] = None
+    msrp: Annotated[float | None, Field(description="New MSRP.")] = None
+    online: Annotated[float | None, Field(description="New Online price (0 allowed).")] = None
+
+
+@write_tool
+def update_item_prices(
+    items: Annotated[list[PriceChange], Field(description="Items and the price levels to change (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Change existing items' prices: Default, MSRP and/or Online. The only tool that changes an
+    existing item's prices, so every price change is explicit. Levels not given are sent back
+    unchanged. Only that item changes, never its matrix or the matrix's other items. Warns when the
+    Default price is not above cost or MSRP is below Default."""
+    return run(lambda w: w.update_item_prices([i.model_dump() for i in items], dry_run, confirm_code), writer)
+
+
+class ReorderSetting(BaseModel):
+    item_id: Annotated[int, Field(description="The item.")]
+    reorder_point: Annotated[int | None, Field(description="Order more when stock falls to this.")] = None
+    reorder_level: Annotated[int | None, Field(description="Order up to this many.")] = None
+
+
+@write_tool
+def set_reorder_levels(
+    items: Annotated[list[ReorderSetting], Field(description="Items and their reorder point and/or level (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Set items' reorder point (order when stock falls to it) and reorder level (order up to it) for
+    the store's shop. Only those two settings are sent; stock on hand can never be sent."""
+    return run(lambda w: w.set_reorder_levels([i.model_dump() for i in items], dry_run, confirm_code), writer)
+
+
+@write_tool
+def archive_purchase_order(
+    order_id: Annotated[int, Field(description="An unfinished purchase order where nothing was received.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Archive one purchase order that never got anywhere (Lightspeed archives a PO rather than
+    erasing it). Refuses a PO with anything received or checked in, and a finished one. The PO
+    and its lines are saved in the write log first."""
+    return run(lambda w: w.archive_purchase_order(order_id, dry_run, confirm_code), writer)
+
+
 @write_tool
 def update_matrix(
     matrix_id: Annotated[int, Field(description="The matrix to change.")],

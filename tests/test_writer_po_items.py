@@ -439,6 +439,99 @@ def test_similar_names_need_confirming_in_intake_too(writer):
                                     "allow_similar_names": True})["request_count"] >= 5
 
 
+# ---- update_item_prices -----------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def three_levels(reads):
+    for item in reads.data["Item"]:
+        item["Prices"] = {"ItemPrice": [{"amount": "599.95", "useTypeID": "1", "useType": "Default"},
+                                        {"amount": "695", "useTypeID": "2", "useType": "MSRP"},
+                                        {"amount": "549.95", "useTypeID": "3", "useType": "Online"}]}
+    return reads
+
+
+def test_price_change_sends_every_level_with_only_the_asked_one_changed(writer, three_levels):
+    result = writer.update_item_prices([{"item_id": 1644, "msrp": 795}])
+    [request] = result["requests"]
+    assert request["method"] == "PUT" and request["path"].endswith("/Item/1644.json")
+    assert request["body"] == {"Prices": {"ItemPrice": [
+        {"amount": "599.95", "useTypeID": "1", "useType": "Default"},
+        {"amount": "795.00", "useTypeID": "2", "useType": "MSRP"},
+        {"amount": "549.95", "useTypeID": "3", "useType": "Online"}]}}
+    assert "MSRP 695.0 -> 795.00" in request["does"]
+
+
+@pytest.mark.parametrize("entry, message", [
+    ({"item_id": 1644, "default": 599.95}, "nothing to change"),
+    ({"item_id": 1644, "default": 0}, "more than 0"),
+    ({"item_id": 1644, "online": -1}, "negative"),
+    ({"item_id": 1700, "default": 1}, "archived"),
+])
+def test_price_rules(writer, three_levels, entry, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.update_item_prices([entry])
+
+
+def test_price_warnings(writer, three_levels):
+    result = writer.update_item_prices([{"item_id": 1644, "default": 60, "msrp": 50}])
+    assert any("not above its cost" in w for w in result["warnings"])
+    assert any("MSRP 50.00 is below" in w for w in result["warnings"])
+
+
+# ---- set_reorder_levels ---------------------------------------------------------------------------------------------
+
+
+def test_reorder_payload_is_the_shop_row_only(writer, reads):
+    for item in reads.data["Item"]:
+        for row in item["ItemShops"]["ItemShop"]:
+            row["itemShopID"] = "9" + row["shopID"] + item["itemID"]
+    result = writer.set_reorder_levels([{"item_id": 1644, "reorder_point": 1, "reorder_level": 3}])
+    assert result["requests"][0]["body"] == {"ItemShops": {"ItemShop": [
+        {"itemShopID": "911644", "reorderPoint": "1", "reorderLevel": "3"}]}}
+    assert "qoh" not in json.dumps(result["requests"])
+
+
+def test_reorder_rules(writer, reads):
+    for item in reads.data["Item"]:
+        for row in item["ItemShops"]["ItemShop"]:
+            row["itemShopID"] = "9" + row["shopID"] + item["itemID"]
+    with pytest.raises(RuleViolation, match="whole number of 0 or more"):
+        writer.set_reorder_levels([{"item_id": 1644, "reorder_point": -1}])
+    with pytest.raises(RuleViolation, match="nothing to change"):
+        writer.set_reorder_levels([{"item_id": 1644, "reorder_point": 0}])
+    result = writer.set_reorder_levels([{"item_id": 1644, "reorder_point": 4, "reorder_level": 2}])
+    assert any("below its reorder point" in w for w in result["warnings"])
+
+
+# ---- archive_purchase_order --------------------------------------------------------------------------------------------
+
+
+def test_archive_po_payload_and_log(writer, reads, fake_api, write_log, write_switch):
+    reads.data["Order"].append({"orderID": "353", "vendorID": "1", "refNum": "267751", "complete": "false",
+                                "archived": "false", "createTime": "2024-06-05T00:00:00+00:00", "timeStamp": "t"})
+    reads.data["OrderLine"].append({"orderLineID": "50", "orderID": "353", "itemID": "1345", "quantity": "2",
+                                    "numReceived": "0", "checkedIn": "0", "price": "63.50"})
+    result = writer.archive_purchase_order(353)
+    [request] = result["requests"]
+    assert request["method"] == "DELETE" and request["path"].endswith("/Order/353.json") and request["body"] is None
+    turn_on(write_switch)
+    writer.archive_purchase_order(353, dry_run=False, confirm_code=result["confirm_code"])
+    before = write_log.entries()[0]["before"]
+    assert before["order"]["refNum"] == "267751" and before["lines"][0]["quantity"] == "2"
+
+
+@pytest.mark.parametrize("order_id, message", [
+    (853, "goods received or checked in"),   # line 10 has 1 received
+    (400, "finished"),
+    (404, "not found"),
+])
+def test_archive_po_rules(writer, fake_api, order_id, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.archive_purchase_order(order_id)
+    assert fake_api.requests == []
+
+
 # ---- update_matrix ---------------------------------------------------------------------------------------------
 
 
