@@ -859,6 +859,112 @@ def archive_purchase_order(
 
 
 @write_tool
+def correct_vendor_numbers(
+    vendor_id: Annotated[int, Field(description="The vendor whose numbers these are.")],
+    items: Annotated[list[VendorNumber], Field(description="Items and their corrected vendor number.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Correct a vendor number an item already has for this vendor (e.g. a typo). Its record and cost
+    are kept. Removing a vendor number isn't supported (Lightspeed doesn't document how)."""
+    return run(lambda w: w.correct_vendor_numbers(vendor_id, [i.model_dump() for i in items], dry_run, confirm_code),
+               writer)
+
+
+@write_tool
+def update_vendor(
+    vendor_id: Annotated[int, Field(description="The vendor.")],
+    name: Annotated[str | None, Field(description="New name, exactly as the vendor writes it.")] = None,
+    account_number: Annotated[str | None, Field(description="New account number with the vendor.")] = None,
+    allow_similar_name: Annotated[bool, Field(description="Only after the user confirms it: allow a name like another vendor's.")] = False,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Rename a vendor and/or change the store's account number with it. Refuses a name another
+    vendor has (and a near-match unless confirmed)."""
+    return run(lambda w: w.update_vendor(vendor_id, name, account_number, allow_similar_name, dry_run, confirm_code),
+               writer)
+
+
+@write_tool
+def archive_vendor(
+    vendor_id: Annotated[int, Field(description="The vendor to archive.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Archive a vendor the store no longer uses (Lightspeed archives rather than erases). Refuses one
+    that is still the default vendor of an active item, or has an unfinished purchase order."""
+    return run(lambda w: w.archive_vendor(vendor_id, dry_run, confirm_code), writer)
+
+
+@write_tool
+def rename_brand(
+    manufacturer_id: Annotated[int, Field(description="The brand (list_manufacturers).")],
+    name: Annotated[str, Field(description="Its new name.")],
+    allow_similar_name: Annotated[bool, Field(description="Only after the user confirms it: allow a name like another brand's.")] = False,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Rename a brand (e.g. fix a typo). Refuses a name another brand has, and a near-match unless
+    confirmed. Every item with this brand shows the new name. Brands can't be deleted."""
+    return run(lambda w: w.rename_brand(manufacturer_id, name, allow_similar_name, dry_run, confirm_code), writer)
+
+
+@write_tool
+def create_category(
+    name: Annotated[str, Field(description="The new category's name (no '/').")],
+    parent_id: Annotated[int | None, Field(description="The category it goes under (list_categories); empty for top level.")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Create a category, at the top level or under another one. Refuses a name a sibling already has."""
+    return run(lambda w: w.create_category(name, parent_id, dry_run, confirm_code), writer)
+
+
+@write_tool
+def rename_category(
+    category_id: Annotated[int, Field(description="The category.")],
+    name: Annotated[str, Field(description="Its new name (no '/').")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Rename a category that has no subcategories (whether Lightspeed updates subcategories' paths
+    isn't documented). Its items stay in it."""
+    return run(lambda w: w.rename_category(category_id, name, dry_run, confirm_code), writer)
+
+
+@write_tool
+def delete_category(
+    category_id: Annotated[int, Field(description="An empty category.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Delete an empty category: no items (archived ones included), no matrices, no subcategories.
+    Lightspeed deletes categories for good; its name and place are saved in the write log first."""
+    return run(lambda w: w.delete_category(category_id, dry_run, confirm_code), writer)
+
+
+class CountedItem(BaseModel):
+    item_id: Annotated[int, Field(description="The item counted.")]
+    counted: Annotated[int, Field(description="How many were counted (0 or more).")]
+
+
+@write_tool
+def create_inventory_count(
+    items: Annotated[list[CountedItem], Field(description="Each counted item once, with its total (max 100).")],
+    name: Annotated[str | None, Field(description="Name for a new count, e.g. 'Neck ties 2026-10-27'.")] = None,
+    count_id: Annotated[int | None, Field(description="Instead of name: add to this count (not yet reconciled).")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Record an inventory count: create it (or add to one awaiting reconciliation) with each item's
+    counted quantity. The dry run shows on-hand vs counted per item. Stock changes ONLY when the
+    user reconciles the count in Lightspeed; this server never reconciles. Tell the user."""
+    return run(lambda w: w.create_inventory_count(name, [i.model_dump() for i in items], count_id, dry_run,
+                                                  confirm_code), writer)
+
+
+@write_tool
 def update_matrix(
     matrix_id: Annotated[int, Field(description="The matrix to change.")],
     description: Annotated[str | None, Field(description="New plain-language description naming the garment type (renames every item in the matrix).")] = None,

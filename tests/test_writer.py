@@ -115,9 +115,9 @@ class CannedReads:
     def get(self, path, params=None):
         self.calls.append((path, dict(params or {})))
         name, _, record_id = path.removesuffix(".json").partition("/")
-        tables = {**self.data, "Vendor": VENDORS, "Manufacturer": MANUFACTURERS}
+        tables = {"InventoryCount": [], **self.data, "Vendor": VENDORS, "Manufacturer": MANUFACTURERS}
         key = {"ItemMatrix": "itemMatrixID", "Item": "itemID", "Order": "orderID", "Vendor": "vendorID",
-               "Manufacturer": "manufacturerID"}[name]
+               "Manufacturer": "manufacturerID", "InventoryCount": "inventoryCountID"}[name]
         for record in tables[name]:
             if record[key] == record_id:
                 return {name: copy.deepcopy(record)}
@@ -129,10 +129,11 @@ class CannedReads:
         name = path.removesuffix(".json")
         rows = {"ItemAttributeSet": ATTRIBUTE_SETS, "Category": CATEGORIES, "Vendor": VENDORS,
                 "TaxClass": [{"taxClassID": "1", "name": "Item"}], "Shop": [{"shopID": "1", "name": "Suits 4 Men Inc"}],
-                "Manufacturer": MANUFACTURERS, **self.data}[name]
+                "Manufacturer": MANUFACTURERS, "InventoryCountItem": [], **self.data}[name]
         if params.get("archived") != "true":
             rows = [r for r in rows if r.get("archived") != "true"]
-        for field in ("itemMatrixID", "customSku", "orderID"):
+        for field in ("itemMatrixID", "customSku", "orderID", "defaultVendorID", "manufacturerID", "categoryID",
+                      "complete", "inventoryCountID"):
             if field in params:
                 rows = [r for r in rows if r.get(field) == params[field]]
         for field in ("itemID", "vendorID"):

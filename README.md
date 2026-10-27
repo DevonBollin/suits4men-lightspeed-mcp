@@ -91,9 +91,9 @@ Phase 2 changed the scopes (`employee:inventory` replaces
 `employee:inventory_read`), and bootstrap was re-run on 2026-10-26: the
 saved token has those 9 scopes.
 
-**Pending:** creating brands needs `employee:manufacturers`, added afterwards.
-Run bootstrap once more before the first brand is created (everything else,
-new vendors included, works with the current token). Re-authorizing changes no inventory data. Run it
+**Pending:** creating or renaming brands needs `employee:manufacturers`, added
+afterwards. Run bootstrap once more before the first brand change (everything
+else, vendors and categories included, works with the current token). Re-authorizing changes no inventory data. Run it
 from a normal PowerShell window: from the Claude app's Terminal panel, open one with
 `Start-Process powershell -WorkingDirectory "C:\Development\Suits 4 Men Inventory"`.
 
@@ -170,6 +170,14 @@ across several entries and switched over atomically. See
 | `update_matrix` | `PUT ItemMatrix/<id>.json`: description, category, brand, vendor, default cost, Default price, only what changes | Change the attribute set or values, or archive |
 | `create_vendor` | `POST Vendor.json`: name (as the vendor writes it) and account number | Create a duplicate or near-duplicate (see below); update or archive a vendor |
 | `create_brand` | `POST Manufacturer.json`: the brand's name | Create a duplicate or near-duplicate; Lightspeed can't delete a brand |
+| `update_item_prices` | `PUT Item/<id>.json` with all three price levels, only the asked-for ones changed | Change anything but prices; it is the only tool that changes an existing item's price |
+| `set_reorder_levels` | `PUT ItemShop/<id>.json`: reorder point and level for the shop | Send stock (no route can) |
+| `archive_purchase_order` | `DELETE Order/<id>.json` (Lightspeed archives) for a PO where nothing was received; logged first | Archive a PO with goods received, or a finished one |
+| `correct_vendor_numbers` | `PUT Item/<id>.json`: an existing vendor number's new value (its ID and cost kept) | Remove a vendor number (not documented) |
+| `update_vendor` / `archive_vendor` | `PUT Vendor/<id>.json` (name, account number) / `DELETE` (archives) | Archive a vendor still used by an active item or an open PO |
+| `rename_brand` | `PUT Manufacturer/<id>.json`: name | Take another brand's name |
+| `create_category` / `rename_category` / `delete_category` | `POST`/`PUT Category` (name, path, parent) / `DELETE` (for good) | Rename one with subcategories; delete one with items, matrices or subcategories |
+| `create_inventory_count` | `POST InventoryCount.json` + one `POST InventoryCountItem.json` per counted item | **Reconcile** (the step that changes stock stays a click in Lightspeed) |
 
 `receive_po_lines` marks goods as received on the PO. Stock on hand changes
 only when someone presses **Add Received To Inventory** on that PO in
@@ -219,6 +227,20 @@ a new vendor reads all ~680 vendors, so that dry run takes about 20 seconds.
 Vendor numbers: Lightspeed's "Vendor ID" on an item must belong to that item
 alone (its receive-by-Vendor-ID breaks otherwise). A number printed on several
 lines of one invoice is a style number shared by sizes or colors, and is not saved.
+
+#### Inventory counts
+
+`create_inventory_count` records counted quantities (a new count, or more items
+on one still awaiting reconciliation); the dry run shows on-hand vs counted for
+each item and the total change. **Stock only changes when you reconcile the count
+in Lightspeed**, and only for the items in it. Reconciling can't be undone except by
+adjusting each item, so it stays your click. Entries are recorded under employee
+`COUNT_EMPLOYEE_ID` in `lightspeed_mcp/config.py` (1, the employee all past counts used).
+
+Not available through Lightspeed's API at all: creating or changing vendor
+returns (read-only), and special orders other than as a customer sale line (kept
+out, like all customer data). Attribute sets stay read-only by choice: the store
+uses set 5 for everything.
 
 #### Updating a matrix
 

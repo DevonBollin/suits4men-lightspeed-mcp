@@ -127,9 +127,23 @@ ITEM_INTO_MATRIX = Route("PUT", re.compile(r"Item/\d+\.json"),
 ITEM_SKU = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"customSku"}))
 # An item's prices, and nothing else. Only update_item_prices may send this.
 ITEM_PRICES = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"Prices"}))
-# An item's reorder point and level on its shop row (ItemShops may then hold only itemShopID,
-# reorderPoint and reorderLevel: NESTED_FIELDS). Stock itself (qoh) can never be sent.
-ITEM_REORDER = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"ItemShops"}))
+# An item's reorder point and level, on Lightspeed's ItemShop endpoint, which (per its docs) only
+# updates those two settings. Stock itself (qoh) is not a field here and can never be sent.
+ITEM_SHOP_REORDER = Route("PUT", re.compile(r"ItemShop/\d+\.json"), frozenset({"reorderPoint", "reorderLevel"}))
+# Vendors: rename / account number, and archive (Lightspeed archives a vendor on DELETE).
+UPDATE_VENDOR = Route("PUT", re.compile(r"Vendor/\d+\.json"), frozenset({"name", "accountNumber"}))
+ARCHIVE_VENDOR = Route("DELETE", re.compile(r"Vendor/\d+\.json"), frozenset())
+# A brand's name (Lightspeed can't delete a brand).
+RENAME_BRAND = Route("PUT", re.compile(r"Manufacturer/\d+\.json"), frozenset({"name"}))
+# Categories. Lightspeed deletes a category for good (it refuses one with subcategories).
+NEW_CATEGORY = Route("POST", re.compile(r"Category\.json"), frozenset({"name", "fullPathName", "parentID"}))
+RENAME_CATEGORY = Route("PUT", re.compile(r"Category/\d+\.json"), frozenset({"name", "fullPathName"}))
+DELETE_CATEGORY = Route("DELETE", re.compile(r"Category/\d+\.json"), frozenset())
+# An inventory count and its counted items. Stock changes only when the count is reconciled, which
+# is never sent from here (it stays a click in Lightspeed).
+NEW_COUNT = Route("POST", re.compile(r"InventoryCount\.json"), frozenset({"name", "shopID"}))
+NEW_COUNT_ITEM = Route("POST", re.compile(r"InventoryCountItem\.json"),
+                       frozenset({"inventoryCountID", "itemID", "qty", "employeeID"}))
 # Lightspeed archives a PO on DELETE. Only POs with nothing received (archive_purchase_order checks).
 ARCHIVE_ORDER = Route("DELETE", re.compile(r"Order/\d+\.json"), frozenset())
 # A new item outside any matrix (shirts, ties, shoes): no itemMatrixID, no ItemAttributes.
@@ -187,8 +201,16 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "create_vendor": (NEW_VENDOR,),
     "create_brand": (NEW_BRAND,),
     "update_item_prices": (ITEM_PRICES,),
-    "set_reorder_levels": (ITEM_REORDER,),
+    "set_reorder_levels": (ITEM_SHOP_REORDER,),
     "archive_purchase_order": (ARCHIVE_ORDER,),
+    "correct_vendor_numbers": (ITEM_VENDOR_NUMBERS,),
+    "update_vendor": (UPDATE_VENDOR,),
+    "archive_vendor": (ARCHIVE_VENDOR,),
+    "rename_brand": (RENAME_BRAND,),
+    "create_category": (NEW_CATEGORY,),
+    "rename_category": (RENAME_CATEGORY,),
+    "delete_category": (DELETE_CATEGORY,),
+    "create_inventory_count": (NEW_COUNT, NEW_COUNT_ITEM),
 }
 
 
@@ -295,7 +317,8 @@ def make_write_http(base_url: str, switch: WriteSwitch, transport: httpx.BaseTra
 
 
 # The ID fields worth recording from a response record.
-ID_FIELDS = ("itemMatrixID", "itemID", "orderID", "orderLineID", "vendorID", "manufacturerID")
+ID_FIELDS = ("itemMatrixID", "itemID", "orderID", "orderLineID", "vendorID", "manufacturerID", "categoryID",
+             "inventoryCountID", "inventoryCountItemID", "itemShopID")
 
 
 def affected_ids(body: dict) -> dict:

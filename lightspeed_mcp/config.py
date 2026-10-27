@@ -45,6 +45,11 @@ SCOPES = [
     "employee:vendor_returns",   # returns to vendors
 ]
 
+# The employee that inventory-count entries are recorded under (Lightspeed requires one per
+# counted item). Employee 1 counted every item in the store's counts and created its recent POs
+# (checked 2026-10-26). Change it here if counts should be recorded under someone else.
+COUNT_EMPLOYEE_ID = "1"
+
 # Prefix for every Windows Credential Manager entry this project creates.
 KEYRING_PREFIX = "suits4men-lightspeed"
 

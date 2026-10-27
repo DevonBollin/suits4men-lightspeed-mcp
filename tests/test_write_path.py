@@ -79,33 +79,39 @@ def test_exactly_these_write_tools():
         "move_items_into_matrix", "assign_custom_skus", "archive_item", "create_items", "create_purchase_order",
         "remove_po_lines", "update_purchase_order", "update_po_lines", "set_vendor_numbers", "intake_invoice",
         "update_matrix", "create_vendor", "create_brand", "update_item_prices", "set_reorder_levels",
-        "archive_purchase_order"}
+        "archive_purchase_order", "correct_vendor_numbers", "update_vendor", "archive_vendor", "rename_brand",
+        "create_category", "rename_category", "delete_category", "create_inventory_count"}
 
 
-def test_vendors_and_brands_can_only_be_created():
+def test_vendors_and_brands_send_only_names_and_brands_are_never_deleted():
     for tool, r in all_routes():
         if r.path.pattern.startswith(("Vendor", "Manufacturer")):
-            assert r.method == "POST", tool
             assert r.fields <= {"name", "accountNumber"}, tool
+        if r.method == "DELETE":
+            assert not r.path.fullmatch("Manufacturer/1.json"), tool
 
 
-def test_deletes_are_one_item_one_po_line_or_one_po():
+def test_deletes_are_limited_to_these():
+    """Archive one item, PO or vendor; remove an unreceived PO line; delete an empty category. Nothing else."""
     deletes = {(tool, r.path.pattern) for tool, r in all_routes() if r.method == "DELETE"}
-    assert {("archive_item", r"Item/\d+\.json"), ("remove_po_lines", r"OrderLine/\d+\.json"),
-            ("archive_purchase_order", r"Order/\d+\.json")} <= deletes
+    assert deletes == {("archive_item", r"Item/\d+\.json"), ("remove_po_lines", r"OrderLine/\d+\.json"),
+                       ("archive_purchase_order", r"Order/\d+\.json"), ("archive_vendor", r"Vendor/\d+\.json"),
+                       ("delete_category", r"Category/\d+\.json")}
     for path in ("ItemMatrix/7.json", "ItemAttributeSet/5.json", "Manufacturer/1.json", "Item.json", "OrderLine.json",
-                 "Shop/1.json"):
+                 "Shop/1.json", "InventoryCount/1.json", "ItemShop/5.json"):
         assert not any(r.method == "DELETE" and r.path.fullmatch(path) for _, r in all_routes())
 
 
-def test_stock_rows_carry_reorder_settings_only():
-    """ItemShops may only be sent by set_reorder_levels, and a stock row may never carry qoh."""
+def test_stock_is_never_sent():
+    """No route carries stock rows (ItemShops) or qoh; reorder settings go to ItemShop, two fields only.
+    Inventory counts are recorded but never reconciled (no route for it)."""
     for tool, r in all_routes():
-        if "ItemShops" in r.fields:
-            assert tool == "set_reorder_levels"
+        assert "ItemShops" not in r.fields and "qoh" not in r.fields, tool
+        assert not r.path.pattern.startswith("InventoryCountReconcile"), tool
+        assert "Reconcile" not in r.path.pattern, tool
+    assert only_route("set_reorder_levels").fields == {"reorderPoint", "reorderLevel"}
     assert nested_problem({"ItemShops": {"ItemShop": [{"itemShopID": "1", "qoh": "5"}]}}) == \
         "ItemShops may not contain qoh"
-    assert nested_problem({"ItemShops": {"ItemShop": [{"itemShopID": "1", "reorderPoint": "2"}]}}) is None
     assert nested_problem({"Prices": {"ItemPrice": [{"amount": "1", "useTypeID": "1", "itemID": "9"}]}}) == \
         "Prices may not contain itemID"
 
@@ -115,8 +121,7 @@ def test_a_stock_change_is_refused_even_in_a_reorder_request(make_write_client, 
     client = make_write_client()
     fake_api.handler = created
     with pytest.raises(WriteBlockedError, match="qoh"):
-        client.send("set_reorder_levels", "PUT", "Item/1.json",
-                    {"ItemShops": {"ItemShop": [{"itemShopID": "5", "reorderPoint": "1", "qoh": "40"}]}}, "code")
+        client.send("set_reorder_levels", "PUT", "ItemShop/5.json", {"reorderPoint": "1", "qoh": "40"}, "code")
     assert fake_api.requests == []
 
 
@@ -221,7 +226,8 @@ def test_fields_outside_a_route_are_refused(make_write_client, fake_api, write_s
     ("GET", BASE + "Item.json"),
     ("DELETE", BASE + "ItemMatrix/7.json"),
     ("DELETE", BASE + "ItemAttributeSet/5.json"),
-    ("PUT", BASE + "ItemShop/5.json"),
+    ("PUT", BASE + "Shop/1.json"),
+    ("POST", BASE + "InventoryCountReconcile.json"),
     ("POST", BASE + "Customer.json"),
     ("POST", "https://evil.example.com/API/V3/Account/12345/Item.json"),
     ("POST", BASE + "Item.json?load_relations=x"),

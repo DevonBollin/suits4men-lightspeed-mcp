@@ -220,8 +220,10 @@ def numbered(reads):
 
 def test_vendor_number_payload_keeps_existing_numbers(writer, numbered):
     result = writer.set_vendor_numbers(1, [{"item_id": 1345, "vendor_number": "CV-50SC"}])
+    # The new number carries the item's cost: Lightspeed would otherwise set the vendor cost to 0.
     assert result["requests"][0]["body"] == {"ItemVendorNums": {"ItemVendorNum": [
-        {"itemVendorNumID": "8", "vendorID": "21", "value": "GF-1"}, {"vendorID": "1", "value": "CV-50SC"}]}}
+        {"itemVendorNumID": "8", "vendorID": "21", "value": "GF-1"},
+        {"vendorID": "1", "value": "CV-50SC", "cost": "63.50"}]}}
 
 
 @pytest.mark.parametrize("items, message", [
@@ -254,7 +256,8 @@ def test_intake_plan_for_a_new_invoice(writer):
         ("PUT", "Order/{new:order}.json")]
     assert reqs[0]["body"] == {"vendorID": "1", "shopID": "1", "refNum": "INV-7001", "shipCost": "40.00",
                                "otherCost": "0.00"}
-    assert reqs[1]["body"] == {"ItemVendorNums": {"ItemVendorNum": [{"vendorID": "1", "value": "CV-50SC"}]}}
+    assert reqs[1]["body"] == {"ItemVendorNums": {"ItemVendorNum": [{"vendorID": "1", "value": "CV-50SC",
+                                                                     "cost": "63.50"}]}}
     variant, tie = reqs[2]["body"], reqs[3]["body"]
     assert variant["itemMatrixID"] == "7" and variant["description"] == "Caravelli Cobalt 44R Slim"
     assert variant["Prices"]["ItemPrice"][0]["amount"] == "599.95" and variant["customSku"] == "013101"
@@ -398,7 +401,8 @@ def test_intake_creates_the_new_vendor_and_brand_first(writer):
     assert reqs[2]["body"]["vendorID"] == "{new:vendor}"
     tie = reqs[3]["body"]
     assert tie["defaultVendorID"] == "{new:vendor}" and tie["manufacturerID"] == "{new:brand:1}"
-    assert tie["ItemVendorNums"] == {"ItemVendorNum": [{"vendorID": "{new:vendor}", "value": "BP-TIE-TEAL"}]}
+    assert tie["ItemVendorNums"] == {"ItemVendorNum": [{"vendorID": "{new:vendor}", "value": "BP-TIE-TEAL",
+                                                        "cost": "12.00"}]}
     assert result["summary"].startswith("Creates the new vendor 'Bruno Piattelli Inc.' and 1 new brand(s) first.")
 
 
@@ -487,8 +491,9 @@ def test_reorder_payload_is_the_shop_row_only(writer, reads):
         for row in item["ItemShops"]["ItemShop"]:
             row["itemShopID"] = "9" + row["shopID"] + item["itemID"]
     result = writer.set_reorder_levels([{"item_id": 1644, "reorder_point": 1, "reorder_level": 3}])
-    assert result["requests"][0]["body"] == {"ItemShops": {"ItemShop": [
-        {"itemShopID": "911644", "reorderPoint": "1", "reorderLevel": "3"}]}}
+    [request] = result["requests"]
+    assert request["method"] == "PUT" and request["path"].endswith("/ItemShop/911644.json")   # the shop-1 row
+    assert request["body"] == {"reorderPoint": "1", "reorderLevel": "3"}
     assert "qoh" not in json.dumps(result["requests"])
 
 

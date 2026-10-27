@@ -99,6 +99,15 @@ DRY_RUNS = [
                              "quantity": 6, "unit_cost": 8}]}),
     ("update_matrix", {"matrix_id": 7, "description": "Caravelli Suit"}),
     ("update_matrix", {"matrix_id": 7, "price": 599.95}),
+    ("create_vendor", {"name": "Bruno Piattelli", "account_number": "BP-1001"}),
+    ("create_brand", {"name": "Bruno Piattelli"}),
+    ("update_item_prices", {"items": [{"item_id": 2321, "msrp": 695}]}),
+    ("set_reorder_levels", {"items": [{"item_id": 1644, "reorder_point": 1, "reorder_level": 3}]}),
+    ("archive_purchase_order", {"order_id": 353}),          # 2024, nothing received
+    ("archive_vendor", {"vendor_id": 700}),                 # active copy of archived "Broder Brothers" (101)
+    ("create_category", {"name": "Hats", "parent_id": 60}),
+    ("delete_category", {"category_id": 119}),              # empty
+    ("create_inventory_count", {"name": "Neck ties check", "items": [{"item_id": 1387, "counted": 150}]}),
 ]
 
 

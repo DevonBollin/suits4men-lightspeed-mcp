@@ -39,6 +39,7 @@ from datetime import date, datetime
 
 from . import format as fmt
 from . import intake, rules
+from .config import COUNT_EMPLOYEE_ID
 from .errors import ApiError, LightspeedError, WriteRefused
 from .reader import InventoryReader, batches, id_filter, relations
 from .rules import RuleViolation
@@ -67,7 +68,8 @@ class PlannedRequest:
 
 # Which ID field a created record's ID is read from, by record type.
 CREATED_ID_FIELDS = {"Order": "orderID", "Item": "itemID", "OrderLine": "orderLineID", "ItemMatrix": "itemMatrixID",
-                     "Vendor": "vendorID", "Manufacturer": "manufacturerID"}
+                     "Vendor": "vendorID", "Manufacturer": "manufacturerID", "Category": "categoryID",
+                     "InventoryCount": "inventoryCountID"}
 
 
 def new_ref(name: str) -> str:
@@ -539,11 +541,19 @@ class InventoryWriter:
         return value
 
     @staticmethod
-    def _vendor_numbers_body(item: dict | None, vendor_id, value: str) -> dict:
-        """ItemVendorNums for a PUT/POST: the item's existing numbers (kept as they are) plus the new one."""
+    def _vendor_numbers_body(item: dict | None, vendor_id, value: str, cost=None) -> dict:
+        """ItemVendorNums for a PUT/POST: the item's existing numbers (kept as they are) plus the new one.
+
+        Lightspeed sets a vendor number's cost to 0 when none is given, so the new one carries a cost
+        (the invoice's unit cost, or the item's default cost).
+        """
         kept = [{k: v.get(k) for k in ("itemVendorNumID", "vendorID", "value", "cost") if v.get(k) not in (None, "")}
                 for v in intake.vendor_numbers(item or {})]
-        return {"ItemVendorNum": kept + [{"vendorID": str(vendor_id), "value": value}]}
+        new = {"vendorID": str(vendor_id), "value": value}
+        cost = cost if cost is not None else (item or {}).get("defaultCost")
+        if fmt.number(cost):
+            new["cost"] = f"{round(float(cost), 2):.2f}"
+        return {"ItemVendorNum": kept + [new]}
 
     @staticmethod
     def _clean_values(entry: dict, what: str) -> tuple[str, str, str]:
@@ -1546,7 +1556,7 @@ class InventoryWriter:
                         requests.append(PlannedRequest(
                             f"line {m.number}: save vendor number {number} on {item_label(item)}", "PUT",
                             f"Item/{item.get('itemID')}.json",
-                            {"ItemVendorNums": self._vendor_numbers_body(item, vendor_ref, number)}))
+                            {"ItemVendorNums": self._vendor_numbers_body(item, vendor_ref, number, cost)}))
                     if not fmt.text(item.get("customSku")):
                         warnings.append(f"Line {m.number}: {item_label(item)} has no custom SKU (assign_custom_skus).")
                     if not fmt.ref_id(item.get("itemMatrixID")):
@@ -1558,7 +1568,7 @@ class InventoryWriter:
                     continue
                 if save_number:
                     numbers_saved += 1
-                    body["ItemVendorNums"] = self._vendor_numbers_body(None, vendor_ref, number)
+                    body["ItemVendorNums"] = self._vendor_numbers_body(None, vendor_ref, number, cost)
                 name = f"item:{m.number}"
                 requests.append(PlannedRequest(
                     f"line {m.number}: create '{body['description']}' (SKU {body['customSku']}, cost {cost}, price "
@@ -1920,7 +1930,7 @@ class InventoryWriter:
                             if str(s.get("shopID")) == shop), None)
                 if row is None or not fmt.ref_id(row.get("itemShopID")):
                     raise RuleViolation(f"Refused: {item_label(item)} has no stock row for shop {shop}.")
-                record, changes = {"itemShopID": str(row.get("itemShopID"))}, []
+                record, changes = {}, []
                 for key, field_name, label in (("reorder_point", "reorderPoint", "reorder point"),
                                                ("reorder_level", "reorderLevel", "reorder level")):
                     if entry.get(key) is None:
@@ -1941,10 +1951,11 @@ class InventoryWriter:
                 level = int(record.get("reorderLevel", fmt.integer(row.get("reorderLevel")) or 0))
                 if level and level < point:
                     warnings.append(f"{item_label(item)}: reorder level {level} is below its reorder point {point}.")
-                requests.append(PlannedRequest(f"{item_label(item)}: " + "; ".join(changes), "PUT", f"Item/{item_id}.json",
-                                               {"ItemShops": {"ItemShop": [record]}}))
-            summary = (f"Set the reorder point and/or level of {len(requests)} item(s) for shop {shop}. Only those "
-                       "two settings are sent, on the item's shop row: stock on hand is never sent.")
+                requests.append(PlannedRequest(f"{item_label(item)}: " + "; ".join(changes), "PUT",
+                                               f"ItemShop/{row.get('itemShopID')}.json", record))
+            summary = (f"Set the reorder point and/or level of {len(requests)} item(s) for shop {shop}, through "
+                       "Lightspeed's ItemShop endpoint, which only updates those two settings. Stock on hand is never "
+                       "sent.")
             return Plan("set_reorder_levels", summary, requests, warnings)
 
         return self._run("set_reorder_levels", dry_run, confirm_code, build)
@@ -1984,3 +1995,282 @@ class InventoryWriter:
                         warnings, basis={"timeStamp": order.get("timeStamp"), "lines": len(lines)})
 
         return self._run("archive_purchase_order", dry_run, confirm_code, build)
+
+    # ---- 16. correct a vendor number ----------------------------------------------------------------------
+
+    def correct_vendor_numbers(self, vendor_id: int, items: list[dict], dry_run: bool = True,
+                               confirm_code: str | None = None) -> dict:
+        """Change the value of a vendor number an item already has for this vendor (its ID and cost are kept).
+        Removing one isn't documented by Lightspeed, so it isn't offered."""
+
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            vendor = self._active_vendor(vendor_id)
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            numbers = [rules.clean(entry.get("vendor_number")) for entry in items]
+            if len(set(ids)) != len(ids) or len({n.lower() for n in numbers}) != len(numbers):
+                raise RuleViolation("Refused: the same item or the same vendor number is listed twice.")
+            found = self._items_by_id(ids)
+            requests = []
+            for item_id, number in zip(ids, numbers):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                current = [v for v in intake.vendor_numbers(item) if str(v.get("vendorID")) == str(vendor_id)]
+                if not current:
+                    raise RuleViolation(f"Refused: {item_label(item)} has no vendor number for this vendor; "
+                                        "set_vendor_numbers adds one.")
+                old = fmt.text(current[0].get("value")) or ""
+                if not number:
+                    raise RuleViolation("Refused: a vendor number can't be blank (removing one isn't supported).")
+                if number.lower() == old.lower() and number == old:
+                    raise RuleViolation(f"Refused: {item_label(item)} already has vendor number {number}.")
+                holder = self._vendor_number_holder(vendor_id, number)
+                if holder and str(holder.get("itemID")) != item_id:
+                    raise RuleViolation(f"Refused: vendor number '{number}' is already on {item_label(holder)}. Each "
+                                        "vendor number must belong to one item.")
+                records = []
+                for v in intake.vendor_numbers(item):
+                    record = {k: v.get(k) for k in ("itemVendorNumID", "vendorID", "value", "cost")
+                              if v.get(k) not in (None, "")}
+                    if v is current[0]:
+                        record["value"] = number
+                    records.append(record)
+                requests.append(PlannedRequest(f"{item_label(item)}: vendor number '{old}' -> '{number}'", "PUT",
+                                               f"Item/{item_id}.json", {"ItemVendorNums": {"ItemVendorNum": records}}))
+            summary = (f"Correct {fmt.text(vendor.get('name'))}'s vendor number on {len(requests)} item(s). The number "
+                       "keeps its record ID and cost; the items' other vendor numbers are sent back unchanged.")
+            return Plan("correct_vendor_numbers", summary, requests,
+                        ["Changing an existing vendor number isn't documented by Lightspeed: check the first one "
+                         "afterwards (get_item) before correcting more."])
+
+        return self._run("correct_vendor_numbers", dry_run, confirm_code, build)
+
+    # ---- 17. vendors: rename / account number, archive -------------------------------------------------------
+
+    def update_vendor(self, vendor_id: int, name: str | None = None, account_number: str | None = None,
+                      allow_similar_name: bool = False, dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            vendor = self._active_vendor(vendor_id)
+            current_name = fmt.text(vendor.get("name")) or ""
+            body, changes, warnings = {}, [], []
+            if name is not None and rules.clean(name) != current_name:
+                others = [r for r in self._existing_names("vendor") if str(r["id"]) != str(vendor_id)]
+                new_name = self._check_new_name("vendor", name, allow_similar_name, warnings, others)
+                body["name"] = new_name
+                changes.append(f"name '{current_name}' -> '{new_name}'")
+                warnings.append("Every item, PO and return that uses this vendor shows the new name.")
+            if account_number is not None and rules.clean(account_number) != (fmt.text(vendor.get("accountNumber")) or ""):
+                body["accountNumber"] = rules.clean(account_number)
+                changes.append(f"account number '{fmt.text(vendor.get('accountNumber')) or ''}' -> "
+                               f"'{body['accountNumber']}'")
+            if not body:
+                raise RuleViolation(f"Refused: nothing to change on vendor {vendor_id}.")
+            summary = f"Change vendor {vendor_id} '{current_name}': " + "; ".join(changes) + ". Nothing else is sent."
+            return Plan("update_vendor", summary,
+                        [PlannedRequest(f"update vendor {vendor_id}", "PUT", f"Vendor/{int(vendor_id)}.json", body)],
+                        warnings)
+
+        return self._run("update_vendor", dry_run, confirm_code, build)
+
+    def archive_vendor(self, vendor_id: int, dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            vendor = self._active_vendor(vendor_id)
+            items, _ = self.client.get_all("Item.json", {"defaultVendorID": str(int(vendor_id))}, max_records=5)
+            if items:
+                raise RuleViolation(f"Refused: active items still have vendor {vendor_id} as their default vendor (e.g. "
+                                    f"{item_label(items[0])}). Move them to another vendor first.")
+            orders, _ = self.client.get_all("Order.json", {"vendorID": str(int(vendor_id)), "complete": "false"},
+                                            max_records=5)
+            if orders:
+                raise RuleViolation(f"Refused: vendor {vendor_id} has unfinished purchase order(s), e.g. "
+                                    f"{orders[0].get('orderID')}. Finish or archive them first.")
+            before = {k: vendor.get(k) for k in ("vendorID", "name", "accountNumber", "priceLevel", "updatePrice",
+                                                 "updateCost", "updateDescription", "shareSellThrough")
+                      if vendor.get(k) is not None}
+            summary = (f"Archive vendor {vendor_id} '{fmt.text(vendor.get('name'))}'. No active item uses it as default "
+                       "vendor and it has no unfinished PO. Lightspeed archives a vendor on DELETE (it is not erased); "
+                       "its past POs and returns keep it.")
+            return Plan("archive_vendor", summary,
+                        [PlannedRequest(f"archive vendor {vendor_id}", "DELETE", f"Vendor/{int(vendor_id)}.json", None,
+                                        before=before)],
+                        ["Unarchiving a vendor isn't documented for the API; it may need doing in Lightspeed."],
+                        basis={"timeStamp": vendor.get("timeStamp")})
+
+        return self._run("archive_vendor", dry_run, confirm_code, build)
+
+    # ---- 18. rename a brand ------------------------------------------------------------------------------------
+
+    def rename_brand(self, manufacturer_id: int, name: str, allow_similar_name: bool = False, dry_run: bool = True,
+                     confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            record = self._get_record(f"Manufacturer/{int(manufacturer_id)}.json", "Manufacturer")
+            if record is None:
+                raise RuleViolation(f"Refused: brand {manufacturer_id} does not exist.")
+            current = fmt.text(record.get("name")) or ""
+            if rules.clean(name) == current:
+                raise RuleViolation(f"Refused: brand {manufacturer_id} is already called '{current}'.")
+            warnings: list[str] = []
+            others = [r for r in self._existing_names("brand") if str(r["id"]) != str(manufacturer_id)]
+            new_name = self._check_new_name("brand", name, allow_similar_name, warnings, others)
+            items, _ = self.client.get_all("Item.json", {"manufacturerID": str(int(manufacturer_id)), "archived": "true"})
+            warnings.append(f"{len(items)} item(s) (archived included) and any matrix with this brand show the new name.")
+            summary = f"Rename brand {manufacturer_id} '{current}' -> '{new_name}'. Only the name is sent."
+            return Plan("rename_brand", summary,
+                        [PlannedRequest(f"rename brand {manufacturer_id}", "PUT",
+                                        f"Manufacturer/{int(manufacturer_id)}.json", {"name": new_name})], warnings)
+
+        return self._run("rename_brand", dry_run, confirm_code, build)
+
+    # ---- 19. categories: create, rename, delete ------------------------------------------------------------------
+
+    def _category(self, category_id) -> dict:
+        category = self.reader.categories().get(str(int(category_id)))
+        if not category:
+            raise RuleViolation(f"Refused: category {category_id} does not exist.")
+        return category
+
+    def _check_category_name(self, name, parent_id: str, except_id: str | None = None) -> str:
+        """A plain name, not used by a sibling (same parent), ignoring case. '/' would break the path."""
+        name = rules.check_record_name(name, "category")
+        if "/" in name:
+            raise RuleViolation("Refused: a category name can't contain '/' (Lightspeed uses it between levels).")
+        rules.check_not_boys(name)
+        for cid, c in self.reader.categories().items():
+            if (str(c.get("parentID") or "0") == parent_id and cid != except_id
+                    and (fmt.text(c.get("name")) or "").lower() == name.lower()):
+                raise RuleViolation(f"Refused: category {cid} '{fmt.text(c.get('fullPathName'))}' already has this name "
+                                    "at that level.")
+        return name
+
+    def create_category(self, name: str, parent_id: int | None = None, dry_run: bool = True,
+                        confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            parent = str(int(parent_id)) if parent_id else "0"
+            parent_path = fmt.text(self._category(parent).get("fullPathName")) if parent != "0" else ""
+            new_name = self._check_category_name(name, parent)
+            path = f"{parent_path}/{new_name}" if parent_path else new_name
+            summary = f"Create the category '{path}'" + (f" under '{parent_path}'." if parent_path else " (top level).")
+            return Plan("create_category", summary,
+                        [PlannedRequest(f"create category '{path}'", "POST", "Category.json",
+                                        {"name": new_name, "fullPathName": path, "parentID": parent})])
+
+        return self._run("create_category", dry_run, confirm_code, build)
+
+    def rename_category(self, category_id: int, name: str, dry_run: bool = True,
+                        confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            category = self._category(category_id)
+            cid = str(int(category_id))
+            children = [c for c in self.reader.categories().values() if str(c.get("parentID")) == cid]
+            if children:
+                raise RuleViolation(f"Refused: category {cid} has {len(children)} subcategories. Lightspeed doesn't say "
+                                    "whether their paths follow a rename, so only categories without subcategories "
+                                    "are renamed here.")
+            parent = str(category.get("parentID") or "0")
+            new_name = self._check_category_name(name, parent, except_id=cid)
+            if new_name == fmt.text(category.get("name")):
+                raise RuleViolation(f"Refused: category {cid} is already called '{new_name}'.")
+            old_path = fmt.text(category.get("fullPathName")) or ""
+            path = (old_path.rsplit("/", 1)[0] + "/" + new_name) if "/" in old_path else new_name
+            items, _ = self.client.get_all("Item.json", {"categoryID": cid, "archived": "true"})
+            summary = (f"Rename category {cid} '{old_path}' -> '{path}'. Its {len(items)} item(s) stay in it and show "
+                       "the new name.")
+            return Plan("rename_category", summary,
+                        [PlannedRequest(f"rename category {cid}", "PUT", f"Category/{cid}.json",
+                                        {"name": new_name, "fullPathName": path})])
+
+        return self._run("rename_category", dry_run, confirm_code, build)
+
+    def delete_category(self, category_id: int, dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            category = self._category(category_id)
+            cid = str(int(category_id))
+            children = [c for c in self.reader.categories().values() if str(c.get("parentID")) == cid]
+            if children:
+                raise RuleViolation(f"Refused: category {cid} has subcategories; Lightspeed won't delete it.")
+            items, _ = self.client.get_all("Item.json", {"categoryID": cid, "archived": "true"}, max_records=5)
+            if items:
+                raise RuleViolation(f"Refused: category {cid} still has items (archived ones count too), e.g. "
+                                    f"{item_label(items[0])}. Lightspeed doesn't say where they would end up.")
+            matrices, _ = self.client.get_all("ItemMatrix.json", {"categoryID": cid, "archived": "true"}, max_records=5)
+            if matrices:
+                raise RuleViolation(f"Refused: matrix {matrices[0].get('itemMatrixID')} uses category {cid}.")
+            path = fmt.text(category.get("fullPathName")) or ""
+            before = {k: category.get(k) for k in ("categoryID", "name", "fullPathName", "parentID")}
+            summary = f"Delete the empty category {cid} '{path}' (no items, matrices or subcategories)."
+            return Plan("delete_category", summary,
+                        [PlannedRequest(f"delete category {cid} '{path}'", "DELETE", f"Category/{cid}.json", None,
+                                        before=before)],
+                        ["Lightspeed deletes a category for good; its name and place are saved in the write log."])
+
+        return self._run("delete_category", dry_run, confirm_code, build)
+
+    # ---- 20. inventory counts (reconciling stays a click in Lightspeed) -------------------------------------------
+
+    def create_inventory_count(self, name: str | None, items: list[dict], count_id: int | None = None,
+                               dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        """Lightspeed's count flow: create the count, add each counted item with its quantity, then
+        reconcile. Stock only changes on reconcile, and that is never sent from here."""
+
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one counted item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice. Lightspeed adds repeated entries "
+                                    "together, so give each item once with its total.")
+            requests: list[PlannedRequest] = []
+            if count_id is not None:
+                count = self._get_record(f"InventoryCount/{int(count_id)}.json", "InventoryCount")
+                if count is None or fmt.flag(count.get("archived")):
+                    raise RuleViolation(f"Refused: inventory count {count_id} was not found (or is archived).")
+                # Live values: awaiting_reconciliation, reconciliation_success, reconciliation_done.
+                if (fmt.text(count.get("reconcileStatus")) or "awaiting_reconciliation") != "awaiting_reconciliation":
+                    raise RuleViolation(f"Refused: inventory count {count_id} is already reconciled "
+                                        f"({count.get('reconcileStatus')}); start a new count instead.")
+                already, _ = self.client.get_all("InventoryCountItem.json", {"inventoryCountID": str(int(count_id))})
+                counted = {str(r.get("itemID")) for r in already}
+                again = [i for i in ids if i in counted]
+                if again:
+                    raise RuleViolation(f"Refused: item(s) {', '.join(again)} are already in count {count_id}; another "
+                                        "entry would be added to the first.")
+                count_ref, count_text = str(int(count_id)), f"inventory count {count_id}"
+            else:
+                count_name = rules.check_record_name(name, "inventory count")
+                requests.append(PlannedRequest(f"create inventory count '{count_name}'", "POST", "InventoryCount.json",
+                                               {"name": count_name, "shopID": self._single_shop()}, creates="count"))
+                count_ref, count_text = new_ref("count"), f"the new inventory count '{count_name}'"
+            found = self._items_by_id(ids)
+            lines = []
+            for entry, item_id in zip(items, ids):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                try:
+                    qty = int(entry.get("counted"))
+                except (TypeError, ValueError):
+                    raise RuleViolation(f"Refused: the count for {item_label(item)} is not a whole number.") from None
+                if qty < 0 or qty != float(entry.get("counted")):
+                    raise RuleViolation(f"Refused: the count for {item_label(item)} must be a whole number of 0 or more.")
+                qoh = fmt.total_qoh(item) or 0
+                lines.append(f"{item_label(item)}: on hand {qoh}, counted {qty} ({qty - qoh:+d})")
+                requests.append(PlannedRequest(f"count {qty} x {item_label(item)} (on hand now {qoh})", "POST",
+                                               "InventoryCountItem.json",
+                                               {"inventoryCountID": count_ref, "itemID": item_id, "qty": str(qty),
+                                                "employeeID": COUNT_EMPLOYEE_ID}))
+            change = sum(int(r.body["qty"]) for r in requests if r.path == "InventoryCountItem.json") - sum(
+                fmt.total_qoh(found[i]) or 0 for i in ids)
+            summary = (f"Record {len(ids)} counted item(s) on {count_text} (employee {COUNT_EMPLOYEE_ID}). If reconciled "
+                       f"as is, stock would change by {change:+d} unit(s) in total. Nothing changes stock now.")
+            after = ("Stock does NOT change until the count is reconciled. In Lightspeed, open the count, check the "
+                     "differences, and reconcile it there. Items not in the count are not adjusted. Reconciling can't "
+                     "be undone except by adjusting each item.")
+            return Plan("create_inventory_count", summary, requests, lines, after)
+
+        return self._run("create_inventory_count", dry_run, confirm_code, build)

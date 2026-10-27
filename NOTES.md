@@ -580,6 +580,62 @@ new_item.new_brand=…)`.
   Wool", "Vitarelli" / "Marquis / Vitarelli".
 - Only 3 of 677 vendors have an account number.
 
+## Prices, reorder levels, PO/vendor archiving, categories, counts (2026-10-26, late)
+
+Built on the owner's request (the rest of the CRUD table). Docs findings:
+
+- **Prices:** no page says what a PUT with only some price levels does (every
+  documented example sends all three). `update_item_prices` sends all three, only
+  the asked-for ones changed. It is the only route that puts `Prices` on an
+  existing item.
+- **Reorder:** `PUT ItemShop/{itemShopID}.json` (changelog 2025.06.06) "allows you
+  to update the reorder point and reorder level"; qoh isn't writable there. Used
+  instead of Item PUT with ItemShops, so **no route carries `ItemShops` or `qoh`**.
+  No item in the store has a reorder point or level today (0 of 790).
+- **ItemVendorNum:** changing a value (keep `itemVendorNumID`) and removing one are
+  not documented; a number without `cost` sets the vendor cost to 0, so new
+  numbers carry the invoice's or item's cost. Removal isn't offered.
+- **Order DELETE** archives ("Archived orders are not counted towards backorder
+  totals"). What happens to the lines and whether it can be undone is unconfirmed.
+- **Vendor DELETE** archives; unarchiving isn't documented. `archive_vendor`
+  refuses a vendor that is any active item's default or has an unfinished PO.
+- **Manufacturer:** PUT `name`; DELETE is not allowed at all.
+- **Category:** POST/PUT `name`, `fullPathName`, `parentID` (nested set, the
+  documented pattern sends the path too); POST/PUT/DELETE cost 10 drips; **DELETE
+  is permanent**, refused by Lightspeed with subcategories, and items "will not
+  be deleted" (where they go is unconfirmed). So `delete_category` needs a
+  category with no items (archived too), no matrices, no subcategories, and
+  `rename_category` refuses one with subcategories (whether their paths update
+  is unconfirmed).
+- **Inventory counts:** `POST InventoryCount` {name, shopID} → `POST
+  InventoryCountItem` {inventoryCountID, itemID, qty, employeeID (required)} →
+  `POST InventoryCountReconcile`. "The quantity on hand is not adjusted until the
+  count is reconciled." Reconcile "can not be undone"; it has its own scope
+  (`employee:inventory_counts_reconcile`, not held). **No route reconciles.**
+  Repeated entries for an item add up, so each item is entered once.
+  Live `reconcileStatus` values: `awaiting_reconciliation`, `reconciliation_success`,
+  `reconciliation_done`. Every existing count item, and recent POs, use employee 1
+  (`COUNT_EMPLOYEE_ID`); the token's `sub` claim (1434369) is not an employee ID.
+- **Vendor returns are read-only in the API** (GET only, scope "View vendor
+  returns"); no VendorReturnItem endpoint. **Special orders** can only be created as
+  a customer SaleLine (`isSpecialOrder`, `customerID` required): not built, customer
+  data stays out. **ItemAttributeSet** names are limited to Lightspeed's own; not
+  built (the store uses set 5).
+
+### Findings (dry runs and snapshot)
+
+- The duplicate vendor names are each an archived original plus an active copy
+  with no items and no POs: "Broder Brothers" 101 (archived) / 700, "Yellowman
+  (YMX)" 102 (archived) / 701.
+- Item 1468's only vendor number is "Christopher Lena": the vendor's name, not an
+  item number.
+- Empty categories (no items, matrices or subcategories): 114 ".../Dress
+  Shirts/Dress Shirt", 115 ".../Non Iron", 119 ".../Ultra Stretch".
+- 9 POs from 2024 (353, 389, 415, 438, 469, 470, 472, 476, 495) are unfinished
+  with nothing received.
+- Category 83 holds items with vendor codes in their description, e.g. 1158
+  "S62KR Suit Heather-Grey 34R Modern".
+
 ## Helper tools (2026-10-26, evening)
 
 - `suggest_custom_skus`, `show_write_log`, `take_snapshot`, `compare_snapshots`.
@@ -595,4 +651,4 @@ new_item.new_brand=…)`.
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
   `check_tools.py --dry-runs` calls every write tool on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (505 tests).
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (551 tests).
