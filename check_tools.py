@@ -112,6 +112,7 @@ DRY_RUNS = [
     ("reassign_items", {"items": [{"item_id": 1380, "vendor_id": 2}, {"item_id": 1390, "vendor_id": 2}]}),
     ("set_upcs", {"items": [{"item_id": 1345, "upc": "036000291452"}]}),  # a sample UPC with a valid check digit
     ("move_category", {"category_id": 84}),                 # Suits/Tuxedos to the top level
+    ("adjust_stock", {"items": [{"item_id": 1644, "change": 1}], "reason": "Dry run: one found in the back"}),
 ]
 
 

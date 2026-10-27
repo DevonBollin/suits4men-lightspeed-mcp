@@ -1,16 +1,20 @@
-"""Items outside a matrix: vendor, brand and category.
+"""Item tools: vendor, brand and category; UPCs; stock changes.
 
 Same setup as test_writer.py: canned reads, a mocked write transport, the switch in a temp folder.
 """
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
+from lightspeed_mcp.errors import WriteRefused
 from lightspeed_mcp.reader import InventoryReader
 from lightspeed_mcp.rules import RuleViolation
 from lightspeed_mcp.writer import InventoryWriter
+from tests.conftest import turn_on
 from tests.test_writer import CannedReads
 
 
@@ -133,3 +137,97 @@ def test_intake_notes_an_existing_item_without_the_upc(writer):
     result = writer.intake_invoice(vendor_id=1, invoice_number="INV-UPC2", lines=[
         {"item_id": 1345, "upc": "03600029145", "quantity": 1, "unit_cost": 63.5}])
     assert any("has no UPC; set_upcs can save 03600029145" in w for w in result["warnings"])
+
+
+# ---- adjust_stock --------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stock_rows(reads):
+    """Give every canned stock row an ID: '9' + shop + item (shop 1's row of item 1644 is 911644)."""
+    for item in reads.data["Item"]:
+        for row in item["ItemShops"]["ItemShop"]:
+            row["itemShopID"] = "9" + row["shopID"] + item["itemID"]
+    return reads
+
+
+@pytest.fixture
+def confirmed(write_log):
+    """A first stock change has been done and checked."""
+    write_log.append({"write_id": "x", "tool": "adjust_stock", "event": "done", "status": 200})
+
+
+def test_first_stock_change_is_one_item_with_the_shop_row_only(writer, stock_rows):
+    result = writer.adjust_stock([{"item_id": 1346, "change": -1}], "Broke suit: pants sold alone")
+    [request] = result["requests"]
+    assert request["method"] == "PUT" and request["path"].endswith("/Item/1346.json")
+    assert request["body"] == {"ItemShops": {"ItemShop": [{"itemShopID": "911346", "qoh": "2"}]}}  # 3 - 1
+    assert "stock 3 -> 2 (-1)" in request["does"]
+    assert "Broke suit" in result["summary"] and "first stock change" in result["after"]
+    with pytest.raises(RuleViolation, match="one item per call"):
+        writer.adjust_stock([{"item_id": 1346, "change": -1}, {"item_id": 1801, "change": 1}], "Broke suit")
+
+
+def test_breaking_a_suit_after_the_first_change(writer, stock_rows, confirmed):
+    result = writer.adjust_stock([{"item_id": 1346, "change": -1}, {"item_id": 1801, "change": 1}],
+                                 "Broke suit 1346: jacket sold alone, pants to Caravelli Pants 34")
+    assert [r["body"]["ItemShops"]["ItemShop"][0]["qoh"] for r in result["requests"]] == ["2", "1"]
+    assert "after" not in result
+    assert any("Cost control" in w for w in result["warnings"])       # +1 on the pants
+
+
+def test_set_to_zero_settles_a_placeholder(writer, stock_rows):
+    result = writer.adjust_stock([{"item_id": 1186, "set_to": 0}], "Settle placeholder before archiving")
+    assert result["requests"][0]["body"]["ItemShops"]["ItemShop"][0]["qoh"] == "0"
+    assert "stock -16 -> 0 (+16)" in result["requests"][0]["does"]
+
+
+def test_a_sale_after_the_dry_run_makes_it_stale(writer, reads, stock_rows, fake_api, write_switch):
+    turn_on(write_switch)
+    args = ([{"item_id": 1186, "set_to": 0}], "Settle placeholder before archiving")
+    code = writer.adjust_stock(*args)["confirm_code"]
+    for row in next(i for i in reads.data["Item"] if i["itemID"] == "1186")["ItemShops"]["ItemShop"]:
+        row["qoh"] = "-17"                                             # one more sold meanwhile
+    with pytest.raises(WriteRefused, match="does not match"):
+        writer.adjust_stock(*args, dry_run=False, confirm_code=code)
+    assert fake_api.requests == []
+
+
+def test_the_reason_and_old_stock_are_logged(writer, stock_rows, fake_api, write_log, write_switch):
+    turn_on(write_switch)
+    args = ([{"item_id": 1346, "change": -1}], "Broke suit: pants sold alone")
+    code = writer.adjust_stock(*args)["confirm_code"]
+    writer.adjust_stock(*args, dry_run=False, confirm_code=code)
+    [sending] = [e for e in write_log.entries() if e["event"] == "sending"]
+    assert sending["before"] == {"itemID": "1346", "itemShopID": "911346", "shopID": "1", "qoh": "3",
+                                 "reason": "Broke suit: pants sold alone"}
+    assert json.loads(fake_api.requests[0].content) == {"ItemShops": {"ItemShop": [{"itemShopID": "911346",
+                                                                                     "qoh": "2"}]}}
+
+
+@pytest.mark.parametrize("items, reason, message", [
+    ([{"item_id": 1346, "change": -1}], "", "say why"),
+    ([{"item_id": 1346}], "Recount", "either change"),
+    ([{"item_id": 1346, "change": -1, "set_to": 2}], "Recount", "either change"),
+    ([{"item_id": 1346, "change": 0}], "Recount", "other than 0"),
+    ([{"item_id": 1346, "change": 1.5}], "Recount", "other than 0"),
+    ([{"item_id": 1346, "set_to": -1}], "Recount", "from 0 to"),
+    ([{"item_id": 1346, "set_to": 3}], "Recount", "already has stock 3"),
+    ([{"item_id": 1700, "change": 1}], "Recount", "archived"),
+    ([{"item_id": 99999, "change": 1}], "Recount", "not found"),
+])
+def test_stock_change_rules(writer, stock_rows, fake_api, items, reason, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.adjust_stock(items, reason)
+    assert fake_api.requests == []
+
+
+def test_an_item_without_a_shop_row_is_refused(writer):
+    with pytest.raises(RuleViolation, match="no stock row for shop 1"):
+        writer.adjust_stock([{"item_id": 1346, "change": -1}], "Recount")   # canned rows have no itemShopID
+
+
+def test_still_negative_and_large_changes_are_flagged(writer, stock_rows, confirmed):
+    result = writer.adjust_stock([{"item_id": 1644, "change": 2}, {"item_id": 1345, "set_to": 150}], "Recount")
+    assert any("stock would be -25, still negative" in w for w in result["warnings"])
+    assert any("+150 units" in w for w in result["warnings"])

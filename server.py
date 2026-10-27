@@ -47,8 +47,9 @@ mcp = MCPServer(
         "vendors, manufacturers, categories, purchase orders, stock and stock history, sales history, inventory "
         "counts, special orders, vendor returns and vendor catalogs. Results are trimmed JSON with IDs; long lists "
         "come as {columns, rows} tables. Use api_get for any field the other tools leave out. The read tools and "
-        "api_get can never change anything. The write tools (matrices, items, SKUs, vendor numbers, purchase "
-        "orders and their lines, invoice intake, archiving one item) default to dry runs that send nothing. "
+        "api_get can never change anything. The write tools (matrices, items, SKUs, UPCs, vendor numbers, purchase "
+        "orders and their lines, invoice intake, categories, stock changes, archiving one item) default to dry "
+        "runs that send nothing. "
         "For an invoice or packing slip: match_invoice_lines, then intake_invoice. Matrices can never be "
         "archived. Never make a "
         "real write unless the user, in this chat, has approved that exact dry run; an approval covers one write "
@@ -1011,6 +1012,29 @@ def move_category(
     and move the subcategories one by one, then delete the empty old parent. Refuses a name a
     category under the new parent already has."""
     return run(lambda w: w.move_category(category_id, parent_id, dry_run, confirm_code), writer)
+
+
+class StockChange(BaseModel):
+    item_id: Annotated[int, Field(description="The item.")]
+    change: Annotated[int | None, Field(description="Units to add (+) or take off (-), e.g. -1 on the suit and +1 on the leftover pants when a suit is broken.")] = None
+    set_to: Annotated[int | None, Field(description="Instead of change: the exact quantity on hand, e.g. 0 to settle an old placeholder before archiving it, or a counted quantity.")] = None
+
+
+@write_tool
+def adjust_stock(
+    items: Annotated[list[StockChange], Field(description="Items and their stock change (max 20; one until a first change has been checked).")],
+    reason: Annotated[str, Field(description="Why, in a sentence (kept in the write log), e.g. 'Broke suit 1644: pants sold alone'.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Change items' stock on hand directly, when no purchase order or count fits: breaking a suit
+    (suit -1, the leftover piece +1 in its separates matrix), settling an old placeholder to 0 before
+    archiving it, or correcting a miscount. The dry run shows each item's stock now -> new. Lightspeed
+    takes the new quantity itself, so if anything sells between the dry run and the approval, the
+    call is refused: run the dry run again. No PO is recorded and added stock gets its cost from
+    Lightspeed's Cost control setting, so goods bought from a vendor go through intake_invoice instead.
+    One item per call until a first change has been done and checked."""
+    return run(lambda w: w.adjust_stock([i.model_dump() for i in items], reason, dry_run, confirm_code), writer)
 
 
 class CountedItem(BaseModel):

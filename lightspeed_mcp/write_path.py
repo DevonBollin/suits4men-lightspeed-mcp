@@ -14,8 +14,9 @@ in writer.py hold one. Before anything leaves the computer, these checks must pa
      (Lightspeed archives an item on DELETE). No route can update or archive a
      matrix: archiving a matrix archives every item in it, so that stays manual.
   3. The JSON body holds only the fields that route allows (a DELETE has no
-     body). Prices can only be set when creating a matrix or a new item; stock
-     levels (ItemShops) never.
+     body). Prices can only be set when creating a matrix or a new item (or by
+     update_item_prices); stock on hand (ItemShops qoh) only by adjust_stock,
+     one shop's stock row at a time.
   4. An httpx request hook repeats checks 1 and 2 as the last line of defence,
      so code that reaches past WriteClient still cannot send anything else.
 
@@ -67,12 +68,13 @@ WRITE_COST = 2.0
 
 
 # What a nested record in a body may contain, wherever it appears. A price can only carry an
-# amount and its level; a stock row (ItemShops) only its ID and reorder settings, never qoh.
+# amount and its level; a stock row (ItemShops, which only adjust_stock's route allows) only its
+# ID and the new quantity on hand.
 NESTED_FIELDS = {
     ("Prices", "ItemPrice"): frozenset({"amount", "useTypeID", "useType"}),
     ("ItemAttributes", None): frozenset({"itemAttributeSetID", "attribute1", "attribute2", "attribute3"}),
     ("ItemVendorNums", "ItemVendorNum"): frozenset({"itemVendorNumID", "vendorID", "value", "cost"}),
-    ("ItemShops", "ItemShop"): frozenset({"itemShopID", "reorderPoint", "reorderLevel"}),
+    ("ItemShops", "ItemShop"): frozenset({"itemShopID", "qoh"}),
 }
 
 
@@ -143,6 +145,10 @@ RENAME_BRAND = Route("PUT", re.compile(r"Manufacturer/\d+\.json"), frozenset({"n
 NEW_CATEGORY = Route("POST", re.compile(r"Category\.json"), frozenset({"name", "fullPathName", "parentID"}))
 RENAME_CATEGORY = Route("PUT", re.compile(r"Category/\d+\.json"), frozenset({"name", "fullPathName"}))
 DELETE_CATEGORY = Route("DELETE", re.compile(r"Category/\d+\.json"), frozenset())
+# An item's stock on hand in one shop: its stock row (by itemShopID) with the new qoh, and nothing
+# else. Lightspeed's Item update takes ItemShops; the ItemShop endpoint itself only takes reorder
+# settings. Only adjust_stock may send it (README, "Changing stock").
+ITEM_STOCK = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"ItemShops"}))
 # A category's place in the tree: its new parent and the path that goes with it. Never its name.
 MOVE_CATEGORY = Route("PUT", re.compile(r"Category/\d+\.json"), frozenset({"parentID", "fullPathName"}))
 # Attribute sets (matrix types): a name and up to three attribute names. Never `archived` or `system`.
@@ -229,6 +235,7 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "reassign_items": (ITEM_VENDOR_BRAND_CATEGORY,),
     "set_upcs": (ITEM_UPC,),
     "move_category": (MOVE_CATEGORY,),
+    "adjust_stock": (ITEM_STOCK,),
 }
 
 
@@ -400,6 +407,15 @@ class WriteClient:
         problem = nested_problem(body)
         if problem:
             raise WriteBlockedError(f"{tool}: {problem}.")
+        if "ItemShops" in body:
+            # One shop's own stock row, named by its ID. Never a row without one (Lightspeed's shop 0 row
+            # is the all-shops total), never several at once.
+            rows = body["ItemShops"]["ItemShop"]
+            rows = rows if isinstance(rows, list) else [rows]
+            if len(rows) != 1 or set(rows[0]) != {"itemShopID", "qoh"} or not str(rows[0]["itemShopID"]).isdigit() \
+                    or str(rows[0]["itemShopID"]) == "0" or not re.fullmatch(r"-?\d+", str(rows[0]["qoh"])):
+                raise WriteBlockedError(f"{tool}: a stock change is exactly one stock row: its itemShopID and the new "
+                                        "whole-number qoh.")
 
     def send(self, tool: str, method: str, path: str, body: dict | None, confirm_code: str,
              before: dict | None = None) -> dict:

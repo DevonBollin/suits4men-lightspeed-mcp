@@ -255,13 +255,14 @@ across several entries and switched over atomically. See
 | `create_vendor` | `POST Vendor.json`: name (as the vendor writes it) and account number | Create a duplicate or near-duplicate (see below); update or archive a vendor |
 | `create_brand` | `POST Manufacturer.json`: the brand's name | Create a duplicate or near-duplicate; Lightspeed can't delete a brand |
 | `update_item_prices` | `PUT Item/<id>.json` with all three price levels, only the asked-for ones changed | Change anything but prices; it is the only tool that changes an existing item's price |
-| `set_reorder_levels` | `PUT ItemShop/<id>.json`: reorder point and level for the shop | Send stock (no route can) |
+| `set_reorder_levels` | `PUT ItemShop/<id>.json`: reorder point and level for the shop | Send stock (only `adjust_stock` can) |
 | `archive_purchase_order` | `DELETE Order/<id>.json` (Lightspeed archives) for a PO where nothing was received; logged first | Archive a PO with goods received, or a finished one |
 | `correct_vendor_numbers` | `PUT Item/<id>.json`: an existing vendor number's new value (its ID and cost kept) | Remove a vendor number (not documented) |
 | `update_vendor` / `archive_vendor` | `PUT Vendor/<id>.json` (name, account number) / `DELETE` (archives) | Archive a vendor still used by an active item or an open PO |
 | `rename_brand` | `PUT Manufacturer/<id>.json`: name | Take another brand's name |
 | `create_category` / `rename_category` / `delete_category` | `POST`/`PUT Category` (name, path, parent) / `DELETE` (for good) | Rename one with subcategories; delete one with items, matrices or subcategories |
 | `move_category` | `PUT Category/<id>.json`: new parent and path; its items and matrices move with it | Move one with subcategories (rebuild a branch leaf by leaf), or rename it |
+| `adjust_stock` | `PUT Item/<id>.json` per item with one stock row: its `itemShopID` and the new `qoh` | Change stock without a reason, overwrite a sale made after the dry run, or (until a first change is checked) touch more than one item |
 | `create_inventory_count` | `POST InventoryCount.json` + one `POST InventoryCountItem.json` per counted item | **Reconcile** (the step that changes stock stays a click in Lightspeed) |
 | `create_attribute_set` / `update_attribute_set` | `POST`/`PUT ItemAttributeSet`: a set's name and its 1-3 attribute names (one is always Color) | Touch Lightspeed's built-in sets 1-4; remove, swap or move Color in a set that matrices use |
 | `reassign_items` | `PUT Item/<id>.json` per item: default vendor, brand and/or category, only what changes | Touch an item in a matrix (`update_matrix` does the whole matrix), or prices, cost, stock and vendor numbers |
@@ -325,6 +326,27 @@ that has it. A new item or variant created by the intake gets the line's UPC,
 and `add_matrix_variants`, `create_items` and `set_upcs` take one too. A UPC
 must be 11-14 digits (Lightspeed's rule), pass its check digit, and belong to
 one item only.
+
+#### Changing stock
+
+`adjust_stock` changes stock on hand directly, for what no purchase order or
+count covers: breaking a suit (the suit −1, the leftover pants or jacket +1 in
+its separates matrix), settling an old placeholder to 0 so it can be archived,
+or correcting a miscount. Each item takes a `change` (−1, +1) or a `set_to`
+(0), and every call takes a reason, which is kept in the write log with the
+stock as it was.
+
+- Lightspeed takes the new quantity itself, not a change, so the dry run reads
+  each item's stock and shows now → new. If anything sells before you approve,
+  the confirm code no longer matches and the call is refused: run the dry run
+  again.
+- No purchase order or count is recorded. Stock added this way gets its cost
+  from Lightspeed's **Cost control** setting (default or average cost), so goods
+  bought from a vendor still go through `intake_invoice`.
+- This isn't in Lightspeed's current endpoint docs (their developer forum and
+  Cost control help describe it), so it moves **one item per call until a first
+  change has been done and checked**: take a snapshot before, then compare and
+  look at the item's stock history.
 
 #### Inventory counts
 

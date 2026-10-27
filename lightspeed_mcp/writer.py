@@ -1171,8 +1171,8 @@ class InventoryWriter:
                 raise RuleViolation(
                     f"Refused: {item_label(item)} has stock {fmt.total_qoh(item)}. Archiving zeroes an item's stock in "
                     "Lightspeed, and that can't be undone. Only items with stock exactly 0 are archived here: settle "
-                    "the stock first (e.g. with an inventory count), or archive it by hand in Lightspeed if that is "
-                    "really intended.")
+                    "the stock first (adjust_stock with set_to 0, or an inventory count), or archive it by hand in "
+                    "Lightspeed if that is really intended.")
 
             lines, _ = self.client.get_all("OrderLine.json", {"itemID": str(int(item_id))})
             order_ids = sorted({str(line.get("orderID")) for line in lines if fmt.ref_id(line.get("orderID"))}, key=int)
@@ -2608,3 +2608,105 @@ class InventoryWriter:
                         after=after, basis={"timeStamp": category.get("timeStamp")})
 
         return self._run("move_category", dry_run, confirm_code, build)
+
+    # ---- 25. change stock on hand directly -----------------------------------------------------------------
+    # Lightspeed's Item update takes the shop's stock row (ItemShops: its itemShopID and a new qoh). The
+    # qoh is the new quantity itself, not a change, so each plan reads the stock now and works the new
+    # number out; the stock it read is part of the confirm code, so a sale between the dry run and the
+    # approval makes the code stale instead of being overwritten. Not in Lightspeed's current endpoint
+    # docs (their developer forum and Cost control help describe it): see NOTES.md.
+
+    MAX_STOCK_ITEMS = 20
+
+    def _stock_changes_confirmed(self) -> bool:
+        """Has a stock change ever come back done? Until one has, one item per call."""
+        return any(e.get("tool") == "adjust_stock" and e.get("event") == "done"
+                   for e in self.writes.write_log.entries())
+
+    def adjust_stock(self, items: list[dict], reason: str, dry_run: bool = True,
+                     confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            why = rules.clean(reason)
+            if len(why) < 5:
+                raise RuleViolation("Refused: say why the stock changes (e.g. 'Broke suit: pants sold alone, leftover "
+                                    "jacket to Caravelli Sport Coat 42R'). It is kept in the write log.")
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            first = not self._stock_changes_confirmed()
+            limit = 1 if first else self.MAX_STOCK_ITEMS
+            if len(items) > limit:
+                raise RuleViolation(
+                    f"Refused: {len(items)} items; the limit is {limit} per call"
+                    + (". Until one stock change has been done and checked (how Lightspeed records it and what it "
+                       "does to cost), it is one item per call." if first else "."))
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            shop = self._single_shop()
+            found = self._items_by_id(ids)
+            requests, warnings = [], []
+            read: dict[str, int] = {}
+            added = False
+            for entry, item_id in zip(items, ids):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                row = next((s for s in fmt.as_list((item.get("ItemShops") or {}).get("ItemShop"))
+                            if str(s.get("shopID")) == shop), None)
+                if row is None or not fmt.ref_id(row.get("itemShopID")):
+                    raise RuleViolation(f"Refused: {item_label(item)} has no stock row for shop {shop}.")
+                current = fmt.integer(row.get("qoh")) or 0
+                change, set_to = entry.get("change"), entry.get("set_to")
+                if (change is None) == (set_to is None):
+                    raise RuleViolation(f"Refused: for {item_label(item)} give either change (e.g. -1) or set_to "
+                                        "(e.g. 0), not both.")
+                if set_to is not None:
+                    try:
+                        new = int(set_to)
+                    except (TypeError, ValueError):
+                        raise RuleViolation(f"Refused: set_to '{set_to}' is not a whole number.") from None
+                    if new != float(set_to) or not 0 <= new <= MAX_LINE_QUANTITY:
+                        raise RuleViolation(f"Refused: set_to must be a whole number from 0 to {MAX_LINE_QUANTITY}.")
+                else:
+                    try:
+                        delta = int(change)
+                    except (TypeError, ValueError):
+                        raise RuleViolation(f"Refused: change '{change}' is not a whole number.") from None
+                    if delta != float(change) or delta == 0 or abs(delta) > MAX_LINE_QUANTITY:
+                        raise RuleViolation(f"Refused: change must be a whole number other than 0, at most "
+                                            f"{MAX_LINE_QUANTITY} either way.")
+                    new = current + delta
+                if new == current:
+                    raise RuleViolation(f"Refused: {item_label(item)} already has stock {current}.")
+                delta = new - current
+                added = added or delta > 0
+                if new < 0:
+                    warnings.append(f"{item_label(item)}: stock would be {new}, still negative.")
+                if abs(delta) > 100:
+                    warnings.append(f"{item_label(item)}: a change of {delta:+d} units. Check the number.")
+                read[item_id] = current
+                requests.append(PlannedRequest(
+                    f"{item_label(item)}: stock {current} -> {new} ({delta:+d})", "PUT", f"Item/{item_id}.json",
+                    {"ItemShops": {"ItemShop": [{"itemShopID": str(row.get("itemShopID")), "qoh": str(new)}]}},
+                    before={"itemID": item_id, "itemShopID": str(row.get("itemShopID")), "shopID": shop,
+                            "qoh": str(current), "reason": why}))
+            warnings.append("No purchase order or inventory count is recorded: the item's stock history shows a change "
+                            "made through the API. The reason is kept in this computer's write log.")
+            if added:
+                warnings.append("Stock added this way gets its cost from Lightspeed's Cost control setting (the item's "
+                                "default cost or its average cost), not from an invoice. Goods bought from a vendor go "
+                                "through a purchase order instead (intake_invoice).")
+            summary = (f"Change the stock on hand of {len(requests)} item(s) in shop {shop}, as listed. Reason: {why}. "
+                       "Lightspeed takes the new quantity itself, so each is worked out from the stock read now; if "
+                       "anything sells before the approval, this dry run no longer matches and is refused. Only the "
+                       "stock row's quantity is sent.")
+            after = None
+            if first:
+                after = ("This is the first stock change through the API. Take a snapshot before (take_snapshot); "
+                         "afterwards compare (compare_snapshots) and look at the item's stock history "
+                         "(get_stock_history) to see how Lightspeed recorded it and what it did to cost.")
+            return Plan("adjust_stock", summary, requests, warnings, after, basis={"shop": shop, "stock": read})
+
+        return self._run("adjust_stock", dry_run, confirm_code, build)
