@@ -26,7 +26,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from lightspeed_mcp import intake, snapshots
+from lightspeed_mcp import info, intake, snapshots
 from lightspeed_mcp.client import LightspeedClient
 from lightspeed_mcp.config import HTTP_TIMEOUT_SECONDS
 from lightspeed_mcp.errors import LightspeedError, NotBootstrappedError
@@ -459,6 +459,14 @@ def match_invoice_lines(
     back as existing (with the item), new_variant (a matrix gains a color/size/fit), new_item, or
     unresolved (with the reason and candidate items by description). Read-only."""
     return run(lambda r: intake.match_report(intake.InvoiceMatcher(r).match(vendor_id, [l.model_dump() for l in lines])))
+
+
+@tool
+def server_info() -> str:
+    """What is running on this computer: the server's version (git branch and commit), the computer's
+    name, the Lightspeed account, the login's permissions and expiry, whether writes are turned on,
+    how many writes were logged, and the newest snapshot. Local only; never shows a token."""
+    return run(lambda _: info.server_info(SecretStore(), WriteSwitch(), WriteLog()), local)
 
 
 @tool
