@@ -28,6 +28,7 @@ file in this folder, and not in the Claude Desktop config.
 | `install_claude_desktop.py` | Adds the server to Claude Desktop's config |
 | `check_tools.py` | Calls the read tools against the live account; `--dry-runs` calls the write tools as dry runs |
 | `backup_lightspeed.py` | Saves a read-only snapshot of the inventory data; `--compare` diffs two snapshots |
+| `update.ps1` | Updates another computer (the store's) to the newest released version, safely |
 | `lightspeed_mcp/client.py`, `reader.py` | GET-only client and the read tools' logic |
 | `lightspeed_mcp/write_path.py` | The only code that can write: master switch, allowed requests, write log |
 | `lightspeed_mcp/writer.py`, `rules.py` | The write tools' logic and the store's business rules |
@@ -97,6 +98,88 @@ else, vendors and categories included, works with the current token). Re-authori
 from a normal PowerShell window: from the Claude app's Terminal panel, open one with
 `Start-Process powershell -WorkingDirectory "C:\Development\Suits 4 Men Inventory"`.
 
+## Two computers: developing here, running at the store
+
+The code lives in a private GitHub repository:
+`https://github.com/DevonBollin/suits4men-lightspeed-mcp`.
+
+- The **developer's computer** works on the `main` branch.
+- The **store's computer** runs only released versions: the `stable` branch.
+- Each computer has its **own** Lightspeed login, write switch, write log and
+  snapshots. None of those are in git, so nothing that matters to one computer
+  travels to the other.
+
+Both computers work on the same live Lightspeed account. Dry runs, the write
+switch and per-write approval are what keep testing safe.
+
+### Setting up another computer (once)
+
+1. **Install** [Claude Desktop](https://claude.ai/download),
+   [Git for Windows](https://git-scm.com/download/win) and
+   [uv](https://docs.astral.sh/uv/getting-started/installation/), then open a new
+   PowerShell window so they are found.
+2. **Access to the repository:** that computer needs a GitHub login that can
+   read it. Either add its owner's GitHub account as a collaborator (repository
+   Settings > Collaborators), or create a fine-grained token with read-only
+   access to this one repository. The first `git clone` asks for it in a browser
+   window (Git Credential Manager).
+3. **Get the released version and its packages:**
+
+   ```powershell
+   git clone -b stable https://github.com/DevonBollin/suits4men-lightspeed-mcp.git "C:\Suits 4 Men\Lightspeed"
+   cd "C:\Suits 4 Men\Lightspeed"
+   uv sync
+   .venv\Scripts\python.exe -m pytest -q
+   .venv\Scripts\python.exe install_claude_desktop.py
+   ```
+
+4. **A Lightspeed login of its own.** In Lightspeed's developer portal, create a
+   second API client for this computer, with the redirect URI
+   `https://localhost/callback`. Use that client's ID and secret here, so each
+   computer can be revoked without affecting the other. Then run the bootstrap
+   steps above (`bootstrap.py`, in a normal PowerShell window), signing in as the
+   owner or an admin.
+5. **Restart Claude Desktop** (Quit from the tray icon). Ask Claude for
+   `server_info`: it should show branch `stable`, the account, the login's
+   permissions, and `writes_enabled: false`.
+
+Writes stay **off** on that computer until someone there creates
+`state\WRITES_ENABLED` by hand (see "Turning writes on and off").
+
+### Releasing a new version (developer's computer)
+
+1. Work on `main`, run the tests (`.venv\Scripts\python.exe -m pytest`) and, for
+   anything that touches Lightspeed, `check_tools.py` and `check_tools.py --dry-runs`.
+2. Raise `version` in `pyproject.toml` and run `uv lock`, so `server_info` shows
+   which release a computer runs. Commit.
+3. Publish `main`, then release it to `stable`:
+
+   ```powershell
+   git push origin main
+   git push origin main:stable
+   ```
+
+### Updating the store's computer
+
+In PowerShell, in its project folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\update.ps1
+```
+
+`-ExecutionPolicy Bypass` lets Windows run this one script and changes no
+setting. The script:
+
+1. refuses to run if files were edited on that computer;
+2. moves to the newest `stable` (fast-forward only);
+3. runs `uv sync`;
+4. runs the tests, and if any fail, goes back to the version it started from;
+5. tells you to restart Claude Desktop.
+
+It never touches `state\` (the switch and the log), `backups\` or the saved login.
+Updating is always a deliberate step, never automatic, because these tools can
+change the live inventory.
+
 ## Revoke access
 
 1. In Lightspeed Retail, open **Settings > Client API Access**, find this
@@ -147,6 +230,7 @@ across several entries and switched over atomically. See
 | `take_snapshot` | Saves a snapshot to `backups\` in the background (about 75 s). GET only; it adds files on this computer |
 | `compare_snapshots` | Lists snapshots and compares two (by default the two newest), field by field |
 | `match_invoice_lines` | Matches an invoice's or packing slip's lines to items: existing, new variant, new item, or unresolved (with candidates) |
+| `server_info` | What runs on this computer: version (branch and commit), computer, account, login permissions, write switch, writes logged, newest snapshot |
 
 ### Write tools
 
