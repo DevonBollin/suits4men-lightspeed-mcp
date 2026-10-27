@@ -73,12 +73,25 @@ def test_request_hook_refuses_even_an_allowed_request_with_switch_off(make_write
 # ---- only the write tools' own requests ---------------------------------------------------------
 
 
-def test_exactly_five_write_tools_and_no_delete():
+def test_exactly_these_write_tools():
     assert set(WRITE_ROUTES) == {"create_matrix", "add_matrix_variants", "update_item_fields", "add_po_lines",
-                                 "receive_po_lines"}
-    assert {r.method for r in WRITE_ROUTES.values()} == {"POST", "PUT"}
-    # The matrix itself can be created but never updated (a matrix price save can reach every child).
-    assert not any(r.method == "PUT" and r.path.fullmatch("ItemMatrix/7.json") for r in WRITE_ROUTES.values())
+                                 "receive_po_lines", "move_items_into_matrix", "assign_custom_skus", "archive_item"}
+
+
+def test_the_only_delete_archives_one_item():
+    deletes = {tool: r for tool, r in WRITE_ROUTES.items() if r.method == "DELETE"}
+    assert list(deletes) == ["archive_item"]
+    route = deletes["archive_item"]
+    assert route.path.fullmatch("Item/1345.json") and route.fields == frozenset()
+    for path in ("Item.json", "ItemMatrix/7.json", "OrderLine/1.json", "Order/853.json", "Item/1345/Image.json"):
+        assert not route.path.fullmatch(path)
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "POST"])
+def test_no_route_can_change_an_existing_matrix(method):
+    """A matrix can be created, never updated or archived: a matrix price save can reach every
+    item, and archiving a matrix archives all of its items. That stays manual in Lightspeed."""
+    assert not any(r.method == method and r.path.fullmatch("ItemMatrix/7.json") for r in WRITE_ROUTES.values())
 
 
 def test_prices_and_stock_can_only_be_set_on_new_records():
@@ -88,6 +101,9 @@ def test_prices_and_stock_can_only_be_set_on_new_records():
             assert route.method == "POST" and tool in ("create_matrix", "add_matrix_variants")
     assert WRITE_ROUTES["update_item_fields"].fields == {"customSku", "defaultCost", "description"}
     assert WRITE_ROUTES["receive_po_lines"].fields == {"numReceived"}
+    assert WRITE_ROUTES["assign_custom_skus"].fields == {"customSku"}
+    assert WRITE_ROUTES["move_items_into_matrix"].fields == {"itemMatrixID", "ItemAttributes", "description",
+                                                             "categoryID", "manufacturerID", "defaultVendorID"}
 
 
 @pytest.mark.parametrize("tool, method, path", [
@@ -102,6 +118,11 @@ def test_prices_and_stock_can_only_be_set_on_new_records():
     ("add_matrix_variants", "PUT", "Item/1.json"),         # another tool's route
     ("receive_po_lines", "PUT", "Order/853.json"),
     ("receive_po_lines", "POST", "Customer.json"),
+    ("archive_item", "DELETE", "ItemMatrix/7.json"),       # never a matrix
+    ("archive_item", "DELETE", "Item.json"),
+    ("archive_item", "PUT", "Item/1.json"),
+    ("assign_custom_skus", "DELETE", "Item/1.json"),       # only archive_item may DELETE
+    ("move_items_into_matrix", "PUT", "ItemMatrix/7.json"),
 ])
 def test_requests_outside_a_tools_route_are_refused(make_write_client, fake_api, write_log, write_switch, tool, method, path):
     turn_on(write_switch)  # even with writes on
@@ -120,6 +141,10 @@ def test_requests_outside_a_tools_route_are_refused(make_write_client, fake_api,
     ("add_matrix_variants", "POST", "Item.json", {**ITEM_BODY, "ItemShops": {"ItemShop": {"qoh": "5"}}}),
     ("receive_po_lines", "PUT", "OrderLine/1.json", {"numReceived": "1", "quantity": "9"}),
     ("receive_po_lines", "PUT", "OrderLine/1.json", {}),
+    ("assign_custom_skus", "PUT", "Item/1.json", {"customSku": "013471", "description": "x"}),
+    ("move_items_into_matrix", "PUT", "Item/1.json", {"itemMatrixID": "7", "Prices": {"ItemPrice": []}}),
+    ("move_items_into_matrix", "PUT", "Item/1.json", {"itemMatrixID": "7", "customSku": "013471"}),
+    ("archive_item", "DELETE", "Item/1.json", {"archived": "true"}),  # a DELETE has no body
 ])
 def test_fields_outside_a_route_are_refused(make_write_client, fake_api, write_switch, tool, method, path, body):
     turn_on(write_switch)
@@ -132,7 +157,8 @@ def test_fields_outside_a_route_are_refused(make_write_client, fake_api, write_s
 
 @pytest.mark.parametrize("method, url", [
     ("GET", BASE + "Item.json"),
-    ("DELETE", BASE + "Item/1.json"),
+    ("DELETE", BASE + "ItemMatrix/7.json"),
+    ("DELETE", BASE + "OrderLine/1.json"),
     ("PUT", BASE + "ItemMatrix/7.json"),
     ("POST", BASE + "Customer.json"),
     ("POST", "https://evil.example.com/API/V3/Account/12345/Item.json"),
@@ -171,6 +197,22 @@ def test_a_write_is_sent_once_and_logged_without_the_token(make_write_client, fa
     assert sending["write_id"] == done["write_id"]
     log_text = write_log.path.read_text(encoding="utf-8")
     assert long_token("access", 0) not in log_text and "Bearer" not in log_text
+
+
+def test_archiving_sends_a_bodyless_delete_and_logs_the_record_before(make_write_client, fake_api, write_log,
+                                                                      write_switch):
+    turn_on(write_switch)
+    client = make_write_client()
+    fake_api.handler = lambda request: httpx.Response(200, json={"Item": {"itemID": "1345", "archived": "true"}})
+    before = {"itemID": "1345", "description": "Caravelli Beige 50S Classic", "itemType": "default", "tax": "true"}
+
+    client.send("archive_item", "DELETE", "Item/1345.json", None, "code", before=before)
+
+    [request] = fake_api.requests
+    assert request.method == "DELETE" and request.content == b""
+    sending, done = write_log.entries()
+    assert sending["payload"] is None and sending["before"] == before
+    assert done["affected_ids"] == {"Item": {"itemID": "1345"}}
 
 
 def test_the_log_is_only_appended_to(make_write_client, fake_api, write_log, write_switch):

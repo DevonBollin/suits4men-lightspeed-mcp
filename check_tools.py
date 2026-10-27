@@ -70,6 +70,13 @@ DRY_RUNS = [
     ("add_po_lines", {"order_id": 853, "lines": [{"item_id": 1345, "quantity": 1}]}),
     ("receive_po_lines", {"order_id": 853, "lines": [{"order_line_id": 2684, "quantity": 1},
                                                      {"order_line_id": 2692, "quantity": 3}]}),
+    # Item 2321 "Caravelli Burgundy 58L Slim" is not in matrix 7, where it belongs.
+    ("move_items_into_matrix", {"matrix_id": 7, "items": [{"item_id": 2321, "color": "Burgundy", "size": "58L",
+                                                           "fit": "Slim"}]}),
+    # Five of the items without a custom SKU; the SKUs are picked automatically.
+    ("assign_custom_skus", {"items": [{"item_id": i} for i in (2321, 2322, 2323, 2324, 2325)]}),
+    # Only to show the request: 1345 has stock 0 and is on no open PO.
+    ("archive_item", {"item_id": 1345}),
 ]
 
 

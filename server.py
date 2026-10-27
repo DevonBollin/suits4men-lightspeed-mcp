@@ -47,8 +47,9 @@ mcp = MCPServer(
         "vendors, manufacturers, categories, purchase orders, stock and stock history, sales history, inventory "
         "counts, special orders, vendor returns and vendor catalogs. Results are trimmed JSON with IDs; long lists "
         "come as {columns, rows} tables. Use api_get for any field the other tools leave out. The read tools and "
-        "api_get can never change anything. Five write tools (create_matrix, add_matrix_variants, "
-        "update_item_fields, add_po_lines, receive_po_lines) default to dry runs that send nothing. Never make a "
+        "api_get can never change anything. Eight write tools (create_matrix, add_matrix_variants, "
+        "update_item_fields, add_po_lines, receive_po_lines, move_items_into_matrix, assign_custom_skus, "
+        "archive_item) default to dry runs that send nothing. Matrices can never be archived. Never make a "
         "real write unless the user, in this chat, has approved that exact dry run; an approval covers one write "
         "only. Real writes are refused while the store owner has writes turned off. suggest_custom_skus gives "
         "unused SKUs, show_write_log lists what has been written, and take_snapshot / compare_snapshots save and "
@@ -458,6 +459,18 @@ class NewPoLine(BaseModel):
     unit_cost: Annotated[float | None, Field(description="Unit cost on this PO. Default: the item's default cost.")] = None
 
 
+class MoveItem(BaseModel):
+    item_id: Annotated[int, Field(description="The existing item to put into the matrix.")]
+    color: Annotated[str, Field(description="Its color, exactly as the vendor names it.")]
+    size: Annotated[str, Field(description="Its size, e.g. '58L'. Pants: waist only.")]
+    fit: Annotated[str, Field(description="Its fit, exactly as the vendor names it. May be blank.")] = ""
+
+
+class SkuAssignment(BaseModel):
+    item_id: Annotated[int, Field(description="An item that has no custom SKU yet.")]
+    custom_sku: Annotated[str | None, Field(description="A 6-digit SKU as text. Leave empty to take the next free one.")] = None
+
+
 class Receipt(BaseModel):
     quantity: Annotated[int, Field(description="Units that arrived now (added to what the line already shows as received).")]
     order_line_id: Annotated[int | None, Field(description="The PO line (get_purchase_order lists order_line_id).")] = None
@@ -544,6 +557,50 @@ def receive_po_lines(
     Lightspeed's API has no call for that step. Tell the user so."""
     return run(lambda w: w.receive_po_lines(order_id, [line.model_dump() for line in lines], dry_run, confirm_code),
                writer)
+
+
+@write_tool
+def move_items_into_matrix(
+    matrix_id: Annotated[int, Field(description="The Color/Size/Fit matrix (attribute set 5) to put the items in.")],
+    items: Annotated[list[MoveItem], Field(description="Existing items and their color, size and fit (max 100; one until a first move has been checked).")],
+    only_matrix_and_attributes: Annotated[bool, Field(description="True: change only the matrix and Color/Size/Fit. False (default): also give each item the matrix's description pattern, category, manufacturer and vendor.")] = False,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Put existing items (not in a matrix, or in another one, e.g. a Color-only matrix) into a
+    Color/Size/Fit matrix, with their color, size and fit. Never sends prices, cost, SKUs or
+    stock. Refuses a combination the matrix already has, spellings that differ from the matrix's
+    only in capitals, non-waist pants sizes, and 3-piece or boys' items. Lightspeed's docs don't
+    describe moving existing items, so until one move has been done and checked, it moves one
+    item per call."""
+    return run(lambda w: w.move_items_into_matrix(matrix_id, [i.model_dump() for i in items],
+                                                  only_matrix_and_attributes, dry_run, confirm_code), writer)
+
+
+@write_tool
+def assign_custom_skus(
+    items: Annotated[list[SkuAssignment], Field(description="Items without a SKU, each with a SKU or none to take the next free one (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Give items that have no custom SKU their own one, many in one approval. SKUs left empty are
+    picked automatically, continuing after the highest SKU in use. Only customSku is sent.
+    Refuses items that already have a SKU (update_item_fields changes those), archived items,
+    and SKUs that are taken (archived items included) or not 6 digits."""
+    return run(lambda w: w.assign_custom_skus([i.model_dump() for i in items], dry_run, confirm_code), writer)
+
+
+@write_tool
+def archive_item(
+    item_id: Annotated[int, Field(description="The one item to archive.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Archive one item (Lightspeed archives items rather than deleting them). Only items with
+    stock exactly 0 that are on no open purchase order: archiving zeroes stock in Lightspeed,
+    and that can't be undone. One item per call. Matrices can never be archived with this
+    server; that stays manual in Lightspeed. The item's values are saved in the write log first."""
+    return run(lambda w: w.archive_item(item_id, dry_run, confirm_code), writer)
 
 
 if __name__ == "__main__":

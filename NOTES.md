@@ -258,8 +258,8 @@ account yet**: the first real write (with the owner's approval) is the first tes
 - A matrix child's description is `<matrix description> <attr1> <attr2> <attr3>`
   (docs). The tools send it that way. Whether Lightspeed overwrites a different
   description is **unconfirmed**.
-- **DELETE on ItemMatrix archives the matrix and all of its items.** The write
-  path has no route for DELETE at all.
+- **DELETE on ItemMatrix archives the matrix and all of its items.** No route
+  touches an existing matrix; archiving matrices stays manual (owner's decision).
 - Price propagation from a matrix to its children is **not documented**.
   No tool updates a matrix, so it can't happen.
 - Whether Lightspeed rejects a duplicate `customSku` is **not documented**. The
@@ -309,8 +309,8 @@ account yet**: the first real write (with the owner's approval) is the first tes
 
 See README.md ("Write tools" and "Turning writes on and off") and the comments
 in `lightspeed_mcp/write_path.py`. In short: separate WriteClient that only
-the five write tools hold; master switch file `state/WRITES_ENABLED` (shipped
-absent = off); one route per tool with a field allowlist (no DELETE, no matrix
+the write tools hold; master switch file `state/WRITES_ENABLED` (shipped
+absent = off); one route per tool with a field allowlist (one DELETE, for one item; no matrix
 update, prices only on new records, never `ItemShops`); dry run by default;
 real calls need the dry run's confirm code (a hash of the exact requests);
 append-only log `state/write_log.jsonl`; 5xx and network errors are never
@@ -360,6 +360,48 @@ Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
 - Taken at 20:22 and 20:39 on 2026-10-26, before and after building Phase 2:
   **identical, 0 differences in every record type.**
 
+## Moving items, batch SKUs, archiving (2026-10-26, evening)
+
+Three more write tools, built on the owner's request: `move_items_into_matrix`,
+`assign_custom_skus`, `archive_item`. Same rules as the others (dry run first,
+switch, confirm code, write log). The owner decided: **matrices are never
+archived through the API; that stays manual.**
+
+From the docs (Item, ItemMatrix, ItemMatrix tutorial pages):
+
+- **Archiving:** "Items can not be deleted, only archived. If you issue a
+  delete on an item it will be archived." And: "If you archive an item with
+  inventory, the inventory will be zeroed out. This can not be undone without
+  individually re-entering the inventory records." So `archive_item` refuses
+  any item whose stock isn't exactly 0 in every shop row, negative included.
+- The DELETE sample response shows the archived item with `itemType:
+  non_inventory` and `tax: false` (it was `default`). Not explained. The tool
+  saves the item's values (`before`) in the write log.
+- **Unarchiving:** `archived` "can only be set to false on update", so a PUT
+  with `archived: false` looks like the way back. Not documented as such, and
+  stock would not come back. Not built.
+- **Moving an existing item into a matrix is not described anywhere.**
+  `itemMatrixID` and `ItemAttributes` are in the Item PUT field list. The
+  tutorial only creates new items in a matrix. Unconfirmed: whether a PUT
+  moves an item, whether Lightspeed rewrites its description or prices, and
+  what happens to the old matrix's attribute lists. So the tool allows one item
+  per call until the write log has a completed move.
+- Whether a matrix's `itemAttributeSetID` can change once it has items is not
+  documented. Moving matrices 9 and 10 (Color only) to Color/Size/Fit is done
+  by creating a new set-5 matrix and moving the items; the old matrix is then
+  archived by hand.
+- The `confirm_code` of a plan now also covers facts the request doesn't show
+  (for archiving: the item's stock and timeStamp), so a change between the dry
+  run and the approval is caught.
+
+Live dry runs (GET only): moving 2321 into matrix 7 as Burgundy / 58L / Slim
+sends `itemMatrixID`, `ItemAttributes`, `categoryID 82 -> 83` and
+`defaultVendorID none -> 1` (2321 has no vendor). Batch SKUs for 2321–2325 got
+013471–013475. Archiving "Boy's Suit" (2366, stock −1) and "Neck Ties -
+Standard" (1387, stock −1,052; also on PO 20, which is not complete) was
+refused for stock. "Giorgio Fiorelli Boys Shirt" (1471) has stock 7, so it
+would be refused too.
+
 ## Helper tools (2026-10-26, evening)
 
 - `suggest_custom_skus`, `show_write_log`, `take_snapshot`, `compare_snapshots`.
@@ -374,5 +416,5 @@ Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
 ## Tooling
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
-  `check_tools.py --dry-runs` calls the five write tools on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (316 tests).
+  `check_tools.py --dry-runs` calls the eight write tools on real records, always with `dry_run=true`.
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (388 tests).

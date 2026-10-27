@@ -7,6 +7,9 @@ Each public method of InventoryWriter is one write tool (server.py describes the
   update_item_fields    PUT  Item/<id>.json          custom SKU, default cost, description; never prices
   add_po_lines          POST OrderLine.json, per line   new lines on an open purchase order
   receive_po_lines      PUT  OrderLine/<id>.json     mark quantities as received on PO lines
+  move_items_into_matrix  PUT Item/<id>.json, per item   put existing items into a matrix with Color/Size/Fit
+  assign_custom_skus    PUT  Item/<id>.json, per item   give items without a SKU their own one
+  archive_item          DELETE Item/<id>.json        archive one item (only with stock 0); never a matrix
 
 Every method works the same way:
   1. With dry_run=False and the master write switch off, refuse at once, before
@@ -51,7 +54,8 @@ class PlannedRequest:
     label: str  # what this one request does, in a few words
     method: str
     path: str  # relative to the account, e.g. "Item.json"
-    body: dict
+    body: dict | None  # None for a DELETE
+    before: dict | None = None  # the record as it is now, saved in the write log (for archiving)
 
 
 @dataclass
@@ -61,10 +65,13 @@ class Plan:
     requests: list[PlannedRequest]
     warnings: list[str] = field(default_factory=list)
     after: str | None = None  # anything the user still has to do in Lightspeed afterwards
+    # Facts the plan relies on that the requests don't show (e.g. an item's stock before
+    # archiving). They are part of the confirm code, so a change since the dry run is caught.
+    basis: dict | None = None
 
     def confirm_code(self) -> str:
-        """A short fingerprint of the exact requests. Any change to a method, path or body changes it."""
-        canonical = json.dumps([self.tool, [[r.method, r.path, r.body] for r in self.requests]],
+        """A short fingerprint of the exact requests (and basis). Any change to either changes it."""
+        canonical = json.dumps([self.tool, [[r.method, r.path, r.body] for r in self.requests], self.basis],
                                sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:10]
 
@@ -163,7 +170,7 @@ class InventoryWriter:
         done = []
         for index, r in enumerate(plan.requests):
             try:
-                sent = self.writes.send(plan.tool, r.method, r.path, r.body, code)
+                sent = self.writes.send(plan.tool, r.method, r.path, r.body, code, before=r.before)
             except LightspeedError as e:
                 return fmt.prune({
                     "dry_run": False,
@@ -245,6 +252,76 @@ class InventoryWriter:
     def _order_lines(self, order_id: int) -> list[dict]:
         rows, _ = self.client.get_all("OrderLine.json", {"orderID": str(int(order_id))})
         return rows
+
+    # ---- matrix checks shared by add_matrix_variants and move_items_into_matrix --------------
+
+    def _target_matrix(self, matrix_id: int) -> tuple[dict, str, bool]:
+        """The matrix items will go into: (record, description, is a pants matrix). Must be an active set-5 matrix."""
+        matrix = self.reader._matrix_record(int(matrix_id))
+        if matrix is None:
+            raise RuleViolation(f"Refused: matrix {matrix_id} was not found (or can't be read).")
+        if fmt.flag(matrix.get("archived")):
+            raise RuleViolation(f"Refused: matrix {matrix_id} is archived.")
+        rules.check_attribute_set(matrix.get("itemAttributeSetID"))
+        matrix_desc = fmt.text(matrix.get("description")) or ""
+        category_path = fmt.text((self.reader.categories().get(str(matrix.get("categoryID"))) or {}).get("fullPathName")) or ""
+        rules.check_not_three_piece(matrix_desc)
+        rules.check_not_boys(matrix_desc, category_path)
+        return matrix, matrix_desc, rules.is_pants(matrix_desc, category_path)
+
+    @staticmethod
+    def _clean_values(entry: dict, what: str) -> tuple[str, str, str]:
+        """Color, size and fit, trimmed but otherwise exactly as given (vendor naming)."""
+        color, size, fit = (rules.clean(entry.get(k)) for k in ("color", "size", "fit"))
+        if not color or not size:
+            raise RuleViolation(f"Refused: {what} needs a color and a size (fit may be blank).")
+        rules.check_not_three_piece(color, size, fit)
+        rules.check_not_boys(color, size, fit)
+        return color, size, fit
+
+    def _check_matrix_values(self, matrix_id: int, matrix: dict, pants: bool, combos: list[tuple[str, str, str]],
+                             warnings: list[str]) -> list[dict]:
+        """Refuse waist-less pants sizes, repeated combinations, combinations the matrix already has
+        (archived items too) and values that differ from the matrix's only in capitals. Warn about new
+        values. Returns the matrix's items (archived included)."""
+        if pants:
+            rules.check_waist_sizes([size for _, size, _ in combos])
+        seen = set()
+        for color, size, fit in combos:
+            combo = (color.lower(), size.lower(), fit.lower())
+            if combo in seen:
+                raise RuleViolation(f"Refused: {color} / {size} / {fit or '(no fit)'} is listed twice.")
+            seen.add(combo)
+
+        children, _ = self.client.get_all("Item.json", {
+            "itemMatrixID": str(int(matrix_id)), "archived": "true", "load_relations": relations("ItemAttributes")})
+        existing = {}
+        for c in children:
+            attrs = c.get("ItemAttributes") or {}
+            existing[tuple((fmt.text(attrs.get(f"attribute{i}")) or "").lower() for i in (1, 2, 3))] = c
+        for color, size, fit in combos:
+            child = existing.get((color.lower(), size.lower(), fit.lower()))
+            if child:
+                state = "an archived item" if fmt.flag(child.get("archived")) else "an item"
+                raise RuleViolation(f"Refused: matrix {matrix_id} already has {state} for {color} / {size} / "
+                                    f"{fit or '(no fit)'}: {item_label(child)}.")
+
+        for index, kind, values in ((1, "color", [c[0] for c in combos]), (2, "size", [c[1] for c in combos]),
+                                    (3, "fit", [c[2] for c in combos if c[2]])):
+            offered = fmt.matrix_attribute_values(matrix, index)
+            by_lower = {o.lower(): o for o in offered}
+            new = []
+            for value in dict.fromkeys(values):
+                if value in offered:
+                    continue
+                if value.lower() in by_lower:
+                    raise RuleViolation(f"Refused: {kind} '{value}' differs only in capitals from the matrix's "
+                                        f"existing '{by_lower[value.lower()]}'. Use the existing spelling.")
+                new.append(value)
+            if new:
+                warnings.append(f"New {kind} value(s) for this matrix: {', '.join(new)}. Existing: "
+                                f"{', '.join(offered) or 'none'}. Check the vendor's spelling.")
+        return children
 
     # ---- 1. create a matrix --------------------------------------------------------------
 
@@ -354,70 +431,16 @@ class InventoryWriter:
                 raise RuleViolation("Refused: give at least one variant.")
             if len(variants) > MAX_REQUESTS_PER_CALL:
                 raise RuleViolation(f"Refused: {len(variants)} variants; the limit is {MAX_REQUESTS_PER_CALL} per call.")
-            matrix = self.reader._matrix_record(int(matrix_id))
-            if matrix is None:
-                raise RuleViolation(f"Refused: matrix {matrix_id} was not found (or can't be read).")
-            if fmt.flag(matrix.get("archived")):
-                raise RuleViolation(f"Refused: matrix {matrix_id} is archived.")
-            rules.check_attribute_set(matrix.get("itemAttributeSetID"))
-            matrix_desc = fmt.text(matrix.get("description")) or ""
-            category_path = fmt.text((self.reader.categories().get(str(matrix.get("categoryID"))) or {}).get("fullPathName")) or ""
-            rules.check_not_three_piece(matrix_desc)
-            rules.check_not_boys(matrix_desc, category_path)
-            pants = rules.is_pants(matrix_desc, category_path)
+            matrix, matrix_desc, pants = self._target_matrix(matrix_id)
             price_text, cost_text = money(price, "price"), money(cost, "cost")
             warnings: list[str] = []
 
-            # Clean and check every variant. Values are kept exactly as given (vendor naming).
             cleaned = []
             for n, v in enumerate(variants, 1):
-                color, size, fit = (rules.clean(v.get(k)) for k in ("color", "size", "fit"))
-                if not color or not size:
-                    raise RuleViolation(f"Refused: variant {n} needs a color and a size (fit may be blank).")
-                rules.check_not_three_piece(color, size, fit)
-                rules.check_not_boys(color, size, fit)
-                sku = rules.check_custom_sku_format(v.get("custom_sku"))
-                cleaned.append((color, size, fit, sku))
-            if pants:
-                rules.check_waist_sizes([size for _, size, _, _ in cleaned])
+                color, size, fit = self._clean_values(v, f"variant {n}")
+                cleaned.append((color, size, fit, rules.check_custom_sku_format(v.get("custom_sku"))))
             rules.check_skus_unique_in_request([sku for *_, sku in cleaned])
-
-            seen = set()
-            for color, size, fit, _ in cleaned:
-                combo = (color.lower(), size.lower(), fit.lower())
-                if combo in seen:
-                    raise RuleViolation(f"Refused: {color} / {size} / {fit or '(no fit)'} is listed twice.")
-                seen.add(combo)
-
-            # Against what the matrix already has.
-            children, _ = self.client.get_all("Item.json", {
-                "itemMatrixID": str(int(matrix_id)), "archived": "true", "load_relations": relations("ItemAttributes")})
-            existing = {}
-            for c in children:
-                attrs = c.get("ItemAttributes") or {}
-                key = tuple((fmt.text(attrs.get(f"attribute{i}")) or "").lower() for i in (1, 2, 3))
-                existing[key] = c
-            for color, size, fit, _ in cleaned:
-                child = existing.get((color.lower(), size.lower(), fit.lower()))
-                if child:
-                    state = "an archived item" if fmt.flag(child.get("archived")) else "an item"
-                    raise RuleViolation(f"Refused: matrix {matrix_id} already has {state} for {color} / {size} / "
-                                        f"{fit or '(no fit)'}: {item_label(child)}.")
-            for index, kind, values in ((1, "color", [c[0] for c in cleaned]), (2, "size", [c[1] for c in cleaned]),
-                                        (3, "fit", [c[2] for c in cleaned if c[2]])):
-                offered = fmt.matrix_attribute_values(matrix, index)
-                by_lower = {o.lower(): o for o in offered}
-                new = []
-                for value in dict.fromkeys(values):
-                    if value in offered:
-                        continue
-                    if value.lower() in by_lower:
-                        raise RuleViolation(f"Refused: {kind} '{value}' differs only in capitals from the matrix's "
-                                            f"existing '{by_lower[value.lower()]}'. Use the existing spelling.")
-                    new.append(value)
-                if new:
-                    warnings.append(f"New {kind} value(s) for this matrix: {', '.join(new)}. Existing: "
-                                    f"{', '.join(offered) or 'none'}. Check the vendor's spelling.")
+            children = self._check_matrix_values(matrix_id, matrix, pants, [c[:3] for c in cleaned], warnings)
 
             taken = {sku: items for sku, items in self._items_with_skus([s for *_, s in cleaned]).items() if items}
             if taken:
@@ -658,3 +681,217 @@ class InventoryWriter:
             return Plan("receive_po_lines", summary, requests, warnings, after)
 
         return self._run("receive_po_lines", dry_run, confirm_code, build)
+
+    # ---- 5. move existing items into a matrix --------------------------------------------------
+
+    def _moves_confirmed(self) -> bool:
+        """Has a move ever come back done? Until one has, moves go one item per call (see below)."""
+        return any(e.get("tool") == "move_items_into_matrix" and e.get("event") == "done"
+                   for e in self.writes.write_log.entries())
+
+    def move_items_into_matrix(
+        self,
+        matrix_id: int,
+        items: list[dict],
+        only_matrix_and_attributes: bool = False,
+        dry_run: bool = True,
+        confirm_code: str | None = None,
+    ) -> dict:
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            # The docs list itemMatrixID and ItemAttributes as item fields but never describe moving an
+            # existing item into a matrix. So the first move is the real test: one item, checked afterwards.
+            limit = MAX_REQUESTS_PER_CALL if self._moves_confirmed() else 1
+            if len(items) > limit:
+                if limit == 1:
+                    raise RuleViolation(
+                        "Refused: no item has been moved into a matrix through the API yet, and Lightspeed's docs "
+                        "don't describe it. Move one item first, check it (get_item, compare_snapshots), then move "
+                        "the rest.")
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {limit} per call.")
+            matrix, matrix_desc, pants = self._target_matrix(matrix_id)
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            found = self._items_by_id(ids)
+            warnings: list[str] = []
+
+            moves = []
+            for entry, item_id in zip(items, ids):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                current_matrix = fmt.ref_id(item.get("itemMatrixID"))
+                if current_matrix == int(matrix_id):
+                    raise RuleViolation(f"Refused: {item_label(item)} is already in matrix {matrix_id}.")
+                rules.check_not_three_piece(fmt.text(item.get("description")) or "")
+                rules.check_not_boys(fmt.text(item.get("description")) or "")
+                moves.append((item, *self._clean_values(entry, item_label(item)), current_matrix))
+            self._check_matrix_values(matrix_id, matrix, pants, [(c, s, f) for _, c, s, f, _ in moves], warnings)
+
+            matrix_price = fmt.prices(matrix).get("Default")
+            requests = []
+            for item, color, size, fit, current_matrix in moves:
+                attributes = {"itemAttributeSetID": str(rules.STORE_ATTRIBUTE_SET_ID), "attribute1": color,
+                              "attribute2": size}
+                if fit:
+                    attributes["attribute3"] = fit
+                body: dict = {"itemMatrixID": str(int(matrix_id)), "ItemAttributes": attributes}
+                changes = [f"matrix {current_matrix or 'none'} -> {matrix_id}", f"{color} / {size} / {fit or '-'}"]
+                if not only_matrix_and_attributes:
+                    # Like the matrix's other items: its description pattern, category, manufacturer and vendor.
+                    old_desc = fmt.text(item.get("description")) or ""
+                    new_desc = " ".join(p for p in (matrix_desc, color, size, fit) if p)
+                    if new_desc != old_desc:
+                        body["description"] = new_desc
+                        changes.append(f"description '{old_desc}' -> '{new_desc}'")
+                    for key, label in (("categoryID", "category"), ("manufacturerID", "manufacturer"),
+                                       ("defaultVendorID", "vendor")):
+                        target = fmt.ref_id(matrix.get(key))
+                        if target and fmt.ref_id(item.get(key)) != target:
+                            body[key] = str(target)
+                            changes.append(f"{label} {fmt.ref_id(item.get(key)) or 'none'} -> {target}")
+                if current_matrix:
+                    warnings.append(f"{item_label(item)} moves out of matrix {current_matrix}; that matrix keeps its "
+                                    "other items.")
+                if not fmt.text(item.get("customSku")):
+                    warnings.append(f"{item_label(item)} has no custom SKU (assign_custom_skus).")
+                item_price = fmt.prices(item).get("Default")
+                if matrix_price is not None and item_price is not None and abs(item_price - matrix_price) > 0.001:
+                    warnings.append(
+                        f"{item_label(item)} sells at {item_price:.2f}, but the matrix's own Default price is "
+                        f"{matrix_price:.2f}. No price is sent and the docs don't say joining a matrix changes it, "
+                        "but that is unconfirmed: check the item's price afterwards.")
+                requests.append(PlannedRequest(f"{item_label(item)}: " + "; ".join(changes), "PUT",
+                                               f"Item/{item.get('itemID')}.json", body))
+
+            summary = (f"Move {len(requests)} existing item(s) into matrix {matrix_id} '{matrix_desc}' (attribute set "
+                       "5 Color/Size/Fit)"
+                       + (", changing only the matrix and Color/Size/Fit" if only_matrix_and_attributes else
+                          ", with the matrix's description pattern, category, manufacturer and vendor")
+                       + ". SKUs, prices, cost and stock are not sent and stay as they are.")
+            after = ("Lightspeed's docs list itemMatrixID and ItemAttributes as item fields but do not describe moving "
+                     "an existing item into a matrix. After this, check the item (get_item) and compare snapshots "
+                     "before moving more.")
+            return Plan("move_items_into_matrix", summary, requests, warnings, after)
+
+        return self._run("move_items_into_matrix", dry_run, confirm_code, build)
+
+    # ---- 6. give items without a SKU their own one ---------------------------------------------
+
+    def assign_custom_skus(self, items: list[dict], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+
+            # One pass over every item (archived too): who holds which SKU, and the highest in use.
+            everything, _ = self.client.get_all("Item.json", {"archived": "true"})
+            by_id = {str(i.get("itemID")): i for i in everything}
+            holders: dict[str, dict] = {}
+            for i in everything:
+                if fmt.text(i.get("customSku")):
+                    holders.setdefault(fmt.text(i.get("customSku")), i)
+            six_digit = sorted(s for s in holders if rules.CUSTOM_SKU_PATTERN.match(s))
+            highest = six_digit[-1] if six_digit else None
+            next_free = int(highest) + 1 if highest else 1
+
+            given = [rules.check_custom_sku_format(entry["custom_sku"]) for entry in items if entry.get("custom_sku")]
+            rules.check_skus_unique_in_request(given)
+            for sku in given:
+                if sku in holders:
+                    raise RuleViolation(f"Refused: custom SKU {sku} is already used by {item_label(holders[sku])}.")
+            reserved = set(given)
+
+            requests, picked = [], 0
+            for entry, item_id in zip(items, ids):
+                item = by_id.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                if fmt.text(item.get("customSku")):
+                    raise RuleViolation(f"Refused: {item_label(item)} already has a SKU. This tool only fills in "
+                                        "missing ones; update_item_fields changes an existing SKU.")
+                if entry.get("custom_sku"):
+                    sku = rules.clean(entry["custom_sku"])
+                else:  # the next number nobody holds or is about to get
+                    while f"{next_free:06d}" in holders or f"{next_free:06d}" in reserved:
+                        next_free += 1
+                    if next_free > 999_999:
+                        raise RuleViolation("Refused: the 6-digit SKU range is used up.")
+                    sku = f"{next_free:06d}"
+                    reserved.add(sku)
+                    picked += 1
+                requests.append(PlannedRequest(f"{item_label(item)} -> SKU {sku}", "PUT", f"Item/{item_id}.json",
+                                               {"customSku": sku}))
+
+            summary = (f"Give {len(requests)} item(s) their own custom SKU"
+                       + (f" ({picked} picked automatically, continuing after the highest in use, {highest})"
+                          if picked else "")
+                       + ". Only customSku is sent: nothing else on the items changes. Each SKU is checked against "
+                         "every item, archived ones included.")
+            return Plan("assign_custom_skus", summary, requests)
+
+        return self._run("assign_custom_skus", dry_run, confirm_code, build)
+
+    # ---- 7. archive one item ---------------------------------------------------------------------
+
+    def archive_item(self, item_id: int, dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            item = self._get_record(f"Item/{int(item_id)}.json", "Item",
+                                    {"load_relations": relations("ItemShops", "ItemAttributes")})
+            if item is None:
+                raise RuleViolation(f"Refused: item {item_id} was not found.")
+            if fmt.flag(item.get("archived")):
+                raise RuleViolation(f"Refused: {item_label(item)} is already archived.")
+
+            # Lightspeed: "If you archive an item with inventory, the inventory will be zeroed out.
+            # This can not be undone." So only items with no stock (and no negative stock) anywhere.
+            stock = {str(s.get("shopID")): fmt.integer(s.get("qoh")) or 0
+                     for s in fmt.as_list((item.get("ItemShops") or {}).get("ItemShop"))}
+            if any(stock.values()):
+                raise RuleViolation(
+                    f"Refused: {item_label(item)} has stock {fmt.total_qoh(item)}. Archiving zeroes an item's stock in "
+                    "Lightspeed, and that can't be undone. Only items with stock exactly 0 are archived here: settle "
+                    "the stock first (e.g. with an inventory count), or archive it by hand in Lightspeed if that is "
+                    "really intended.")
+
+            lines, _ = self.client.get_all("OrderLine.json", {"itemID": str(int(item_id))})
+            order_ids = sorted({str(line.get("orderID")) for line in lines if fmt.ref_id(line.get("orderID"))}, key=int)
+            open_orders = []
+            for batch in batches(order_ids):
+                orders, _ = self.client.get_all("Order.json", {"orderID": id_filter(batch), "archived": "true"})
+                open_orders += [o.get("orderID") for o in orders
+                                if not fmt.flag(o.get("complete")) and not fmt.flag(o.get("archived"))]
+            if open_orders:
+                raise RuleViolation(f"Refused: {item_label(item)} is on open purchase order(s) "
+                                    f"{', '.join(map(str, open_orders))}. Finish those or take the item off them first.")
+
+            warnings = ["Lightspeed's docs show an archived item's type becoming non_inventory and its tax false. "
+                        "Unarchiving (archived=false) is possible but may not restore those, so the item's current "
+                        "values are saved in the write log."]
+            matrix_id = fmt.ref_id(item.get("itemMatrixID"))
+            if matrix_id:
+                warnings.append(f"The item is in matrix {matrix_id}; the matrix and its other items are not touched.")
+            before = {k: item.get(k) for k in (
+                "itemID", "description", "customSku", "itemType", "tax", "taxClassID", "categoryID", "manufacturerID",
+                "defaultVendorID", "itemMatrixID", "defaultCost", "archived", "ItemAttributes", "Prices")
+                if item.get(k) is not None}
+            summary = (f"Archive {item_label(item)}. Its stock is 0, so no stock is lost, and it is on no open PO. "
+                       "Lightspeed hides archived items from sales and searches. Only this one item is archived, "
+                       "never a matrix.")
+            return Plan("archive_item", summary,
+                        [PlannedRequest(f"archive {item_label(item)}", "DELETE", f"Item/{int(item_id)}.json", None,
+                                        before=before)],
+                        warnings,
+                        basis={"itemID": item.get("itemID"), "timeStamp": item.get("timeStamp"), "stock": stock})
+
+        return self._run("archive_item", dry_run, confirm_code, build)

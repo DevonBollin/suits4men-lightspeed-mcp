@@ -52,9 +52,10 @@ def matrix(matrix_id, description, set_id, category, colors=(), sizes=(), fits=(
 
 
 def item(item_id, description, sku="", matrix_id="0", attrs=None, qoh=0, cost="63.50", archived=False,
-         vendor="1", price="599.95"):
+         vendor="1", price="599.95", category="83"):
     record = {"itemID": str(item_id), "description": description, "customSku": sku, "itemMatrixID": str(matrix_id),
-              "defaultVendorID": vendor, "defaultCost": cost, "archived": "true" if archived else "false",
+              "defaultVendorID": vendor, "categoryID": category, "manufacturerID": "1",
+              "defaultCost": cost, "archived": "true" if archived else "false",
               "ItemShops": {"ItemShop": [{"shopID": "0", "qoh": str(qoh)}, {"shopID": "1", "qoh": str(qoh)}]},
               "Prices": {"ItemPrice": [{"amount": price, "useTypeID": "1", "useType": "Default"}]}}
     if attrs:
@@ -79,16 +80,21 @@ def fresh_data() -> dict:
             item(2000, "Boy's Suit", "009001"),
             item(1700, "Old Caravelli Black 40R Slim", "013000", 7, ("Black", "40R", "Slim"), archived=True),
             item(1801, "Caravelli Pants Black 34", "013100", 12, ("Black", "34", "")),
+            item(1346, "Caravelli Black 40R Classic", "013050", 7, ("Black", "40R", "Classic"), qoh=3),
+            item(2321, "Caravelli Burgundy 58L Slim", "", category="82"),  # belongs in matrix 7 but isn't
         ],
         "Order": [
             {"orderID": "853", "vendorID": "1", "refNum": "112423", "complete": "false", "archived": "false"},
             {"orderID": "400", "vendorID": "1", "refNum": "9", "complete": "true", "archived": "false"},
+            {"orderID": "854", "vendorID": "1", "refNum": "112500", "complete": "false", "archived": "false"},
         ],
         "OrderLine": [
             {"orderLineID": "10", "orderID": "853", "itemID": "1644", "quantity": "3", "numReceived": "1", "checkedIn": "0",
              "price": "65"},
             {"orderLineID": "11", "orderID": "853", "itemID": "1186", "quantity": "2", "numReceived": "0", "checkedIn": "1",
              "price": "61.21"},
+            {"orderLineID": "12", "orderID": "854", "itemID": "1801", "quantity": "1", "numReceived": "0", "checkedIn": "0",
+             "price": "30"},
         ],
     }
 
@@ -154,6 +160,10 @@ GOOD_CALLS = {
     "update_item_fields": dict(item_id=1186, custom_sku="013473", cost=62, description="Caravelli Suit"),
     "add_po_lines": dict(order_id=853, lines=[{"item_id": 1345, "quantity": 2}]),
     "receive_po_lines": dict(order_id=853, lines=[{"order_line_id": 10, "quantity": 2}]),
+    "move_items_into_matrix": dict(matrix_id=7, items=[{"item_id": 2321, "color": "Burgundy", "size": "58L",
+                                                        "fit": "Slim"}]),
+    "assign_custom_skus": dict(items=[{"item_id": 1186}, {"item_id": 2321, "custom_sku": "013200"}]),
+    "archive_item": dict(item_id=1345),
 }
 
 
@@ -171,7 +181,7 @@ def test_dry_run_is_the_default_and_sends_nothing(writer, fake_api, write_log, w
         turn_on(write_switch)
     result = call(writer, tool)
     assert result["dry_run"] is True and "Nothing was sent" in result["nothing_sent"]
-    assert result["requests"] and all(r["method"] in ("POST", "PUT") for r in result["requests"])
+    assert result["requests"] and all(r["method"] in ("POST", "PUT", "DELETE") for r in result["requests"])
     assert all(r["path"].startswith("/API/V3/Account/12345/") for r in result["requests"])
     assert re.fullmatch(r"[0-9a-f]{10}", result["confirm_code"])
     assert result["writes_enabled"] is switch_on
@@ -205,7 +215,7 @@ def test_real_call_sends_exactly_what_the_dry_run_showed(writer, fake_api, write
     result = call(writer, tool, dry_run=False, confirm_code=dry["confirm_code"])
 
     assert result["finished"] is True and len(result["done"]) == len(dry["requests"])
-    sent = [(r.method, r.url.path, json.loads(r.content)) for r in fake_api.requests]
+    sent = [(r.method, r.url.path, json.loads(r.content) if r.content else None) for r in fake_api.requests]
     shown = [(r["method"], r["path"], r["body"]) for r in dry["requests"]]
     assert sent == shown
     sending = [e for e in write_log.entries() if e["event"] == "sending"]
@@ -460,4 +470,147 @@ def test_receive_by_item_id(writer):
 def test_receive_rules(writer, fake_api, overrides, message):
     with pytest.raises((RuleViolation, WriteRefused), match=message):
         call(writer, "receive_po_lines", **overrides)
+    assert fake_api.requests == []
+
+
+# ---- move_items_into_matrix -------------------------------------------------------------------------
+
+
+def test_move_payload_sets_matrix_attributes_and_matches_the_matrix(writer):
+    result = call(writer, "move_items_into_matrix")
+    [request] = result["requests"]
+    assert request["method"] == "PUT" and request["path"].endswith("/Item/2321.json")
+    # The description already follows the pattern and vendor/manufacturer match, so only the category is aligned.
+    assert request["body"] == {
+        "itemMatrixID": "7",
+        "ItemAttributes": {"itemAttributeSetID": "5", "attribute1": "Burgundy", "attribute2": "58L", "attribute3": "Slim"},
+        "categoryID": "83",
+    }
+    warnings = " ".join(result["warnings"])
+    assert "New color" in warnings and "Burgundy" in warnings
+    assert "no custom SKU" in warnings
+    assert "sells at 599.95" in warnings and "61.21" in warnings  # the matrix's own price is flagged, never sent
+    assert "do not describe moving" in result["after"]
+
+
+def test_move_can_change_only_the_matrix_and_attributes(writer):
+    result = call(writer, "move_items_into_matrix", only_matrix_and_attributes=True)
+    assert set(result["requests"][0]["body"]) == {"itemMatrixID", "ItemAttributes"}
+
+
+def test_move_never_sends_prices_cost_sku_or_stock(writer):
+    body = call(writer, "move_items_into_matrix")["requests"][0]["body"]
+    assert not {"Prices", "defaultCost", "customSku", "ItemShops"} & set(body)
+
+
+def test_move_out_of_another_matrix_is_flagged(writer):
+    result = call(writer, "move_items_into_matrix", items=[{"item_id": 1801, "color": "Black", "size": "36"}])
+    assert any("moves out of matrix 12" in w for w in result["warnings"])
+    body = result["requests"][0]["body"]
+    assert body["description"] == "Caravelli Black 36" and "attribute3" not in body["ItemAttributes"]
+
+
+def test_first_move_is_one_item_until_a_move_has_been_done(writer, write_log):
+    two = [{"item_id": 2321, "color": "Burgundy", "size": "58L", "fit": "Slim"},
+           {"item_id": 1801, "color": "Black", "size": "36"}]
+    with pytest.raises(RuleViolation, match="Move one item first"):
+        call(writer, "move_items_into_matrix", items=two)
+    write_log.append({"write_id": "x", "tool": "move_items_into_matrix", "event": "done", "status": 200})
+    assert call(writer, "move_items_into_matrix", items=two)["request_count"] == 2
+
+
+@pytest.mark.parametrize("overrides, message", [
+    (dict(matrix_id=9), "attribute set 3"),
+    (dict(matrix_id=404), "not found"),
+    (dict(items=[{"item_id": 1644, "color": "Black", "size": "42R", "fit": "Slim"}]), "already in matrix 7"),
+    (dict(items=[{"item_id": 2321, "color": "Black", "size": "42R", "fit": "Slim"}]), "already has an item"),
+    (dict(items=[{"item_id": 2321, "color": "burgundy", "size": "40R", "fit": "slim"}]), "only in capitals"),
+    (dict(items=[{"item_id": 2000, "color": "Navy", "size": "12", "fit": ""}]), "boys"),
+    (dict(items=[{"item_id": 1700, "color": "Navy", "size": "42R", "fit": "Slim"}]), "archived"),
+    (dict(items=[{"item_id": 99999, "color": "Navy", "size": "42R", "fit": "Slim"}]), "not found"),
+    (dict(matrix_id=12, items=[{"item_id": 2321, "color": "Black", "size": "34x32"}]), "waist only"),
+    (dict(items=[{"item_id": 2321, "color": "", "size": "58L"}]), "needs a color"),
+    (dict(items=[]), "at least one"),
+])
+def test_move_rules(writer, fake_api, overrides, message):
+    with pytest.raises(RuleViolation, match=message):
+        call(writer, "move_items_into_matrix", **overrides)
+    assert fake_api.requests == []
+
+
+# ---- assign_custom_skus ---------------------------------------------------------------------------------
+
+
+def test_batch_skus_fill_in_given_and_next_free(writer):
+    result = call(writer, "assign_custom_skus")
+    bodies = {r["path"].rsplit("/", 1)[1]: r["body"] for r in result["requests"]}
+    # Highest in use is 013100 (archived items count), so the next free is 013101.
+    assert bodies == {"1186.json": {"customSku": "013101"}, "2321.json": {"customSku": "013200"}}
+    assert "1 picked automatically" in result["summary"] and "013100" in result["summary"]
+
+
+def test_batch_skus_skip_numbers_given_in_the_same_request(writer):
+    result = call(writer, "assign_custom_skus", items=[{"item_id": 2321, "custom_sku": "013101"}, {"item_id": 1186}])
+    assert [r["body"]["customSku"] for r in result["requests"]] == ["013101", "013102"]
+
+
+@pytest.mark.parametrize("items, message", [
+    ([{"item_id": 1345}], "already has a SKU"),
+    ([{"item_id": 1700}], "archived"),
+    ([{"item_id": 2321, "custom_sku": "012911"}], "already used by item 1345"),
+    ([{"item_id": 2321, "custom_sku": "013000"}], "already used by item 1700"),  # archived item's SKU
+    ([{"item_id": 2321, "custom_sku": "12345"}], "6-digit"),
+    ([{"item_id": 2321, "custom_sku": "013300"}, {"item_id": 1186, "custom_sku": "013300"}], "used twice"),
+    ([{"item_id": 2321}, {"item_id": 2321}], "listed twice"),
+    ([{"item_id": 99999}], "not found"),
+    ([], "at least one"),
+])
+def test_batch_sku_rules(writer, fake_api, items, message):
+    with pytest.raises(RuleViolation, match=message):
+        call(writer, "assign_custom_skus", items=items)
+    assert fake_api.requests == []
+
+
+# ---- archive_item ---------------------------------------------------------------------------------------
+
+
+def test_archive_dry_run(writer):
+    result = call(writer, "archive_item")
+    [request] = result["requests"]
+    assert request["method"] == "DELETE" and request["path"].endswith("/Item/1345.json")
+    assert request["body"] is None
+    assert any("non_inventory" in w for w in result["warnings"])
+    assert any("matrix 7" in w and "not touched" in w for w in result["warnings"])
+
+
+def test_archive_logs_the_item_as_it_was(writer, fake_api, write_log, write_switch):
+    turn_on(write_switch)
+    code = call(writer, "archive_item")["confirm_code"]
+    call(writer, "archive_item", dry_run=False, confirm_code=code)
+    [request] = fake_api.requests
+    assert request.method == "DELETE" and request.content == b""
+    before = write_log.entries()[0]["before"]
+    assert before["description"] == "Caravelli Beige 50S Classic" and before["customSku"] == "012911"
+    assert before["ItemAttributes"]["attribute1"] == "Beige" and before["Prices"]
+
+
+def test_archive_refused_if_the_item_changed_since_the_dry_run(writer, reads, fake_api, write_switch):
+    turn_on(write_switch)
+    code = call(writer, "archive_item")["confirm_code"]
+    next(i for i in reads.data["Item"] if i["itemID"] == "1345")["timeStamp"] = "2026-10-27T10:00:00+00:00"
+    with pytest.raises(WriteRefused, match="does not match"):
+        call(writer, "archive_item", dry_run=False, confirm_code=code)
+    assert fake_api.requests == []
+
+
+@pytest.mark.parametrize("item_id, message", [
+    (1346, "has stock 3"),        # archiving would zero it, and that can't be undone
+    (1644, "has stock -27"),      # negative stock too
+    (1801, "open purchase order"),
+    (1700, "already archived"),
+    (99999, "not found"),
+])
+def test_archive_rules(writer, fake_api, item_id, message):
+    with pytest.raises(RuleViolation, match=message):
+        call(writer, "archive_item", item_id=item_id)
     assert fake_api.requests == []

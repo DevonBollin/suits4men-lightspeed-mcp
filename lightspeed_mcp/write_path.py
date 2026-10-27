@@ -10,10 +10,12 @@ in writer.py hold one. Before anything leaves the computer, these checks must pa
      deleting the file turns writes off at once, without a restart.
   2. The request is one that the calling write tool is allowed to make
      (WRITE_ROUTES). For example update_item_fields can only PUT
-     Item/<id>.json. There is no route for DELETE, so nothing can ever be
-     deleted or archived.
-  3. The JSON body holds only the fields that route allows. Prices can only be
-     set when creating a matrix or a new item; stock levels (ItemShops) never.
+     Item/<id>.json. The only DELETE is archive_item's, on one Item/<id>.json
+     (Lightspeed archives an item on DELETE). No route can update or archive a
+     matrix: archiving a matrix archives every item in it, so that stays manual.
+  3. The JSON body holds only the fields that route allows (a DELETE has no
+     body). Prices can only be set when creating a matrix or a new item; stock
+     levels (ItemShops) never.
   4. An httpx request hook repeats checks 1 and 2 as the last line of defence,
      so code that reaches past WriteClient still cannot send anything else.
 
@@ -87,6 +89,14 @@ WRITE_ROUTES: dict[str, Route] = {
     "add_po_lines": Route("POST", re.compile(r"OrderLine\.json"),
                           frozenset({"orderID", "itemID", "quantity", "price", "originalPrice", "numReceived"})),
     "receive_po_lines": Route("PUT", re.compile(r"OrderLine/\d+\.json"), frozenset({"numReceived"})),
+    # Put an existing item into a matrix: its matrix, Color/Size/Fit, and (optionally) the
+    # matrix's description pattern, category, vendor and manufacturer. Never prices, cost or stock.
+    "move_items_into_matrix": Route("PUT", re.compile(r"Item/\d+\.json"),
+                                    frozenset({"itemMatrixID", "ItemAttributes", "description", "categoryID",
+                                               "manufacturerID", "defaultVendorID"})),
+    "assign_custom_skus": Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"customSku"})),
+    # Lightspeed archives an item on DELETE (items are never really deleted). Items only, never a matrix.
+    "archive_item": Route("DELETE", re.compile(r"Item/\d+\.json"), frozenset()),
 }
 
 
@@ -143,6 +153,8 @@ def write_log_report(switch: WriteSwitch, write_log: WriteLog, limit: int = 20) 
         if e.get("event") == "sending":
             w["sent"] = e.get("time")
             w["payload"] = e.get("payload")
+            if e.get("before"):
+                w["before"] = e["before"]
         elif e.get("event") == "done":
             w.update(outcome="done", status=e.get("status"), affected_ids=e.get("affected_ids"))
         elif e.get("event") == "failed":
@@ -226,7 +238,7 @@ class WriteClient:
         """What a dry run shows: the path exactly as it would be requested."""
         return f"/API/V3/Account/{self.account_id}/{path}"
 
-    def check(self, tool: str, method: str, path: str, body: dict) -> None:
+    def check(self, tool: str, method: str, path: str, body: dict | None) -> None:
         """Refuse anything but the tool's own kind of request with allowed fields. Sends nothing.
 
         Dry runs call this too, so every payload a dry run shows is one the write path would accept.
@@ -236,20 +248,32 @@ class WriteClient:
             raise WriteBlockedError(f"'{tool}' is not a write tool; only {', '.join(WRITE_ROUTES)} can write.")
         if not route_allows(route, method, path):
             raise WriteBlockedError(f"{tool} may only send {route.method} {route.path.pattern}, not {method} {path}.")
+        if route.method == "DELETE":
+            if body:
+                raise WriteBlockedError(f"{tool}: a DELETE has no body.")
+            return
         if not isinstance(body, dict) or not body:
             raise WriteBlockedError(f"{tool}: the request body must be a non-empty JSON object.")
         extra = sorted(set(body) - route.fields)
         if extra:
             raise WriteBlockedError(f"{tool} may not send the field(s) {', '.join(extra)}.")
 
-    def send(self, tool: str, method: str, path: str, body: dict, confirm_code: str) -> dict:
-        """Send one write. Returns {"status", "affected_ids", "record"}; raises on any refusal or failure."""
+    def send(self, tool: str, method: str, path: str, body: dict | None, confirm_code: str,
+             before: dict | None = None) -> dict:
+        """Send one write. Returns {"status", "affected_ids", "record"}; raises on any refusal or failure.
+
+        `before` is the record as it was, logged with the request so a change
+        (e.g. archiving) can be put back by hand later.
+        """
         self.switch.require_on()
         self.check(tool, method, path, body)
         write_id = uuid.uuid4().hex[:12]
         entry = {"write_id": write_id, "tool": tool, "confirm_code": confirm_code, "method": method,
                  "path": self.full_path(path)}
-        self.write_log.append({**entry, "event": "sending", "payload": body})
+        sending = {**entry, "event": "sending", "payload": body}
+        if before:
+            sending["before"] = before
+        self.write_log.append(sending)
         try:
             status, response_body = self._send(method, path, body)
         except LightspeedError as e:
@@ -261,7 +285,7 @@ class WriteClient:
         record = next((v for k, v in response_body.items() if k != "@attributes" and isinstance(v, dict)), {})
         return {"status": status, "affected_ids": ids, "record": record}
 
-    def _send(self, method: str, path: str, body: dict) -> tuple[int, dict]:
+    def _send(self, method: str, path: str, body: dict | None) -> tuple[int, dict]:
         """Auth, rate limit and error handling for one write.
 
         Retried: 401 (once, with a fresh token) and 429, because Lightspeed did not
@@ -275,7 +299,8 @@ class WriteClient:
             self.limiter.wait_for_room(WRITE_COST)
             token = self.tokens.access_token()
             try:
-                response = self.http.request(method, url, json=body, headers={"Authorization": f"Bearer {token}"})
+                response = self.http.request(method, url, json=body or None,
+                                             headers={"Authorization": f"Bearer {token}"})
             except httpx.TransportError as e:
                 raise WriteOutcomeUnknown(
                     f"Network error during {method} {path} ({type(e).__name__}). Lightspeed may or may not have made "

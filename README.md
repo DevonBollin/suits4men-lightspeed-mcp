@@ -2,8 +2,9 @@
 
 A local MCP server that lets Claude Desktop read the Suits 4 Men Lightspeed
 Retail (R-Series) account (items, matrices, attribute sets, vendors,
-categories, purchase orders and stock) and, with your approval, make five
-narrow kinds of change.
+categories, purchase orders and stock) and, with your approval, make eight
+narrow kinds of change. Matrices can never be updated or archived through it:
+that stays manual in Lightspeed.
 
 - **Read tools** (Phase 1) use a client that refuses every request except GET.
   They can never change Lightspeed.
@@ -150,10 +151,26 @@ across several entries and switched over atomically. See
 | `update_item_fields` | `PUT Item/<id>.json` with only the changed fields among custom SKU, default cost, description | Change prices, stock or anything else |
 | `add_po_lines` | `POST OrderLine.json` per new line on an open PO | Receive anything |
 | `receive_po_lines` | `PUT OrderLine/<id>.json` with the line's new `numReceived` total | Change stock (see below) |
+| `move_items_into_matrix` | `PUT Item/<id>.json` per item: its matrix and Color/Size/Fit, plus (unless told not to) the matrix's description pattern, category, manufacturer and vendor | Send prices, cost, SKU or stock |
+| `assign_custom_skus` | `PUT Item/<id>.json` per item with only `customSku`, for items that have none; empty ones get the next free SKU | Replace an existing SKU |
+| `archive_item` | `DELETE Item/<id>.json` for **one** item with stock exactly 0 and on no open PO (Lightspeed archives on DELETE) | Archive a matrix, or an item with stock |
 
 `receive_po_lines` marks goods as received on the PO. Stock on hand changes
 only when someone presses **Add Received To Inventory** on that PO in
 Lightspeed: the API has no call for that step.
+
+`move_items_into_matrix` is for items that belong in a matrix but aren't in
+one (e.g. 2321 "Caravelli Burgundy 58L Slim" outside matrix 7), and for moving
+the items of a Color-only matrix (9, 10) into a new Color/Size/Fit one: create
+the new matrix, move the items, then archive the empty old matrix by hand.
+Lightspeed's docs don't describe moving existing items, so the tool moves
+**one item per call until a move has been done and checked**.
+
+`archive_item` refuses any item with stock (positive or negative):
+Lightspeed zeroes an archived item's stock and that can't be undone. It saves
+the item's values in the write log first, because Lightspeed's docs show
+archiving also switching the item to non-inventory and not taxable.
+Unarchiving may be possible but is not built.
 
 The tools refuse (and say which rule) anything that breaks the store's rules:
 
@@ -163,7 +180,8 @@ The tools refuse (and say which rule) anything that breaks the store's rules:
 - pants sizes that aren't waist-only;
 - a custom SKU that isn't 6 digits or is already used (archived items included);
 - a duplicate variant;
-- receiving more than was ordered.
+- receiving more than was ordered;
+- archiving an item with stock or on an open PO.
 
 Color and fit values are sent exactly as given, never re-cased. Prices are
 only ever set on new records, and only to the price you give. Matrix 7's own
