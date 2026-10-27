@@ -1033,5 +1033,25 @@ def update_matrix(
                                          default_cost, price, dry_run, confirm_code), writer)
 
 
+class Reassignment(BaseModel):
+    item_id: Annotated[int, Field(description="An item that is not in a matrix.")]
+    vendor_id: Annotated[int | None, Field(description="New default vendor (list_vendors).")] = None
+    manufacturer_id: Annotated[int | None, Field(description="New brand (list_manufacturers).")] = None
+    category_id: Annotated[int | None, Field(description="New category (list_categories).")] = None
+
+
+@write_tool
+def reassign_items(
+    items: Annotated[list[Reassignment], Field(description="Items and their new vendor, brand and/or category (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Give items that are not in a matrix another default vendor, brand and/or category, e.g. to move
+    items off a duplicate or disabled vendor record, a misspelled brand, or an old category. Only those
+    fields are sent. Refuses items in a matrix (update_matrix changes a whole matrix) and archived items.
+    Warns when an item's vendor number stays filed under the old vendor."""
+    return run(lambda w: w.reassign_items([i.model_dump() for i in items], dry_run, confirm_code), writer)
+
+
 if __name__ == "__main__":
     mcp.run()  # stdio

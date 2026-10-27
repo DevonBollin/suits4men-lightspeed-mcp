@@ -263,6 +263,7 @@ across several entries and switched over atomically. See
 | `create_category` / `rename_category` / `delete_category` | `POST`/`PUT Category` (name, path, parent) / `DELETE` (for good) | Rename one with subcategories; delete one with items, matrices or subcategories |
 | `create_inventory_count` | `POST InventoryCount.json` + one `POST InventoryCountItem.json` per counted item | **Reconcile** (the step that changes stock stays a click in Lightspeed) |
 | `create_attribute_set` / `update_attribute_set` | `POST`/`PUT ItemAttributeSet`: a set's name and its 1-3 attribute names (one is always Color) | Touch Lightspeed's built-in sets 1-4; remove, swap or move Color in a set that matrices use |
+| `reassign_items` | `PUT Item/<id>.json` per item: default vendor, brand and/or category, only what changes | Touch an item in a matrix (`update_matrix` does the whole matrix), or prices, cost, stock and vendor numbers |
 
 `receive_po_lines` marks goods as received on the PO. Stock on hand changes
 only when someone presses **Add Received To Inventory** on that PO in

@@ -108,6 +108,8 @@ DRY_RUNS = [
     ("create_category", {"name": "Hats", "parent_id": 60}),
     ("delete_category", {"category_id": 119}),              # empty
     ("create_inventory_count", {"name": "Neck ties check", "items": [{"item_id": 1387, "counted": 150}]}),
+    # Belt and silk scarf: off the archived "Ties, Boxers & Socks" (51) onto the active "Ties, Boxers, and Socks" (2).
+    ("reassign_items", {"items": [{"item_id": 1380, "vendor_id": 2}, {"item_id": 1390, "vendor_id": 2}]}),
 ]
 
 

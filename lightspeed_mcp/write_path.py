@@ -125,6 +125,10 @@ ITEM_INTO_MATRIX = Route("PUT", re.compile(r"Item/\d+\.json"),
                          frozenset({"itemMatrixID", "ItemAttributes", "description", "categoryID", "manufacturerID",
                                     "defaultVendorID"}))
 ITEM_SKU = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"customSku"}))
+# An item's default vendor, brand and category, for items outside a matrix (a matrix sets these for
+# all its items: update_matrix). Never prices, cost, stock or vendor numbers.
+ITEM_VENDOR_BRAND_CATEGORY = Route("PUT", re.compile(r"Item/\d+\.json"),
+                                   frozenset({"defaultVendorID", "manufacturerID", "categoryID"}))
 # An item's prices, and nothing else. Only update_item_prices may send this.
 ITEM_PRICES = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"Prices"}))
 # An item's reorder point and level, on Lightspeed's ItemShop endpoint, which (per its docs) only
@@ -217,6 +221,7 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "create_inventory_count": (NEW_COUNT, NEW_COUNT_ITEM),
     "create_attribute_set": (NEW_ATTRIBUTE_SET,),
     "update_attribute_set": (UPDATE_ATTRIBUTE_SET,),
+    "reassign_items": (ITEM_VENDOR_BRAND_CATEGORY,),
 }
 
 

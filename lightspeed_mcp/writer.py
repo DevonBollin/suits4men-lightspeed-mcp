@@ -2407,3 +2407,69 @@ class InventoryWriter:
                         warnings, basis={"timeStamp": current.get("timeStamp"), "matrices": len(in_use)})
 
         return self._run("update_attribute_set", dry_run, confirm_code, build)
+
+    # ---- 22. an item's vendor, brand and category (items not in a matrix) -------------------------------------
+
+    def reassign_items(self, items: list[dict], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        """Give items another default vendor, brand and/or category, e.g. to move them off a duplicate vendor
+        record or a misspelled brand. Only items outside a matrix: a matrix sets these for all of its items."""
+
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            found = self._items_by_id(ids)
+            names: dict[tuple[str, str], str] = {}  # (field, id) -> name, each looked up once
+
+            def name_of(key: str, value) -> str:
+                if (key, value) not in names:
+                    names[key, value] = {
+                        "defaultVendorID": lambda v: fmt.text(self._active_vendor(v).get("name")) or "",
+                        "manufacturerID": self._manufacturer_name,
+                        "categoryID": self._active_category_path}[key](value)
+                return names[key, value]
+
+            requests, warnings = [], []
+            for entry, item_id in zip(items, ids):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                matrix_id = fmt.ref_id(item.get("itemMatrixID"))
+                if matrix_id:
+                    raise RuleViolation(f"Refused: {item_label(item)} is in matrix {matrix_id}, which sets the vendor, "
+                                        "brand and category of all its items. Use update_matrix for the whole matrix.")
+                body, changes = {}, []
+                for arg, key, label in (("vendor_id", "defaultVendorID", "vendor"),
+                                        ("manufacturer_id", "manufacturerID", "brand"),
+                                        ("category_id", "categoryID", "category")):
+                    if entry.get(arg) is None:
+                        continue
+                    new = str(int(entry[arg]))
+                    old = str(fmt.ref_id(item.get(key)) or 0)
+                    if new == old:
+                        continue
+                    body[key] = new
+                    changes.append(f"{label} {old if old != '0' else '(none)'} -> {new} ({name_of(key, new)})")
+                if not body:
+                    raise RuleViolation(f"Refused: nothing to change on {item_label(item)}.")
+                if "defaultVendorID" in body:
+                    old_vendor = str(fmt.ref_id(item.get("defaultVendorID")) or 0)
+                    kept = [fmt.text(v.get("value")) for v in intake.vendor_numbers(item)
+                            if str(v.get("vendorID")) == old_vendor]
+                    if kept:
+                        warnings.append(f"{item_label(item)}: its vendor number {kept[0]} stays filed under the old "
+                                        "vendor; set_vendor_numbers adds one for the new vendor.")
+                requests.append(PlannedRequest(f"{item_label(item)}: " + "; ".join(changes), "PUT",
+                                               f"Item/{item_id}.json", body))
+            summary = (f"Change the vendor, brand and/or category of {len(requests)} item(s) not in a matrix, as listed. "
+                       "Only those fields are sent: prices, cost, stock, SKUs and vendor numbers stay as they are. Past "
+                       "purchase orders and sales keep the vendor they had.")
+            return Plan("reassign_items", summary, requests, warnings)
+
+        return self._run("reassign_items", dry_run, confirm_code, build)

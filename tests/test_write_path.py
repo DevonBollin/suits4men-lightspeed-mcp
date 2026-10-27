@@ -81,7 +81,7 @@ def test_exactly_these_write_tools():
         "update_matrix", "create_vendor", "create_brand", "update_item_prices", "set_reorder_levels",
         "archive_purchase_order", "correct_vendor_numbers", "update_vendor", "archive_vendor", "rename_brand",
         "create_category", "rename_category", "delete_category", "create_inventory_count", "create_attribute_set",
-        "update_attribute_set"}
+        "update_attribute_set", "reassign_items"}
 
 
 def test_attribute_sets_send_names_only_and_are_never_deleted():
@@ -179,6 +179,7 @@ def test_prices_change_only_when_a_tool_is_asked_to():
     assert only_route("assign_custom_skus").fields == {"customSku"}
     assert only_route("move_items_into_matrix").fields == {"itemMatrixID", "ItemAttributes", "description",
                                                            "categoryID", "manufacturerID", "defaultVendorID"}
+    assert only_route("reassign_items").fields == {"defaultVendorID", "manufacturerID", "categoryID"}
 
 
 @pytest.mark.parametrize("tool, method, path", [

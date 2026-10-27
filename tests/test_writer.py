@@ -174,6 +174,7 @@ GOOD_CALLS = {
                                                         "fit": "Slim"}]),
     "assign_custom_skus": dict(items=[{"item_id": 1186}, {"item_id": 2321, "custom_sku": "013200"}]),
     "archive_item": dict(item_id=1345),
+    "reassign_items": dict(items=[{"item_id": 1186, "vendor_id": 21, "manufacturer_id": 3, "category_id": 84}]),
 }
 
 
