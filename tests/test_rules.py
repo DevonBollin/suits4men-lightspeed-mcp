@@ -100,6 +100,26 @@ def test_custom_sku_format(sku, ok):
             rules.check_custom_sku_format(sku)
 
 
+@pytest.mark.parametrize("a, b", [("San Malone, Inc.", "San Malone"), ("SAN  MALONE LLC", "san malone"),
+                                  ("Johnston & Murphy", "Johnston and Murphy")])
+def test_same_company_names(a, b):
+    assert rules.name_key(a) == rules.name_key(b)
+
+
+@pytest.mark.parametrize("name, existing", [("Tommmy Hilfiger", "Tommy Hilfiger"), ("Canoletto", "Canaletto"),
+                                            ("Retro Partis", "Retro Paris"), ("Renoir Wool", "Renoir"),
+                                            ("Renoir", "Renoir Wool")])
+def test_similar_company_names(name, existing):
+    same, similar = rules.same_and_similar_names(name, [{"id": "1", "name": existing, "archived": False}])
+    assert not same and similar
+
+
+@pytest.mark.parametrize("name, existing", [("Stacy Adams", "stac"), ("Caravelli", "Calvin Klein"),
+                                            ("Florsheim", "Forsyth of Canada")])
+def test_different_company_names(name, existing):
+    assert rules.same_and_similar_names(name, [{"id": "1", "name": existing, "archived": False}]) == ([], [])
+
+
 def test_server_marks_exactly_the_write_tools_as_writes():
     """Every other tool is read-only, except take_snapshot, which only adds local files (GET only)."""
     import server

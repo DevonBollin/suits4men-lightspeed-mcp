@@ -419,6 +419,15 @@ class NewItemDetails(BaseModel):
     manufacturer_id: Annotated[int | None, Field(description="Brand (list_manufacturers).")] = None
 
 
+class InvoiceNewItem(NewItemDetails):
+    new_brand: Annotated[str | None, Field(description="Instead of manufacturer_id: a brand Lightspeed doesn't have yet (created in the same plan).")] = None
+
+
+class NewVendor(BaseModel):
+    name: Annotated[str, Field(description="The vendor's name, exactly as the vendor writes it.")]
+    account_number: Annotated[str | None, Field(description="The store's account number with the vendor.")] = None
+
+
 class InvoiceLine(BaseModel):
     quantity: Annotated[int, Field(description="Units on this line (that arrived, for a packing slip).")]
     unit_cost: Annotated[float, Field(description="Unit cost on the invoice.")]
@@ -431,13 +440,13 @@ class InvoiceLine(BaseModel):
     description: Annotated[str | None, Field(description="The invoice's own text for the line (helps suggest matches).")] = None
     price: Annotated[float | None, Field(description="For a matrix variant that doesn't exist yet: its selling price.")] = None
     custom_sku: Annotated[str | None, Field(description="For a new item: its 6-digit SKU; empty = the next free one.")] = None
-    new_item: Annotated[NewItemDetails | None, Field(description="For a new item outside any matrix (shirts, ties, ...).")] = None
+    new_item: Annotated[InvoiceNewItem | None, Field(description="For a new item outside any matrix (shirts, ties, ...).")] = None
 
 
 @tool
 def match_invoice_lines(
-    vendor_id: Annotated[int, Field(description="The vendor the invoice or packing slip is from (list_vendors).")],
     lines: Annotated[list[InvoiceLine], Field(description="The document's lines, as read from it.")],
+    vendor_id: Annotated[int | None, Field(description="The vendor the document is from (list_vendors); empty for a vendor Lightspeed doesn't have yet.")] = None,
 ) -> str:
     """Before an intake: match each invoice / packing-slip line to the store's items. Each line comes
     back as existing (with the item), new_variant (a matrix gains a color/size/fit), new_item, or
@@ -742,9 +751,11 @@ def set_vendor_numbers(
 
 @write_tool
 def intake_invoice(
-    vendor_id: Annotated[int, Field(description="The vendor on the invoice or packing slip.")],
     invoice_number: Annotated[str, Field(description="The document's invoice / order number (the PO's reference).")],
     lines: Annotated[list[InvoiceLine], Field(description="Every line on the document (max 100).")],
+    vendor_id: Annotated[int | None, Field(description="The vendor on the document (list_vendors), if Lightspeed has it.")] = None,
+    new_vendor: Annotated[NewVendor | None, Field(description="Instead of vendor_id: a vendor Lightspeed doesn't have yet (created in the same plan). Check list_vendors first.")] = None,
+    allow_similar_names: Annotated[bool, Field(description="Only after the user confirms it: create a new vendor or brand even though an existing one has a similar name.")] = False,
     invoice_date: Annotated[str | None, Field(description="YYYY-MM-DD, the document's date (the PO's ordered date).")] = None,
     ship_cost: Annotated[float | None, Field(description="Shipping on the document.")] = None,
     other_cost: Annotated[float | None, Field(description="Other charges on the document.")] = None,
@@ -760,10 +771,42 @@ def intake_invoice(
     in a matrix with their price, or standalone items), save vendor numbers, add or update the PO
     lines at the invoice's unit cost with what was received, and set the PO's ordered date and Check In.
     Stock changes only when the user clicks Add Received To Inventory on the PO in Lightspeed (no API
-    call exists for it): always tell them."""
+    call exists for it): always tell them. A vendor (new_vendor) or brand (new_item.new_brand) that
+    Lightspeed doesn't have yet is created first in the same plan; exact duplicates are refused, and
+    near-matches too unless the user confirms (allow_similar_names)."""
     return run(lambda w: w.intake_invoice(vendor_id, invoice_number, [l.model_dump() for l in lines], invoice_date,
                                           ship_cost, other_cost, order_id, mark_received, save_vendor_numbers,
-                                          dry_run, confirm_code), writer)
+                                          dry_run, confirm_code,
+                                          new_vendor.model_dump() if new_vendor else None, allow_similar_names),
+               writer)
+
+
+@write_tool
+def create_vendor(
+    name: Annotated[str, Field(description="The vendor's name, exactly as the vendor writes it.")],
+    account_number: Annotated[str | None, Field(description="The store's account number with the vendor.")] = None,
+    allow_similar_name: Annotated[bool, Field(description="Only after the user confirms it: create it even though an existing vendor has a similar name.")] = False,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Create a vendor Lightspeed doesn't have yet (name and account number only). Refuses a name an
+    existing vendor already has (ignoring case, punctuation and Inc/LLC/Ltd; archived vendors
+    included), and a near-match (e.g. a typo of an existing name) unless the user confirms it is a
+    different company. For an invoice from a new vendor, intake_invoice can create it in the same plan."""
+    return run(lambda w: w.create_vendor(name, account_number, allow_similar_name, dry_run, confirm_code), writer)
+
+
+@write_tool
+def create_brand(
+    name: Annotated[str, Field(description="The brand's name, exactly as the brand writes it.")],
+    allow_similar_name: Annotated[bool, Field(description="Only after the user confirms it: create it even though an existing brand has a similar name.")] = False,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Create a brand (Lightspeed's Manufacturer) it doesn't have yet. Refuses a name an existing brand
+    already has, and a near-match (e.g. 'Tommmy Hilfiger' next to 'Tommy Hilfiger') unless the user
+    confirms it is a different brand. Lightspeed can't delete a brand afterwards."""
+    return run(lambda w: w.create_brand(name, allow_similar_name, dry_run, confirm_code), writer)
 
 
 @write_tool

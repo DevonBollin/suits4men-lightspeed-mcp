@@ -236,6 +236,52 @@ def check_custom_sku_format(sku: str) -> str:
     return sku
 
 
+# ---- vendor and brand names ---------------------------------------------------------------
+
+# Words that don't make two company names different: "San Malone" = "San Malone, Inc.".
+COMPANY_SUFFIXES = {"inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation", "co", "company"}
+
+# How alike two names must be to count as "probably the same company" (difflib ratio, 0-1).
+# Catches typos like "Tommmy Hilfiger" / "Tommy Hilfiger" or "Canaletto" / "Canoletto".
+SIMILAR_NAME_RATIO = 0.85
+
+
+def name_key(name: str) -> str:
+    """'San Malone, Inc.' -> 'san malone'. Case, punctuation and company suffixes don't count."""
+    words = re.findall(r"[a-z0-9]+", clean(name).lower().replace("&", " and "))
+    while len(words) > 1 and words[-1] in COMPANY_SUFFIXES:
+        words.pop()
+    return " ".join(words)
+
+
+def check_record_name(name, kind: str) -> str:
+    """A vendor's or brand's name, trimmed but otherwise exactly as given."""
+    name = clean(name)
+    if not name_key(name):
+        raise RuleViolation(f"Refused: the {kind} name is empty.")
+    if len(name) > MAX_DESCRIPTION_LENGTH:
+        raise RuleViolation(f"Refused: the {kind} name is {len(name)} characters; Lightspeed allows {MAX_DESCRIPTION_LENGTH}.")
+    return name
+
+
+def same_and_similar_names(name: str, existing: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Existing records ({"id", "name", "archived"}) with the same name, and with a similar one."""
+    from difflib import SequenceMatcher
+
+    key = name_key(name)
+    same, similar = [], []
+    for record in existing:
+        other = name_key(record["name"])
+        if not other:
+            continue
+        if other == key:
+            same.append(record)
+        elif (SequenceMatcher(None, key, other).ratio() >= SIMILAR_NAME_RATIO
+              or re.search(rf"\b{re.escape(key)}\b", other) or re.search(rf"\b{re.escape(other)}\b", key)):
+            similar.append(record)
+    return same, similar
+
+
 def check_skus_unique_in_request(skus: list[str]) -> None:
     seen = set()
     for sku in skus:

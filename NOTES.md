@@ -544,6 +544,42 @@ style numbers, standalone items, removing unreceived PO lines.
   ("Caravelli Beige 50S Classic" → "Caravelli Suit Beige 50S Classic").
 - All 399 of matrix 7's items sell at 599.95; its own price is 61.21, MSRP 995, Online 0.
 
+## New vendors and brands (2026-10-26, late)
+
+Built on the owner's request, so an invoice from a new vendor or brand doesn't
+block intake: `create_vendor`, `create_brand`, and `intake_invoice(new_vendor=…,
+new_item.new_brand=…)`.
+
+- Docs: Vendor POST/PUT fields `name`, `accountNumber`, `priceLevel`,
+  `updatePrice`/`updateCost`/`updateDescription` (catalog settings),
+  `shareSellThrough`, `b2bSellerUID`, `Contact`, `Reps`. No required field is
+  marked; `archived` isn't writable; DELETE archives. Only `name` and
+  `accountNumber` are sent. Manufacturer POST: `name` only (required); **DELETE
+  is not allowed at all**.
+- Scopes page: `employee:vendors` "View, create, update and archive vendors"
+  (held); `employee:manufacturers` "View, create, update, and archive
+  manufacturers" (**not held**: added to SCOPES; bootstrap must be re-run
+  before the first brand is created). Neither endpoint page names its scope.
+- Name checks (`rules.name_key`, `same_and_similar_names`): same name =
+  same after lower-casing, dropping punctuation, "&" → "and", and a trailing
+  Inc/LLC/Ltd/Corp/Co. Similar = difflib ratio ≥ 0.85, or one name is a whole
+  word of the other. Same is refused (archived vendors included); similar is
+  refused unless `allow_similar_name(s)=true`, which Claude passes only after
+  the owner confirms.
+- Live dry runs (GET only): "San Malone, Inc." → refused (vendor 1); "Tommy
+  Hilfiger" → refused (brand 15); "Tomy Hilfiger" → refused as like brands 15
+  and 34; new vendor "Bruno Piattelli" + brand + tie → one plan of 6 requests.
+  A new-vendor check reads all 677 vendors: about 20 s.
+
+### Findings (from the snapshot)
+
+- Vendor names used twice: "Broder Brothers" and "Yellowman (YMX)".
+- Brand names that look like typos of each other: "Tommmy Hilfiger" / "Tommy
+  Hilfiger", "Canaletto" / "Canoletto", "Marco Valenino" / "Marco Valetino",
+  "Retro Paris" / "retro partis", "Stacy Adams" / "stac", "Renoir" / "Renoir
+  Wool", "Vitarelli" / "Marquis / Vitarelli".
+- Only 3 of 677 vendors have an account number.
+
 ## Helper tools (2026-10-26, evening)
 
 - `suggest_custom_skus`, `show_write_log`, `take_snapshot`, `compare_snapshots`.

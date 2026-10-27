@@ -129,7 +129,7 @@ class CannedReads:
         name = path.removesuffix(".json")
         rows = {"ItemAttributeSet": ATTRIBUTE_SETS, "Category": CATEGORIES, "Vendor": VENDORS,
                 "TaxClass": [{"taxClassID": "1", "name": "Item"}], "Shop": [{"shopID": "1", "name": "Suits 4 Men Inc"}],
-                **self.data}[name]
+                "Manufacturer": MANUFACTURERS, **self.data}[name]
         if params.get("archived") != "true":
             rows = [r for r in rows if r.get("archived") != "true"]
         for field in ("itemMatrixID", "customSku", "orderID"):

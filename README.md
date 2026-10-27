@@ -89,7 +89,11 @@ prompts to keep the saved ones. Re-authorize when:
 
 Phase 2 changed the scopes (`employee:inventory` replaces
 `employee:inventory_read`), and bootstrap was re-run on 2026-10-26: the
-saved token has all 9 scopes. Re-authorizing changes no inventory data. Run it
+saved token has those 9 scopes.
+
+**Pending:** creating brands needs `employee:manufacturers`, added afterwards.
+Run bootstrap once more before the first brand is created (everything else,
+new vendors included, works with the current token). Re-authorizing changes no inventory data. Run it
 from a normal PowerShell window: from the Claude app's Terminal panel, open one with
 `Start-Process powershell -WorkingDirectory "C:\Development\Suits 4 Men Inventory"`.
 
@@ -164,6 +168,8 @@ across several entries and switched over atomically. See
 | `set_vendor_numbers` | `PUT Item/<id>.json` with the vendor's own number (Lightspeed's Vendor ID), keeping the item's other vendor numbers | Put one number on two items |
 | `intake_invoice` | A whole invoice or packing slip in one approval: PO, new items, vendor numbers, lines with what was received, Check In | Add the goods to stock (a click in Lightspeed) |
 | `update_matrix` | `PUT ItemMatrix/<id>.json`: description, category, brand, vendor, default cost, Default price, only what changes | Change the attribute set or values, or archive |
+| `create_vendor` | `POST Vendor.json`: name (as the vendor writes it) and account number | Create a duplicate or near-duplicate (see below); update or archive a vendor |
+| `create_brand` | `POST Manufacturer.json`: the brand's name | Create a duplicate or near-duplicate; Lightspeed can't delete a brand |
 
 `receive_po_lines` marks goods as received on the PO. Stock on hand changes
 only when someone presses **Add Received To Inventory** on that PO in
@@ -199,6 +205,16 @@ Unarchiving may be possible but is not built.
 5. In Lightspeed, open the PO, check the received quantities against the
    goods, click **Add Received To Inventory**, then **Finished**. Lightspeed's API
    has no call for that step, so stock only changes when you click it.
+
+A vendor Lightspeed doesn't have yet (`new_vendor`), or a new brand on a new
+item (`new_brand`), is created first in the same plan, so a new supplier
+doesn't block the intake.
+
+New vendors and brands: a name an existing one already has is refused,
+ignoring case, punctuation and Inc/LLC/Ltd, archived vendors included. A
+near-match is refused too, unless you confirm it really is a different company
+(e.g. "Tomy Hilfiger" next to "Tommy Hilfiger" and "Tommmy Hilfiger"). Checking
+a new vendor reads all ~680 vendors, so that dry run takes about 20 seconds.
 
 Vendor numbers: Lightspeed's "Vendor ID" on an item must belong to that item
 alone (its receive-by-Vendor-ID breaks otherwise). A number printed on several

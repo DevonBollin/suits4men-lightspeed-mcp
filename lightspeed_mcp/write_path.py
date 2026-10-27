@@ -108,6 +108,11 @@ NEW_ORDER_LINE = Route("POST", re.compile(r"OrderLine\.json"),
 ORDER_LINE_RECEIVED = Route("PUT", re.compile(r"OrderLine/\d+\.json"), frozenset({"numReceived"}))
 # Lightspeed deletes a PO line for good (no archive). Only lines with nothing received, on unfinished POs.
 REMOVE_ORDER_LINE = Route("DELETE", re.compile(r"OrderLine/\d+\.json"), frozenset())
+# A new vendor: its name and the store's account number with it. Nothing else (catalog
+# settings, contacts) is sent. Vendors are never updated or archived here.
+NEW_VENDOR = Route("POST", re.compile(r"Vendor\.json"), frozenset({"name", "accountNumber"}))
+# A new brand (Lightspeed calls it a Manufacturer): only its name. Lightspeed can't delete one.
+NEW_BRAND = Route("POST", re.compile(r"Manufacturer\.json"), frozenset({"name"}))
 # A new, empty purchase order (lines are added separately; the docs don't allow lines in this POST).
 NEW_ORDER = Route("POST", re.compile(r"Order\.json"),
                   frozenset({"vendorID", "shopID", "refNum", "shipCost", "otherCost"}))
@@ -140,9 +145,11 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "set_vendor_numbers": (ITEM_VENDOR_NUMBERS,),
     # One invoice or packing slip, approved once: a PO (new or existing), new items, vendor
     # numbers, lines and received quantities, and the PO's dates.
-    "intake_invoice": (NEW_ORDER, NEW_MATRIX_ITEM, NEW_STANDALONE_ITEM, ITEM_VENDOR_NUMBERS, NEW_ORDER_LINE,
-                       ORDER_LINE_INTAKE, ORDER_HEADER),
+    "intake_invoice": (NEW_VENDOR, NEW_BRAND, NEW_ORDER, NEW_MATRIX_ITEM, NEW_STANDALONE_ITEM, ITEM_VENDOR_NUMBERS,
+                       NEW_ORDER_LINE, ORDER_LINE_INTAKE, ORDER_HEADER),
     "update_matrix": (UPDATE_MATRIX,),
+    "create_vendor": (NEW_VENDOR,),
+    "create_brand": (NEW_BRAND,),
 }
 
 
@@ -249,7 +256,7 @@ def make_write_http(base_url: str, switch: WriteSwitch, transport: httpx.BaseTra
 
 
 # The ID fields worth recording from a response record.
-ID_FIELDS = ("itemMatrixID", "itemID", "orderID", "orderLineID")
+ID_FIELDS = ("itemMatrixID", "itemID", "orderID", "orderLineID", "vendorID", "manufacturerID")
 
 
 def affected_ids(body: dict) -> dict:

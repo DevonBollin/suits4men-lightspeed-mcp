@@ -36,7 +36,8 @@ SCOPES = [
     "employee:inventory",        # items, stock (ItemShop), attribute sets; create and update items
     "employee:product_cost",     # ItemMatrix (403 without it), InventoryLog, vendor catalogs, editing cost
     "employee:purchase_orders",  # purchase orders, lines, received shipments
-    "employee:vendors",          # vendors
+    "employee:vendors",          # vendors (view, create, update)
+    "employee:manufacturers",    # brands: create new ones (reading them needs no scope)
     "employee:categories",       # categories
     "employee:inventory_counts", # inventory counts and their discrepancies (not reconcile)
     "employee:register_read",    # sales history, for sell-through (read-only scope)

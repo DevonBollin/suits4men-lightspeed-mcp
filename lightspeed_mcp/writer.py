@@ -66,7 +66,8 @@ class PlannedRequest:
 
 
 # Which ID field a created record's ID is read from, by record type.
-CREATED_ID_FIELDS = {"Order": "orderID", "Item": "itemID", "OrderLine": "orderLineID", "ItemMatrix": "itemMatrixID"}
+CREATED_ID_FIELDS = {"Order": "orderID", "Item": "itemID", "OrderLine": "orderLineID", "ItemMatrix": "itemMatrixID",
+                     "Vendor": "vendorID", "Manufacturer": "manufacturerID"}
 
 
 def new_ref(name: str) -> str:
@@ -411,10 +412,13 @@ class InventoryWriter:
                 break
 
         category_path = self._active_category_path(entry.get("category_id"))
-        vendor = self._active_vendor(entry.get("vendor_id"))
+        # During intake the vendor or brand may be created earlier in the same plan ("{new:vendor}").
+        vendor_ref = entry.get("vendor_ref") or str(self._active_vendor(entry.get("vendor_id")).get("vendorID"))
         body: dict = {"description": desc, "itemType": "default", "categoryID": str(int(entry["category_id"])),
-                      "defaultVendorID": str(vendor.get("vendorID")), **tax}
-        if entry.get("manufacturer_id"):
+                      "defaultVendorID": vendor_ref, **tax}
+        if entry.get("brand_ref"):
+            body["manufacturerID"] = entry["brand_ref"]
+        elif entry.get("manufacturer_id"):
             if not self._get_record(f"Manufacturer/{int(entry['manufacturer_id'])}.json", "Manufacturer"):
                 raise RuleViolation(f"Refused: manufacturer {entry['manufacturer_id']} does not exist.")
             body["manufacturerID"] = str(int(entry["manufacturer_id"]))
@@ -1149,6 +1153,13 @@ class InventoryWriter:
 
     # ---- 9. purchase orders: create, remove unreceived lines ------------------------------------
 
+    def _single_shop(self) -> str:
+        """The store's one shop ID (a PO needs it)."""
+        shops = [s for s in sorted(self.reader.shop_names(), key=lambda s: int(s) if s.isdigit() else 0) if s != "0"]
+        if len(shops) != 1:
+            raise RuleViolation(f"Refused: the account has {len(shops)} shops readable; this tool expects exactly one.")
+        return shops[0]
+
     def _new_order(self, vendor_id, ref_num, ship_cost=None, other_cost=None) -> tuple[dict, str, list[str]]:
         """The POST Order.json body for a new, empty PO; the vendor's name; summary parts."""
         vendor = self._active_vendor(vendor_id)
@@ -1163,11 +1174,7 @@ class InventoryWriter:
         if same:
             raise RuleViolation(f"Refused: {fmt.text(vendor.get('name'))} reference {ref} is already purchase order "
                                 f"{same[0].get('orderID')}. Use that PO instead of making a second one.")
-        shops = sorted(self.reader.shop_names(), key=lambda s: int(s) if s.isdigit() else 0)
-        shops = [s for s in shops if s != "0"]
-        if len(shops) != 1:
-            raise RuleViolation(f"Refused: the account has {len(shops)} shops readable; this tool expects exactly one.")
-        body = {"vendorID": str(vendor.get("vendorID")), "shopID": shops[0], "refNum": ref,
+        body = {"vendorID": str(vendor.get("vendorID")), "shopID": self._single_shop(), "refNum": ref,
                 "shipCost": money_or_zero(ship_cost, "shipping cost"), "otherCost": money_or_zero(other_cost, "other cost")}
         parts = [f"shipping {body['shipCost']}", f"other costs {body['otherCost']}"]
         return body, fmt.text(vendor.get("name")) or "", parts
@@ -1364,7 +1371,7 @@ class InventoryWriter:
 
     def intake_invoice(
         self,
-        vendor_id: int,
+        vendor_id: int | None,
         invoice_number: str,
         lines: list[dict],
         invoice_date: str | None = None,
@@ -1375,8 +1382,11 @@ class InventoryWriter:
         save_vendor_numbers: bool = True,
         dry_run: bool = True,
         confirm_code: str | None = None,
+        new_vendor: dict | None = None,
+        allow_similar_names: bool = False,
     ) -> dict:
-        """See intake.py for how lines are matched. The plan, in order: the PO (new, or the one given),
+        """See intake.py for how lines are matched. The plan, in order: a new vendor and brands if the
+        document has them, the PO (new, or the one given),
         new items, vendor numbers, PO lines with what arrived, and the PO's dates (ordered = the
         invoice date, received = today, which puts it in Check In)."""
 
@@ -1385,22 +1395,53 @@ class InventoryWriter:
                 raise RuleViolation("Refused: give the invoice's lines.")
             if len(lines) > MAX_INVOICE_LINES:
                 raise RuleViolation(f"Refused: {len(lines)} lines; the limit is {MAX_INVOICE_LINES} per invoice.")
-            vendor = self._active_vendor(vendor_id)
-            vendor_name = fmt.text(vendor.get("name")) or ""
+            if (vendor_id is None) == (new_vendor is None):
+                raise RuleViolation("Refused: give vendor_id for an existing vendor, or new_vendor for one Lightspeed "
+                                    "doesn't have yet (not both).")
+            warnings: list[str] = []
+            requests: list[PlannedRequest] = []
+
+            # 0. A vendor or brands Lightspeed doesn't have yet are created first, in the same plan.
+            if new_vendor is not None:
+                if order_id is not None:
+                    raise RuleViolation("Refused: an existing purchase order can't belong to a new vendor.")
+                vendor_name = self._check_new_name("vendor", new_vendor.get("name"), allow_similar_names, warnings,
+                                                   option="allow_similar_names")
+                vendor_body = {"name": vendor_name}
+                if rules.clean(new_vendor.get("account_number")):
+                    vendor_body["accountNumber"] = rules.clean(new_vendor.get("account_number"))
+                requests.append(PlannedRequest(f"create vendor '{vendor_name}'", "POST", "Vendor.json", vendor_body,
+                                               creates="vendor"))
+                vendor_ref = new_ref("vendor")
+            else:
+                vendor = self._active_vendor(vendor_id)
+                vendor_name, vendor_ref = fmt.text(vendor.get("name")) or "", str(vendor.get("vendorID"))
+            brand_refs: dict[str, str] = {}  # brand name key -> "{new:brand:N}"
+            brand_names = [rules.clean((line.get("new_item") or {}).get("new_brand")) for line in lines]
+            if any(brand_names):
+                existing_brands = self._existing_names("brand")
+                for name in dict.fromkeys(n for n in brand_names if n):
+                    brand = self._check_new_name("brand", name, allow_similar_names, warnings, existing_brands,
+                                                 option="allow_similar_names")
+                    if rules.name_key(brand) in brand_refs:
+                        continue
+                    label = f"brand:{len(brand_refs) + 1}"
+                    requests.append(PlannedRequest(f"create brand '{brand}'", "POST", "Manufacturer.json",
+                                                   {"name": brand}, creates=label))
+                    brand_refs[rules.name_key(brand)] = new_ref(label)
+
             matcher = intake.InvoiceMatcher(self.reader)
-            matches = matcher.match(vendor_id, lines)
+            matches = matcher.match(vendor_ref, lines)
             unresolved = [m for m in matches if m.status == "unresolved"]
             if unresolved:
                 raise RuleViolation("Refused: some lines don't match an item yet. " + " ".join(
                     f"Line {m.number}: {m.reason}" for m in unresolved[:10]) + " match_invoice_lines lists candidates.")
             invoice_day = iso_date(invoice_date, "invoice date") if invoice_date else None
-            warnings: list[str] = []
-            requests: list[PlannedRequest] = []
 
             # 1. The purchase order.
             if order_id is not None:
                 order = self._open_order(order_id)
-                if str(order.get("vendorID")) != str(vendor.get("vendorID")):
+                if str(order.get("vendorID")) != vendor_ref:
                     raise RuleViolation(f"Refused: purchase order {order_id} is for another vendor.")
                 order_ref, on_po = str(int(order_id)), self._order_lines(order_id)
                 ref = rules.clean(invoice_number)
@@ -1409,7 +1450,16 @@ class InventoryWriter:
                                     f"document's number is {ref}.")
                 po_text = f"purchase order {order_id}"
             else:
-                body, _, parts = self._new_order(vendor_id, invoice_number, ship_cost, other_cost)
+                if new_vendor is not None:  # a new vendor has no POs yet, so its reference can't be taken
+                    ref = rules.clean(invoice_number)
+                    if not ref:
+                        raise RuleViolation("Refused: give the invoice or order number (invoice_number).")
+                    body = {"vendorID": vendor_ref, "shopID": self._single_shop(), "refNum": ref,
+                            "shipCost": money_or_zero(ship_cost, "shipping cost"),
+                            "otherCost": money_or_zero(other_cost, "other cost")}
+                    parts = [f"shipping {body['shipCost']}", f"other costs {body['otherCost']}"]
+                else:
+                    body, _, parts = self._new_order(vendor_id, invoice_number, ship_cost, other_cost)
                 requests.append(PlannedRequest(f"create a PO for {vendor_name}, ref {body['refNum']} ({', '.join(parts)})",
                                                "POST", "Order.json", body, creates="order"))
                 order, order_ref, on_po = {}, new_ref("order"), []
@@ -1468,7 +1518,7 @@ class InventoryWriter:
                 save_number = False
                 if save_vendor_numbers and number and number.lower() not in shared and not m.vendor_number_known:
                     try:
-                        self._check_vendor_number(vendor_id, number, m.item, matcher.items)
+                        self._check_vendor_number(vendor_ref, number, m.item, matcher.items)
                         save_number = True
                     except RuleViolation as e:
                         warnings.append(f"Line {m.number}: vendor number not saved. {str(e).removeprefix('Refused: ')}")
@@ -1480,8 +1530,10 @@ class InventoryWriter:
                     body = self._variant_body(matrix, matrix_desc, m.values, skus.take(m.line.get("custom_sku")), cost,
                                               money(m.line["price"], f"line {m.number} price"))
                 elif m.status == "new_item":
-                    entry = {**m.line["new_item"], "cost": m.line.get("unit_cost"), "vendor_id": vendor_id}
+                    entry = {**m.line["new_item"], "cost": m.line.get("unit_cost"), "vendor_ref": vendor_ref}
                     entry["custom_sku"] = entry.get("custom_sku") or m.line.get("custom_sku")
+                    if rules.clean(entry.get("new_brand")):
+                        entry["brand_ref"] = brand_refs[rules.name_key(entry["new_brand"])]
                     body, _ = self._standalone_item(entry, skus, tax, taken_desc, matrices, warnings)
                 else:
                     item = m.item
@@ -1494,7 +1546,7 @@ class InventoryWriter:
                         requests.append(PlannedRequest(
                             f"line {m.number}: save vendor number {number} on {item_label(item)}", "PUT",
                             f"Item/{item.get('itemID')}.json",
-                            {"ItemVendorNums": self._vendor_numbers_body(item, vendor_id, number)}))
+                            {"ItemVendorNums": self._vendor_numbers_body(item, vendor_ref, number)}))
                     if not fmt.text(item.get("customSku")):
                         warnings.append(f"Line {m.number}: {item_label(item)} has no custom SKU (assign_custom_skus).")
                     if not fmt.ref_id(item.get("itemMatrixID")):
@@ -1506,7 +1558,7 @@ class InventoryWriter:
                     continue
                 if save_number:
                     numbers_saved += 1
-                    body["ItemVendorNums"] = self._vendor_numbers_body(None, vendor_id, number)
+                    body["ItemVendorNums"] = self._vendor_numbers_body(None, vendor_ref, number)
                 name = f"item:{m.number}"
                 requests.append(PlannedRequest(
                     f"line {m.number}: create '{body['description']}' (SKU {body['customSku']}, cost {cost}, price "
@@ -1580,7 +1632,10 @@ class InventoryWriter:
                                                f"Order/{order_ref}.json", header))
 
             counts = {s: sum(1 for m in matches if m.status == s) for s in ("existing", "new_variant", "new_item")}
-            summary = (f"{vendor_name} document {rules.clean(invoice_number) or '-'}: {len(matches)} line(s), {units} "
+            created_first = ([f"the new vendor '{vendor_name}'"] if new_vendor is not None else []) + (
+                [f"{len(brand_refs)} new brand(s)"] if brand_refs else [])
+            summary = (("Creates " + " and ".join(created_first) + " first. " if created_first else "")
+                       + f"{vendor_name} document {rules.clean(invoice_number) or '-'}: {len(matches)} line(s), {units} "
                        f"unit(s), {total:.2f} at cost, on {po_text}. Existing items: {counts['existing']}; new items in "
                        f"a matrix: {counts['new_variant']}; new items outside a matrix: {counts['new_item']}"
                        f"{skus.picked_note()}; vendor numbers saved: {numbers_saved}. "
@@ -1716,6 +1771,64 @@ class InventoryWriter:
                         basis={"timeStamp": matrix.get("timeStamp"), "items": n})
 
         return self._run("update_matrix", dry_run, confirm_code, build)
+
+    # ---- 12. new vendors and brands ---------------------------------------------------------------
+
+    def _existing_names(self, kind: str) -> list[dict]:
+        """Every vendor (archived too) or brand, as {"id", "name", "archived"}."""
+        if kind == "vendor":
+            rows, _ = self.client.get_all("Vendor.json", {"archived": "true"})
+            return [{"id": r.get("vendorID"), "name": fmt.text(r.get("name")) or "", "archived": fmt.flag(r.get("archived"))}
+                    for r in rows]
+        rows, _ = self.client.get_all("Manufacturer.json")
+        return [{"id": r.get("manufacturerID"), "name": fmt.text(r.get("name")) or "", "archived": False} for r in rows]
+
+    def _check_new_name(self, kind: str, name, allow_similar: bool, warnings: list[str],
+                        existing: list[dict] | None = None, option: str = "allow_similar_name") -> str:
+        """Refuse a name that a vendor or brand already has; refuse a near-match unless allowed."""
+        name = rules.check_record_name(name, kind)
+        same, similar = rules.same_and_similar_names(name, self._existing_names(kind) if existing is None else existing)
+        if same:
+            record = same[0]
+            raise RuleViolation(f"Refused: {kind} {record['id']} is already called '{record['name']}'"
+                                + (" (archived: unarchive it in Lightspeed instead)." if record["archived"] else ". Use it."))
+        listed = ", ".join(f"'{r['name']}' ({kind} {r['id']}{', archived' if r['archived'] else ''})" for r in similar)
+        if similar and not allow_similar:
+            raise RuleViolation(f"Refused: '{name}' looks like an existing {kind}: {listed}. If it really is a different "
+                                f"{kind}, ask again with {option}=true.")
+        if similar:
+            warnings.append(f"Similar existing {kind}(s): {listed}. Created anyway, as asked.")
+        return name
+
+    def create_vendor(self, name: str, account_number: str | None = None, allow_similar_name: bool = False,
+                      dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            warnings: list[str] = []
+            vendor_name = self._check_new_name("vendor", name, allow_similar_name, warnings)
+            body = {"name": vendor_name}
+            if rules.clean(account_number):
+                body["accountNumber"] = rules.clean(account_number)
+            summary = (f"Create the vendor '{vendor_name}'" + (f", account number {body['accountNumber']}"
+                                                               if "accountNumber" in body else "")
+                       + ". Only the name (and account number) are sent; Lightspeed's other vendor settings keep their "
+                         "defaults. Its name is kept exactly as given.")
+            return Plan("create_vendor", summary,
+                        [PlannedRequest(f"create vendor '{vendor_name}'", "POST", "Vendor.json", body)], warnings)
+
+        return self._run("create_vendor", dry_run, confirm_code, build)
+
+    def create_brand(self, name: str, allow_similar_name: bool = False, dry_run: bool = True,
+                     confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            warnings: list[str] = []
+            brand = self._check_new_name("brand", name, allow_similar_name, warnings)
+            warnings.append("Lightspeed can't delete a brand once it exists (it can only be renamed).")
+            summary = (f"Create the brand '{brand}' (Lightspeed's Manufacturer). Only its name is sent, exactly as "
+                       "given.")
+            return Plan("create_brand", summary,
+                        [PlannedRequest(f"create brand '{brand}'", "POST", "Manufacturer.json", {"name": brand})], warnings)
+
+        return self._run("create_brand", dry_run, confirm_code, build)
 
     def _manufacturer_name(self, manufacturer_id) -> str:
         record = self._get_record(f"Manufacturer/{int(manufacturer_id)}.json", "Manufacturer")

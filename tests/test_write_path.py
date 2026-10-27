@@ -78,7 +78,14 @@ def test_exactly_these_write_tools():
         "create_matrix", "add_matrix_variants", "update_item_fields", "add_po_lines", "receive_po_lines",
         "move_items_into_matrix", "assign_custom_skus", "archive_item", "create_items", "create_purchase_order",
         "remove_po_lines", "update_purchase_order", "update_po_lines", "set_vendor_numbers", "intake_invoice",
-        "update_matrix"}
+        "update_matrix", "create_vendor", "create_brand"}
+
+
+def test_vendors_and_brands_can_only_be_created():
+    for tool, r in all_routes():
+        if r.path.pattern.startswith(("Vendor", "Manufacturer")):
+            assert r.method == "POST", tool
+            assert r.fields <= {"name", "accountNumber"}, tool
 
 
 def test_deletes_are_one_item_or_one_po_line_only():

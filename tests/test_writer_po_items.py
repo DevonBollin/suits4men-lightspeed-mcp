@@ -339,6 +339,106 @@ def test_intake_rules(writer, fake_api, overrides, message):
     assert fake_api.requests == []
 
 
+# ---- create_vendor / create_brand, and intake from a new vendor ---------------------------------------------------
+
+
+@pytest.fixture
+def with_archived_vendor(monkeypatch):
+    import tests.test_writer as canned
+    monkeypatch.setattr(canned, "VENDORS", canned.VENDORS + [
+        {"vendorID": "30", "name": "Old Ties Ltd", "archived": "true"}])
+
+
+def test_new_vendor_payload(writer):
+    result = writer.create_vendor("Bruno Piattelli Inc.", account_number="SM-4411")
+    assert result["requests"][0]["body"] == {"name": "Bruno Piattelli Inc.", "accountNumber": "SM-4411"}
+    assert result["requests"][0]["path"].endswith("/Vendor.json")
+
+
+@pytest.mark.parametrize("name, message", [
+    ("San Malone, Inc.", "vendor 1 is already called 'San Malone'"),
+    ("old ties", "archived: unarchive it in Lightspeed"),
+    ("San Malonee", "looks like an existing vendor"),
+    ("  ", "empty"),
+])
+def test_new_vendor_rules(writer, with_archived_vendor, fake_api, name, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.create_vendor(name)
+    assert fake_api.requests == []
+
+
+def test_a_similar_vendor_can_be_created_once_confirmed(writer):
+    result = writer.create_vendor("San Malone Shirts", allow_similar_name=True)
+    assert any("Similar existing vendor" in w and "San Malone" in w for w in result["warnings"])
+
+
+def test_new_brand_payload_and_rules(writer):
+    result = writer.create_brand("Bruno Piattelli")
+    assert result["requests"][0]["body"] == {"name": "Bruno Piattelli"}
+    assert result["requests"][0]["path"].endswith("/Manufacturer.json")
+    with pytest.raises(RuleViolation, match="brand 1 is already called 'Caravelli'"):
+        writer.create_brand("CARAVELLI")
+    with pytest.raises(RuleViolation, match="looks like an existing brand"):
+        writer.create_brand("Giorgio Fiorrelli")
+
+
+NEW_VENDOR_INVOICE = dict(vendor_id=None, new_vendor={"name": "Bruno Piattelli Inc.", "account_number": "88"},
+                          invoice_number="BP-100", lines=[
+    {"new_item": {"description": "Silk Tie Teal", "category_id": 116, "price": 49.95, "new_brand": "Bruno Piattelli"},
+     "quantity": 4, "unit_cost": 12, "vendor_number": "BP-TIE-TEAL"},
+    {"item_id": 1345, "quantity": 1, "unit_cost": 63.5}])
+
+
+def test_intake_creates_the_new_vendor_and_brand_first(writer):
+    result = writer.intake_invoice(**NEW_VENDOR_INVOICE)
+    reqs = result["requests"]
+    assert [(r["method"], r["path"].split("/Account/12345/")[1]) for r in reqs][:4] == [
+        ("POST", "Vendor.json"), ("POST", "Manufacturer.json"), ("POST", "Order.json"), ("POST", "Item.json")]
+    assert reqs[0]["body"] == {"name": "Bruno Piattelli Inc.", "accountNumber": "88"}
+    assert reqs[2]["body"]["vendorID"] == "{new:vendor}"
+    tie = reqs[3]["body"]
+    assert tie["defaultVendorID"] == "{new:vendor}" and tie["manufacturerID"] == "{new:brand:1}"
+    assert tie["ItemVendorNums"] == {"ItemVendorNum": [{"vendorID": "{new:vendor}", "value": "BP-TIE-TEAL"}]}
+    assert result["summary"].startswith("Creates the new vendor 'Bruno Piattelli Inc.' and 1 new brand(s) first.")
+
+
+def test_intake_fills_in_the_new_vendor_and_brand_ids(writer, fake_api, write_switch):
+    turn_on(write_switch)
+    replies = {"Vendor.json": {"Vendor": {"vendorID": "700"}}, "Manufacturer.json": {"Manufacturer": {"manufacturerID": "60"}},
+               "Order.json": {"Order": {"orderID": "901"}}, "Item.json": {"Item": {"itemID": "2600"}}}
+    fake_api.handler = lambda request: httpx.Response(200, json=replies.get(
+        request.url.path.split("/Account/12345/")[1], {"OrderLine": {"orderLineID": "1"}}))
+    code = writer.intake_invoice(**NEW_VENDOR_INVOICE)["confirm_code"]
+    result = writer.intake_invoice(**NEW_VENDOR_INVOICE, dry_run=False, confirm_code=code)
+    assert result["finished"] is True
+    sent = {r.url.path.split("/Account/12345/")[1]: json.loads(r.content) if r.content else None
+            for r in fake_api.requests if r.method == "POST"}
+    assert sent["Order.json"]["vendorID"] == "700"
+    assert sent["Item.json"]["defaultVendorID"] == "700" and sent["Item.json"]["manufacturerID"] == "60"
+    assert sent["Item.json"]["ItemVendorNums"]["ItemVendorNum"][0]["vendorID"] == "700"
+
+
+@pytest.mark.parametrize("overrides, message", [
+    (dict(vendor_id=1), "not both"),
+    (dict(new_vendor=None), "give vendor_id"),
+    (dict(new_vendor={"name": "San Malone LLC"}), "already called 'San Malone'"),
+    (dict(order_id=853), "can't belong to a new vendor"),
+    (dict(lines=[{"new_item": {"description": "Silk Tie Teal", "category_id": 116, "price": 49.95,
+                               "new_brand": "Caravelli"}, "quantity": 1, "unit_cost": 1}]), "already called 'Caravelli'"),
+])
+def test_intake_new_vendor_rules(writer, fake_api, overrides, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.intake_invoice(**{**NEW_VENDOR_INVOICE, **overrides})
+    assert fake_api.requests == []
+
+
+def test_similar_names_need_confirming_in_intake_too(writer):
+    with pytest.raises(RuleViolation, match="allow_similar_names=true"):
+        writer.intake_invoice(**{**NEW_VENDOR_INVOICE, "new_vendor": {"name": "San Malonee"}})
+    assert writer.intake_invoice(**{**NEW_VENDOR_INVOICE, "new_vendor": {"name": "San Malonee"},
+                                    "allow_similar_names": True})["request_count"] >= 5
+
+
 # ---- update_matrix ---------------------------------------------------------------------------------------------
 
 
