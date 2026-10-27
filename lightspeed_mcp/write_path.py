@@ -239,6 +239,7 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "move_category": (MOVE_CATEGORY,),
     "adjust_stock": (ITEM_STOCK,),
     "set_item_tags": (ITEM_TAGS,),
+    "archive_items": (ARCHIVE_ITEM,),
 }
 
 

@@ -1180,57 +1180,121 @@ class InventoryWriter:
 
     # ---- 7. archive one item ---------------------------------------------------------------------
 
+    ARCHIVE_WARNING = ("Lightspeed's docs show an archived item's type becoming non_inventory and its tax false. "
+                       "Unarchiving (archived=false) is possible but may not restore those, so each item's current "
+                       "values are saved in the write log.")
+
+    def _open_orders_by_item(self, item_ids: list[str]) -> dict[str, list[str]]:
+        """{item ID: the unfinished, unarchived purchase orders it is on}."""
+        lines: list[dict] = []
+        for batch in batches(sorted(set(item_ids), key=int)):
+            rows, _ = self.client.get_all("OrderLine.json", {"itemID": id_filter(batch)})
+            lines += rows
+        order_ids = sorted({str(line.get("orderID")) for line in lines if fmt.ref_id(line.get("orderID"))}, key=int)
+        open_ids: set[str] = set()
+        for batch in batches(order_ids):
+            orders, _ = self.client.get_all("Order.json", {"orderID": id_filter(batch), "archived": "true"})
+            open_ids |= {str(o.get("orderID")) for o in orders
+                         if not fmt.flag(o.get("complete")) and not fmt.flag(o.get("archived"))}
+        found: dict[str, list[str]] = {}
+        for line in lines:
+            order_id = str(line.get("orderID"))
+            if order_id in open_ids and order_id not in found.setdefault(str(line.get("itemID")), []):
+                found[str(line.get("itemID"))].append(order_id)
+        return found
+
+    @staticmethod
+    def _archive_request(item: dict, open_orders: list[str]) -> tuple[PlannedRequest, dict]:
+        """The DELETE that archives one item, and its stock by shop. Refuses an archived item, one with any
+        stock (Lightspeed: "If you archive an item with inventory, the inventory will be zeroed out." That
+        can't be undone), and one on an open purchase order."""
+        if fmt.flag(item.get("archived")):
+            raise RuleViolation(f"Refused: {item_label(item)} is already archived.")
+        stock = {str(s.get("shopID")): fmt.integer(s.get("qoh")) or 0
+                 for s in fmt.as_list((item.get("ItemShops") or {}).get("ItemShop"))}
+        if any(stock.values()):
+            raise RuleViolation(
+                f"Refused: {item_label(item)} has stock {fmt.total_qoh(item)}. Archiving zeroes an item's stock in "
+                "Lightspeed, and that can't be undone. Only items with stock exactly 0 are archived here: settle "
+                "the stock first (adjust_stock with set_to 0, or an inventory count), or archive it by hand in "
+                "Lightspeed if that is really intended.")
+        if open_orders:
+            raise RuleViolation(f"Refused: {item_label(item)} is on open purchase order(s) "
+                                f"{', '.join(open_orders)}. Finish those or take the item off them first.")
+        before = {k: item.get(k) for k in (
+            "itemID", "description", "customSku", "itemType", "tax", "taxClassID", "categoryID", "manufacturerID",
+            "defaultVendorID", "itemMatrixID", "defaultCost", "archived", "ItemAttributes", "Prices")
+            if item.get(k) is not None}
+        return (PlannedRequest(f"archive {item_label(item)}", "DELETE", f"Item/{item.get('itemID')}.json", None,
+                               before=before), stock)
+
     def archive_item(self, item_id: int, dry_run: bool = True, confirm_code: str | None = None) -> dict:
         def build() -> Plan:
             item = self._get_record(f"Item/{int(item_id)}.json", "Item",
                                     {"load_relations": relations("ItemShops", "ItemAttributes")})
             if item is None:
                 raise RuleViolation(f"Refused: item {item_id} was not found.")
-            if fmt.flag(item.get("archived")):
-                raise RuleViolation(f"Refused: {item_label(item)} is already archived.")
-
-            # Lightspeed: "If you archive an item with inventory, the inventory will be zeroed out.
-            # This can not be undone." So only items with no stock (and no negative stock) anywhere.
-            stock = {str(s.get("shopID")): fmt.integer(s.get("qoh")) or 0
-                     for s in fmt.as_list((item.get("ItemShops") or {}).get("ItemShop"))}
-            if any(stock.values()):
-                raise RuleViolation(
-                    f"Refused: {item_label(item)} has stock {fmt.total_qoh(item)}. Archiving zeroes an item's stock in "
-                    "Lightspeed, and that can't be undone. Only items with stock exactly 0 are archived here: settle "
-                    "the stock first (adjust_stock with set_to 0, or an inventory count), or archive it by hand in "
-                    "Lightspeed if that is really intended.")
-
-            lines, _ = self.client.get_all("OrderLine.json", {"itemID": str(int(item_id))})
-            order_ids = sorted({str(line.get("orderID")) for line in lines if fmt.ref_id(line.get("orderID"))}, key=int)
-            open_orders = []
-            for batch in batches(order_ids):
-                orders, _ = self.client.get_all("Order.json", {"orderID": id_filter(batch), "archived": "true"})
-                open_orders += [o.get("orderID") for o in orders
-                                if not fmt.flag(o.get("complete")) and not fmt.flag(o.get("archived"))]
-            if open_orders:
-                raise RuleViolation(f"Refused: {item_label(item)} is on open purchase order(s) "
-                                    f"{', '.join(map(str, open_orders))}. Finish those or take the item off them first.")
-
-            warnings = ["Lightspeed's docs show an archived item's type becoming non_inventory and its tax false. "
-                        "Unarchiving (archived=false) is possible but may not restore those, so the item's current "
-                        "values are saved in the write log."]
+            request, stock = self._archive_request(item, self._open_orders_by_item([str(int(item_id))]).get(
+                str(int(item_id)), []))
+            warnings = [self.ARCHIVE_WARNING]
             matrix_id = fmt.ref_id(item.get("itemMatrixID"))
             if matrix_id:
                 warnings.append(f"The item is in matrix {matrix_id}; the matrix and its other items are not touched.")
-            before = {k: item.get(k) for k in (
-                "itemID", "description", "customSku", "itemType", "tax", "taxClassID", "categoryID", "manufacturerID",
-                "defaultVendorID", "itemMatrixID", "defaultCost", "archived", "ItemAttributes", "Prices")
-                if item.get(k) is not None}
             summary = (f"Archive {item_label(item)}. Its stock is 0, so no stock is lost, and it is on no open PO. "
                        "Lightspeed hides archived items from sales and searches. Only this one item is archived, "
                        "never a matrix.")
-            return Plan("archive_item", summary,
-                        [PlannedRequest(f"archive {item_label(item)}", "DELETE", f"Item/{int(item_id)}.json", None,
-                                        before=before)],
-                        warnings,
+            return Plan("archive_item", summary, [request], warnings,
                         basis={"itemID": item.get("itemID"), "timeStamp": item.get("timeStamp"), "stock": stock})
 
         return self._run("archive_item", dry_run, confirm_code, build)
+
+    def _archives_confirmed(self) -> bool:
+        """Has an archive ever come back done? Until one has, archive_items takes one item per call."""
+        return any(e.get("tool") in ("archive_item", "archive_items") and e.get("event") == "done"
+                   for e in self.writes.write_log.entries())
+
+    def archive_items(self, item_ids: list[int], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        """archive_item for many items in one approval (the migration's old placeholders and legacy items),
+        each with the same checks. Never a matrix."""
+
+        def build() -> Plan:
+            if not item_ids:
+                raise RuleViolation("Refused: give at least one item.")
+            first = not self._archives_confirmed()
+            limit = 1 if first else MAX_REQUESTS_PER_CALL
+            if len(item_ids) > limit:
+                raise RuleViolation(
+                    f"Refused: {len(item_ids)} items; the limit is {limit} per call"
+                    + (". Until one archive has been done and checked, it is one item per call." if first else "."))
+            ids = [str(int(i)) for i in item_ids]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            found = self._items_by_id(ids)
+            missing = [i for i in ids if i not in found]
+            if missing:
+                raise RuleViolation(f"Refused: item(s) {', '.join(missing)} not found.")
+            open_orders = self._open_orders_by_item(ids)
+            requests, basis = [], {}
+            for item_id in ids:
+                item = found[item_id]
+                request, stock = self._archive_request(item, open_orders.get(item_id, []))
+                requests.append(request)
+                basis[item_id] = {"timeStamp": item.get("timeStamp"), "stock": stock}
+            warnings = [self.ARCHIVE_WARNING]
+            in_matrices = sorted({fmt.ref_id(found[i].get("itemMatrixID")) for i in ids} - {None})
+            if in_matrices:
+                warnings.append(f"Some items are in matrices ({', '.join(map(str, in_matrices))}); the matrices and "
+                                "their other items are not touched.")
+            summary = (f"Archive {len(requests)} item(s), as listed. Each has stock 0, so no stock is lost, and is on "
+                       "no open PO. Lightspeed hides archived items from sales and searches; their sales history "
+                       "stays. Items only, never a matrix.")
+            after = None
+            if first:
+                after = ("This is the first archive through the API. Take a snapshot before (take_snapshot) and compare "
+                         "after (compare_snapshots) to check what Lightspeed changed on the item.")
+            return Plan("archive_items", summary, requests, warnings, after, basis={"items": basis})
+
+        return self._run("archive_items", dry_run, confirm_code, build)
 
     # ---- 8. create items outside any matrix -------------------------------------------------------
 

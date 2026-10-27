@@ -270,3 +270,52 @@ def test_tag_rules(writer, fake_api, entry, message):
     with pytest.raises(RuleViolation, match=message):
         writer.set_item_tags([entry])
     assert fake_api.requests == []
+
+
+# ---- archive_items ------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def archived_once(write_log):
+    """A first archive has been done and checked."""
+    write_log.append({"write_id": "x", "tool": "archive_item", "event": "done", "status": 200})
+
+
+def test_first_batch_archive_is_one_item(writer):
+    result = writer.archive_items([1345])
+    [request] = result["requests"]
+    assert request["method"] == "DELETE" and request["path"].endswith("/Item/1345.json") and request["body"] is None
+    assert "first archive" in result["after"]
+    with pytest.raises(RuleViolation, match="one item per call"):
+        writer.archive_items([1345, 2321])
+
+
+def test_batch_archive_after_the_first(writer, archived_once, fake_api, write_log, write_switch):
+    turn_on(write_switch)
+    code = writer.archive_items([1345, 2321])["confirm_code"]
+    result = writer.archive_items([1345, 2321], dry_run=False, confirm_code=code)
+    assert result["finished"] is True
+    assert [(r.method, r.url.path.rsplit("/", 1)[1]) for r in fake_api.requests] == [("DELETE", "1345.json"),
+                                                                                       ("DELETE", "2321.json")]
+    befores = [e["before"]["itemID"] for e in write_log.entries() if e["event"] == "sending"]
+    assert befores == ["1345", "2321"]                                  # each item's values logged first
+
+
+@pytest.mark.parametrize("ids, message", [
+    ([1345, 1644], "has stock -27"),                 # one item with stock refuses the whole call
+    ([1345, 1700], "already archived"),
+    ([1345, 99999], "99999 not found"),
+    ([1345, 1345], "listed twice"),
+    ([], "at least one"),
+])
+def test_batch_archive_rules(writer, archived_once, fake_api, ids, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.archive_items(ids)
+    assert fake_api.requests == []
+
+
+def test_batch_archive_refuses_an_item_on_an_open_po(writer, reads, archived_once):
+    reads.data["OrderLine"].append({"orderLineID": "13", "orderID": "854", "itemID": "1345", "quantity": "1",
+                                    "numReceived": "0", "checkedIn": "0", "price": "60"})
+    with pytest.raises(RuleViolation, match="open purchase order"):
+        writer.archive_items([2321, 1345])

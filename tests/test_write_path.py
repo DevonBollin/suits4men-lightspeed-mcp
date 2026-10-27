@@ -81,7 +81,8 @@ def test_exactly_these_write_tools():
         "update_matrix", "create_vendor", "create_brand", "update_item_prices", "set_reorder_levels",
         "archive_purchase_order", "correct_vendor_numbers", "update_vendor", "archive_vendor", "rename_brand",
         "create_category", "rename_category", "delete_category", "create_inventory_count", "create_attribute_set",
-        "update_attribute_set", "reassign_items", "set_upcs", "move_category", "adjust_stock", "set_item_tags"}
+        "update_attribute_set", "reassign_items", "set_upcs", "move_category", "adjust_stock", "set_item_tags",
+        "archive_items"}
 
 
 def test_attribute_sets_send_names_only_and_are_never_deleted():
@@ -102,7 +103,8 @@ def test_vendors_and_brands_send_only_names_and_brands_are_never_deleted():
 def test_deletes_are_limited_to_these():
     """Archive one item, PO or vendor; remove an unreceived PO line; delete an empty category. Nothing else."""
     deletes = {(tool, r.path.pattern) for tool, r in all_routes() if r.method == "DELETE"}
-    assert deletes == {("archive_item", r"Item/\d+\.json"), ("remove_po_lines", r"OrderLine/\d+\.json"),
+    assert deletes == {("archive_item", r"Item/\d+\.json"), ("archive_items", r"Item/\d+\.json"),
+                       ("remove_po_lines", r"OrderLine/\d+\.json"),
                        ("archive_purchase_order", r"Order/\d+\.json"), ("archive_vendor", r"Vendor/\d+\.json"),
                        ("delete_category", r"Category/\d+\.json")}
     for path in ("ItemMatrix/7.json", "ItemAttributeSet/5.json", "Manufacturer/1.json", "Item.json", "OrderLine.json",
@@ -184,7 +186,7 @@ def only_route(tool):
 
 def test_the_only_delete_archives_one_item():
     deletes = [(tool, r) for tool, r in all_routes() if r.method == "DELETE" and r.path.fullmatch("Item/1345.json")]
-    assert [tool for tool, _ in deletes] == ["archive_item"]
+    assert [tool for tool, _ in deletes] == ["archive_item", "archive_items"]
     route = only_route("archive_item")
     assert route.fields == frozenset()
     for path in ("Item.json", "ItemMatrix/7.json", "OrderLine/1.json", "Order/853.json", "Item/1345/Image.json"):

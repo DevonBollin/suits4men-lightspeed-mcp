@@ -710,6 +710,19 @@ def archive_item(
     return run(lambda w: w.archive_item(item_id, dry_run, confirm_code), writer)
 
 
+@write_tool
+def archive_items(
+    item_ids: Annotated[list[int], Field(description="The items to archive (max 100; one until a first archive has been checked).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Archive many items in one approval, e.g. old placeholders and legacy items after their stock
+    is settled. Each item gets archive_item's checks: stock exactly 0 (adjust_stock with set_to 0
+    first) and on no open purchase order; any item that fails refuses the whole call. Items only:
+    matrices can never be archived with this server. Each item's values are saved in the write log."""
+    return run(lambda w: w.archive_items(item_ids, dry_run, confirm_code), writer)
+
+
 class NewItem(NewItemDetails):
     vendor_id: Annotated[int, Field(description="Default vendor (list_vendors).")]
     cost: Annotated[float, Field(description="Default cost.")]

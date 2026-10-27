@@ -115,6 +115,7 @@ DRY_RUNS = [
     ("move_category", {"category_id": 84}),                 # Suits/Tuxedos to the top level
     ("adjust_stock", {"items": [{"item_id": 1644, "change": 1}], "reason": "Dry run: one found in the back"}),
     ("set_item_tags", {"items": [{"item_id": 1345, "add": ["poly-viscose"]}]}),
+    ("archive_items", {"item_ids": [1345]}),                # one item until a first archive is checked
 ]
 
 
