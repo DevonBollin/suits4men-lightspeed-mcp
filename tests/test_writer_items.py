@@ -319,3 +319,49 @@ def test_batch_archive_refuses_an_item_on_an_open_po(writer, reads, archived_onc
                                     "numReceived": "0", "checkedIn": "0", "price": "60"})
     with pytest.raises(RuleViolation, match="open purchase order"):
         writer.archive_items([2321, 1345])
+
+
+# ---- new variants take the tags their matrix's items share ---------------------------------------------------
+
+
+@pytest.fixture
+def tagged(reads):
+    """Matrix 7's active items (1644, 1345, 1346) all have 'poly-viscose'; two also have 'stretch'."""
+    by_id = {i["itemID"]: i for i in reads.data["Item"]}
+    by_id["1644"]["Tags"] = {"tag": ["poly-viscose", "stretch"]}
+    by_id["1345"]["TagRelations"] = {"TagRelation": [{"Tag": {"name": "stretch"}}, {"Tag": {"name": "poly-viscose"}}]}
+    by_id["1346"]["Tags"] = {"tag": "poly-viscose"}
+    return reads
+
+
+@pytest.fixture
+def tags_confirmed(write_log):
+    write_log.append({"write_id": "x", "tool": "set_item_tags", "event": "done", "status": 200})
+
+
+NEW_VARIANT = [{"color": "Cobalt", "size": "44R", "fit": "Slim", "custom_sku": "013471"}]
+
+
+def test_new_variants_take_the_tags_every_sibling_has(writer, tagged, tags_confirmed):
+    result = writer.add_matrix_variants(7, NEW_VARIANT, price=599.95, cost=63.5)
+    assert result["requests"][0]["body"]["Tags"] == {"tag": ["poly-viscose"]}
+    assert "tags poly-viscose from its other items" in result["summary"]
+
+
+def test_before_a_first_tag_write_the_tags_are_only_named(writer, tagged):
+    result = writer.add_matrix_variants(7, NEW_VARIANT, price=599.95, cost=63.5)
+    assert "Tags" not in result["requests"][0]["body"]
+    assert any("tags poly-viscose; new items will get them automatically" in w for w in result["warnings"])
+
+
+def test_untagged_siblings_give_no_tags(writer, tags_confirmed):
+    result = writer.add_matrix_variants(7, NEW_VARIANT, price=599.95, cost=63.5)
+    assert "Tags" not in result["requests"][0]["body"]
+
+
+def test_intake_new_variants_take_sibling_tags(writer, tagged, tags_confirmed):
+    result = writer.intake_invoice(vendor_id=1, invoice_number="INV-TAGS", lines=[
+        {"matrix_id": 7, "color": "Cobalt", "size": "44R", "fit": "Slim", "quantity": 1, "unit_cost": 63.5,
+         "price": 599.95}])
+    item = next(r for r in result["requests"] if r["path"].endswith("/Item.json"))
+    assert item["body"]["Tags"] == {"tag": ["poly-viscose"]}

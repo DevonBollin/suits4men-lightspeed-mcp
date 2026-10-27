@@ -540,12 +540,30 @@ class InventoryWriter:
                 attributes[f"attribute{i}"] = value
         return attributes
 
+    def _sibling_tags(self, children: list[dict], warnings: list[str]) -> list[str]:
+        """The tags every active item of a matrix shares (fabric, finish, ...): new variants take them, the way
+        the draft keeps tags at the matrix level. Until a first tag write has been checked, they are only
+        named in a warning, so an unconfirmed tag format can't make the new items fail."""
+        active = [c for c in children if not fmt.flag(c.get("archived"))]
+        if not active:
+            return []
+        shared = self._item_tags(active[0])
+        for child in active[1:]:
+            theirs = {t.lower() for t in self._item_tags(child)}
+            shared = [t for t in shared if t.lower() in theirs]
+        if shared and not self._tags_confirmed():
+            warnings.append(f"The matrix's items all have the tags {', '.join(shared)}; new items will get them "
+                            "automatically once a first tag write (set_item_tags) has been checked. Until then, tag "
+                            "them with set_item_tags.")
+            return []
+        return shared
+
     @classmethod
     def _variant_body(cls, matrix: dict, matrix_desc: str, values: tuple[str, str, str], sku: str, cost_text: str,
-                      price_text: str, upc: str | None = None) -> dict:
+                      price_text: str, upc: str | None = None, tags: list[str] | None = None) -> dict:
         """The POST Item.json body for a new item in a matrix: '<matrix description> <values>' (for set 5:
-        color, size, fit), the given SKU, cost, Default price and UPC (if any), and the matrix's category,
-        vendor, manufacturer and tax."""
+        color, size, fit), the given SKU, cost, Default price, UPC and tags (if any), and the matrix's
+        category, vendor, manufacturer and tax."""
         attributes = cls._item_attributes(matrix, values)
         body = {
             "description": " ".join(p for p in (matrix_desc, *values) if p),
@@ -558,6 +576,8 @@ class InventoryWriter:
         }
         if upc:
             body["upc"] = upc
+        if tags:
+            body["Tags"] = {"tag": list(tags)}
         for key in ("categoryID", "manufacturerID", "defaultVendorID", "taxClassID"):
             if fmt.ref_id(matrix.get(key)):
                 body[key] = str(matrix.get(key))
@@ -660,7 +680,8 @@ class InventoryWriter:
             seen.add(key)
 
         children, _ = self.client.get_all("Item.json", {
-            "itemMatrixID": str(int(matrix_id)), "archived": "true", "load_relations": relations("ItemAttributes")})
+            "itemMatrixID": str(int(matrix_id)), "archived": "true",
+            "load_relations": relations("ItemAttributes", "Tags", "TagRelations")})
         existing = {}
         for c in children:
             attrs = c.get("ItemAttributes") or {}
@@ -840,17 +861,19 @@ class InventoryWriter:
             if common is not None and abs(common - float(price_text)) > 0.001:
                 warnings.append(f"Most items in this matrix sell at {common:.2f}; these would sell at {price_text}.")
 
+            tags = self._sibling_tags(children, warnings)
             requests = []
             for (*values, sku), upc in zip(cleaned, upcs):
-                body = self._variant_body(matrix, matrix_desc, tuple(values), sku, cost_text, price_text, upc)
+                body = self._variant_body(matrix, matrix_desc, tuple(values), sku, cost_text, price_text, upc, tags)
                 requests.append(PlannedRequest(f"create '{body['description']}' (SKU {sku}"
                                                + (f", UPC {upc})" if upc else ")"), "POST", "Item.json", body))
 
             summary = (f"Create {len(requests)} new item(s) in matrix {matrix_id} '{matrix_desc}'"
                        + (f" ({garment.name}, sizes {rules.SIZE_FORMATS[garment.size][1]})" if garment and garment.size else "")
                        + f", each with its own custom SKU, cost {cost_text} and Default price {price_text}. "
-                         "Category, vendor, manufacturer and tax come from the matrix. Stock starts at 0. "
-                         "The matrix itself, its price and its other items are not changed.")
+                         "Category, vendor, manufacturer and tax come from the matrix"
+                       + (f"; tags {', '.join(tags)} from its other items" if tags else "")
+                       + ". Stock starts at 0. The matrix itself, its price and its other items are not changed.")
             return Plan("add_matrix_variants", summary, requests, warnings)
 
         return self._run("add_matrix_variants", dry_run, confirm_code, build)
@@ -1656,15 +1679,15 @@ class InventoryWriter:
             new_matches = [m for m in matches if m.status != "existing"]
             skus = self._sku_allocator([m.line.get("custom_sku") or (m.line.get("new_item") or {}).get("custom_sku")
                                         for m in new_matches])
-            matrix_info: dict[str, tuple[dict, str]] = {}
+            matrix_info: dict[str, tuple[dict, str, list[str]]] = {}  # matrix, description, tags new items take
             for mid in dict.fromkeys(str(m.matrix.get("itemMatrixID")) for m in matches if m.status == "new_variant"):
                 matrix, matrix_desc, garment, slots = self._target_matrix(mid)
                 group = [m for m in matches if m.status == "new_variant" and str(m.matrix.get("itemMatrixID")) == mid]
                 # m.values are already by slot; color/size/fit stand for slots 1/2/3 in any set.
                 combos = [self._clean_values({"color": m.values[0], "size": m.values[1], "fit": m.values[2]},
                                              f"line {m.number}", slots) for m in group]
-                self._check_matrix_values(mid, matrix, garment, combos, warnings, slots)
-                matrix_info[mid] = (matrix, matrix_desc)
+                children = self._check_matrix_values(mid, matrix, garment, combos, warnings, slots)
+                matrix_info[mid] = (matrix, matrix_desc, self._sibling_tags(children, warnings))
             tax = self._tax_fields(warnings) if any(m.status == "new_item" for m in matches) else {}
             taken_desc = self._active_descriptions(skus)
             matrices = self._all_matrices() if any(m.status == "new_item" for m in matches) else []
@@ -1686,13 +1709,13 @@ class InventoryWriter:
                         warnings.append(f"Line {m.number}: vendor number not saved. {str(e).removeprefix('Refused: ')}")
                 upc = rules.clean(m.line.get("upc"))
                 if m.status == "new_variant":
-                    matrix, matrix_desc = matrix_info[str(m.matrix.get("itemMatrixID"))]
+                    matrix, matrix_desc, tags = matrix_info[str(m.matrix.get("itemMatrixID"))]
                     if m.line.get("price") is None:
                         raise RuleViolation(f"Refused: line {m.number} is a new item in matrix "
                                             f"{matrix.get('itemMatrixID')} '{matrix_desc}': give its selling price.")
                     body = self._variant_body(matrix, matrix_desc, m.values, skus.take(m.line.get("custom_sku")), cost,
                                               money(m.line["price"], f"line {m.number} price"),
-                                              rules.check_upc(upc) if upc else None)
+                                              rules.check_upc(upc) if upc else None, tags)
                 elif m.status == "new_item":
                     entry = {**m.line["new_item"], "cost": m.line.get("unit_cost"), "vendor_ref": vendor_ref}
                     entry["custom_sku"] = entry.get("custom_sku") or m.line.get("custom_sku")

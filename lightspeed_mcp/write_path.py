@@ -118,7 +118,8 @@ UPDATE_MATRIX = Route("PUT", re.compile(r"ItemMatrix/\d+\.json"),
                       frozenset({"description", "categoryID", "manufacturerID", "defaultVendorID", "defaultCost",
                                  "Prices"}))
 NEW_MATRIX_ITEM = Route("POST", re.compile(r"Item\.json"),
-                        frozenset(ITEM_FIELDS | {"itemMatrixID", "customSku", "upc", "ItemAttributes", "ItemVendorNums"}))
+                        frozenset(ITEM_FIELDS | {"itemMatrixID", "customSku", "upc", "ItemAttributes", "ItemVendorNums",
+                                                 "Tags"}))
 ITEM_SKU_COST_DESCRIPTION = Route("PUT", re.compile(r"Item/\d+\.json"),
                                   frozenset({"customSku", "defaultCost", "description"}))  # never prices or stock
 # Put an existing item into a matrix: its matrix, Color/Size/Fit, and (optionally) the
