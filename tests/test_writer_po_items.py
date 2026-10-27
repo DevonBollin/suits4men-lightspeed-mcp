@@ -226,11 +226,21 @@ def test_vendor_number_payload_keeps_existing_numbers(writer, numbered):
         {"vendorID": "1", "value": "CV-50SC", "cost": "63.50"}]}}
 
 
+def test_one_style_code_on_many_items(writer, numbered):
+    """Renoir prints '201-19' for every size and fit of a style and color: it may go on all of them."""
+    result = writer.set_vendor_numbers(1, [{"item_id": 1644, "vendor_number": "cv-40rc"},
+                                           {"item_id": 1345, "vendor_number": "CV-40RC"}])
+    assert [r["body"]["ItemVendorNums"]["ItemVendorNum"][-1]["value"] for r in result["requests"]] == [
+        "cv-40rc", "CV-40RC"]
+    # Already on item 1346: noted once, not refused.
+    [note] = [w for w in result["warnings"] if "also on" in w]
+    assert "item 1346" in note and "matched by matrix" in note
+
+
 @pytest.mark.parametrize("items, message", [
-    ([{"item_id": 1644, "vendor_number": "cv-40rc"}], "already on item 1346"),    # one number, one item
-    ([{"item_id": 1346, "vendor_number": "CV-NEW"}], "already has vendor number 'CV-40RC'"),
-    ([{"item_id": 1644, "vendor_number": "A"}, {"item_id": 1345, "vendor_number": "a"}], "two items"),
+    ([{"item_id": 1346, "vendor_number": "CV-NEW"}], "already has vendor number 'CV-40RC'"),  # one per vendor
     ([{"item_id": 1644, "vendor_number": " "}], "blank"),
+    ([{"item_id": 1644, "vendor_number": "A"}, {"item_id": 1644, "vendor_number": "B"}], "listed twice"),
 ])
 def test_vendor_number_rules(writer, numbered, items, message):
     with pytest.raises(RuleViolation, match=message):
@@ -315,12 +325,13 @@ def test_intake_without_receiving(writer):
     assert "receivedDate" not in result["requests"][-1]["body"]
 
 
-def test_style_numbers_on_several_lines_are_not_saved(writer):
+def test_style_codes_on_several_lines_are_saved_on_each_item(writer):
     result = writer.intake_invoice(vendor_id=1, invoice_number="INV-7002", lines=[
         {"item_id": 1345, "quantity": 1, "unit_cost": 63.5, "vendor_number": "CV-STYLE"},
         {"item_id": 1644, "quantity": 1, "unit_cost": 63.5, "vendor_number": "CV-STYLE"}])
-    assert not any("ItemVendorNums" in (r["body"] or {}) for r in result["requests"])
-    assert any("style number" in w and "cv-style" in w for w in result["warnings"])
+    saved = {r["path"].rsplit("/", 1)[1]: r["body"]["ItemVendorNums"]["ItemVendorNum"][-1]["value"]
+             for r in result["requests"] if "ItemVendorNums" in (r["body"] or {})}
+    assert saved == {"1345.json": "CV-STYLE", "1644.json": "CV-STYLE"}
 
 
 @pytest.mark.parametrize("overrides, message", [

@@ -49,9 +49,13 @@ def test_correction_keeps_the_record_id_cost_and_other_vendors(writer, numbered)
         {"itemVendorNumID": "9", "vendorID": "21", "value": "OTHER-1"}]}}
 
 
+def test_correction_to_a_code_other_items_share_is_allowed(writer, numbered):
+    result = writer.correct_vendor_numbers(1, [{"item_id": 1346, "vendor_number": "CV-42RS"}])  # 1644's number
+    assert result["requests"][0]["body"]["ItemVendorNums"]["ItemVendorNum"][0]["value"] == "CV-42RS"
+
+
 @pytest.mark.parametrize("items, message", [
     ([{"item_id": 1345, "vendor_number": "X"}], "has no vendor number for this vendor"),
-    ([{"item_id": 1346, "vendor_number": "CV-42RS"}], "already on item 1644"),
     ([{"item_id": 1346, "vendor_number": "CV-40RC"}], "already has vendor number"),
     ([{"item_id": 1346, "vendor_number": ""}], "can't be blank"),
 ])

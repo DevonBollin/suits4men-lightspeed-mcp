@@ -158,6 +158,7 @@ class InvoiceMatcher:
                 return LineMatch(number, line, "unresolved", reason=f"Item {line['item_id']} was not found.")
             return found(item)
 
+        spans: list[int] = []  # the matrices a shared vendor number is used in, when more than one
         if vendor_number:
             by_number = self.with_vendor_number(vendor_id, vendor_number)
             if len(by_number) == 1 and not given:
@@ -173,6 +174,8 @@ class InvoiceMatcher:
                     matrix_ids = {fmt.ref_id(i.get("itemMatrixID")) for i in by_number} - {None}
                     if len(matrix_ids) == 1:  # the number belongs to one matrix: look for the variant there
                         line = {**line, "matrix_id": matrix_ids.pop()}
+                    else:  # one fabric code on suits, vests, pants...: the garment type decides
+                        spans = sorted(matrix_ids)
 
         if line.get("matrix_id") is not None:
             matrix = self.matrix(line["matrix_id"])
@@ -198,6 +201,11 @@ class InvoiceMatcher:
         given_values = [clean(v) for v in (line.get("values") or {}).values()]
         text = " ".join(p for p in (clean(line.get("description")), vendor_number,
                                     *(clean(line.get(k)) for k in LEGACY_FIELDS.values()), *given_values) if p)
+        if len(spans) > 1:
+            names = ", ".join(f"{mid} '{fmt.text((self.matrix(mid) or {}).get('description'))}'" for mid in spans)
+            return LineMatch(number, line, "unresolved", candidates=self.candidates(text),
+                             reason=f"Vendor number {vendor_number} is used in matrices {names}: give the matrix_id "
+                                    "for this line's garment type, with its attribute values.")
         return LineMatch(number, line, "unresolved", candidates=self.candidates(text),
                          reason="Not matched: give item_id, a matrix_id with its attribute values (e.g. "
                                 "color/size/fit), or new_item. Candidates by description are listed.")

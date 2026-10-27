@@ -46,6 +46,17 @@ def test_vendor_number_points_to_its_matrix_for_a_new_variant(reads):
     assert m.status == "new_variant" and m.matrix["itemMatrixID"] == "7" and m.values == ("Cobalt", "44R", "Slim")
 
 
+def test_a_code_used_in_several_matrices_asks_for_the_garment_type(reads):
+    """One fabric code on the suits and the pants: the line's matrix decides."""
+    by_id = {i["itemID"]: i for i in reads.data["Item"]}
+    by_id["1801"]["ItemVendorNums"] = {"ItemVendorNum": [{"vendorID": "1", "value": "CV-100"}]}  # Caravelli Pants
+    [m] = match(reads, {"vendor_number": "CV-100", "color": "Black", "size": "36", "quantity": 1, "unit_cost": 30})
+    assert m.status == "unresolved" and "matrices 7 'Caravelli', 12 'Caravelli Pants'" in m.reason
+    [m] = match(reads, {"vendor_number": "CV-100", "matrix_id": 12, "color": "Black", "size": "34",
+                        "quantity": 1, "unit_cost": 30})
+    assert m.status == "existing" and m.item["itemID"] == "1801"
+
+
 def test_by_matrix_and_values_ignoring_case(reads):
     [m] = match(reads, {"matrix_id": 7, "color": "black", "size": "42r", "fit": "slim", "quantity": 1, "unit_cost": 63.5})
     assert m.status == "existing" and m.item["itemID"] == "1644" and not m.vendor_number_known

@@ -523,30 +523,36 @@ class InventoryWriter:
         return body
 
     # ---- vendor item numbers (Lightspeed's "Vendor ID" on an item; one per vendor) -----------------
+    # A vendor prints one code for a whole style and color (Renoir "201-19"), so the same number may be
+    # on every size and fit, and on the suit, vest and pants cut from that fabric. Invoices are matched by
+    # matrix and attribute values (intake.py), not by the number alone. The cost: Lightspeed's own
+    # lookups by Vendor ID (PO import) find several items for such a number.
 
-    def _vendor_number_holder(self, vendor_id, value: str, items: list[dict] | None = None) -> dict | None:
-        """The item (archived too) that already has this vendor number for this vendor, if any."""
+    def _vendor_number_holders(self, vendor_id, value: str, items: list[dict] | None = None) -> list[dict]:
+        """The items (archived too) that already have this vendor number for this vendor."""
         if items is None:
             items, _ = self.client.get_all("Item.json", {
                 "ItemVendorNums.value": value, "archived": "true", "load_relations": relations("ItemVendorNums")},
                 max_records=20)
-        for item in items:
-            for v in intake.vendor_numbers(item):
-                if str(v.get("vendorID")) == str(vendor_id) and (fmt.text(v.get("value")) or "").lower() == value.lower():
-                    return item
-        return None
+        return [item for item in items
+                if any(str(v.get("vendorID")) == str(vendor_id) and (fmt.text(v.get("value")) or "").lower() == value.lower()
+                       for v in intake.vendor_numbers(item))]
 
-    def _check_vendor_number(self, vendor_id, value: str, item: dict | None, items: list[dict] | None = None) -> str:
-        """Refuse a number another item already has for this vendor, or a second number for one vendor on an item."""
+    def _check_vendor_number(self, vendor_id, value: str, item: dict | None, items: list[dict] | None = None,
+                             warnings: list[str] | None = None) -> str:
+        """Refuse a blank number, or a second number for one vendor on an item. With `warnings`, note the
+        other items that share the number."""
         value = rules.clean(value)
         if not value:
             raise RuleViolation("Refused: a vendor number can't be blank.")
-        holder = self._vendor_number_holder(vendor_id, value, items)
-        if holder and (item is None or str(holder.get("itemID")) != str(item.get("itemID"))):
-            raise RuleViolation(
-                f"Refused: vendor number '{value}' is already on {item_label(holder)} for this vendor. Each vendor "
-                "number must belong to one item (Lightspeed's receive-by-Vendor-ID stops working otherwise), so a "
-                "style number shared by every size or color can't be saved as a vendor number.")
+        if warnings is not None:
+            others = [h for h in self._vendor_number_holders(vendor_id, value, items)
+                      if item is None or str(h.get("itemID")) != str(item.get("itemID"))]
+            if others:
+                warnings.append(f"Vendor number '{value}' is also on {len(others)}{'+' if len(others) >= 20 else ''} "
+                                f"other item(s) for this vendor, e.g. {item_label(others[0])}: a code shared by sizes, "
+                                "fits or garments. Invoices are matched by matrix and color/size/fit, not by the code "
+                                "alone.")
         for v in intake.vendor_numbers(item or {}):
             if str(v.get("vendorID")) == str(vendor_id) and (fmt.text(v.get("value")) or "").lower() != value.lower():
                 raise RuleViolation(f"Refused: {item_label(item)} already has vendor number '{fmt.text(v.get('value'))}' "
@@ -1379,18 +1385,18 @@ class InventoryWriter:
             numbers = [rules.clean(entry.get("vendor_number")) for entry in items]
             if len(set(ids)) != len(ids):
                 raise RuleViolation("Refused: the same item is listed twice.")
-            if len({n.lower() for n in numbers}) != len(numbers):
-                raise RuleViolation("Refused: the same vendor number is listed for two items. Each vendor number must "
-                                    "belong to one item.")
             found = self._items_by_id(ids)
-            requests = []
+            requests, warnings = [], []
+            noted: set[str] = set()  # each shared number is noted once, not once per item
             for item_id, number in zip(ids, numbers):
                 item = found.get(item_id)
                 if item is None:
                     raise RuleViolation(f"Refused: item {item_id} was not found.")
                 if fmt.flag(item.get("archived")):
                     raise RuleViolation(f"Refused: {item_label(item)} is archived.")
-                number = self._check_vendor_number(vendor_id, number, item)
+                number = self._check_vendor_number(vendor_id, number, item,
+                                                   warnings=None if number.lower() in noted else warnings)
+                noted.add(number.lower())
                 if any(str(v.get("vendorID")) == str(vendor_id) for v in intake.vendor_numbers(item)):
                     raise RuleViolation(f"Refused: {item_label(item)} already has vendor number {number}.")
                 requests.append(PlannedRequest(f"{item_label(item)}: vendor number {number}", "PUT", f"Item/{item_id}.json",
@@ -1398,7 +1404,7 @@ class InventoryWriter:
             summary = (f"Save {fmt.text(vendor.get('name'))}'s own item number on {len(requests)} item(s) (Lightspeed's "
                        "Vendor ID field), so their invoices match these items. Any vendor numbers the items already "
                        "have are sent back unchanged. Nothing else on the items changes.")
-            return Plan("set_vendor_numbers", summary, requests)
+            return Plan("set_vendor_numbers", summary, requests, warnings)
 
         return self._run("set_vendor_numbers", dry_run, confirm_code, build)
 
@@ -1531,18 +1537,6 @@ class InventoryWriter:
             taken_desc = self._active_descriptions(skus)
             matrices = self._all_matrices() if any(m.status == "new_item" for m in matches) else []
 
-            # Vendor numbers printed on several lines are style numbers shared by sizes or colors:
-            # Lightspeed's Vendor ID must belong to one item, so those are not saved.
-            printed: dict[str, int] = {}
-            for m in matches:
-                number = rules.clean(m.line.get("vendor_number")).lower()
-                if number:
-                    printed[number] = printed.get(number, 0) + 1
-            shared = sorted(n for n, count in printed.items() if count > 1)
-            if save_vendor_numbers and shared:
-                warnings.append(f"Not saved as vendor numbers (each is on several lines, so it's a style number): "
-                                f"{', '.join(shared)}.")
-
             item_refs: dict[int, str] = {}
             costs: dict[int, tuple[int, str]] = {}
             numbers_saved = 0
@@ -1552,7 +1546,7 @@ class InventoryWriter:
                 costs[m.number] = (qty, cost)
                 number = rules.clean(m.line.get("vendor_number"))
                 save_number = False
-                if save_vendor_numbers and number and number.lower() not in shared and not m.vendor_number_known:
+                if save_vendor_numbers and number and not m.vendor_number_known:
                     try:
                         self._check_vendor_number(vendor_ref, number, m.item, matcher.items)
                         save_number = True
@@ -2035,8 +2029,8 @@ class InventoryWriter:
             vendor = self._active_vendor(vendor_id)
             ids = [str(int(entry.get("item_id"))) for entry in items]
             numbers = [rules.clean(entry.get("vendor_number")) for entry in items]
-            if len(set(ids)) != len(ids) or len({n.lower() for n in numbers}) != len(numbers):
-                raise RuleViolation("Refused: the same item or the same vendor number is listed twice.")
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
             found = self._items_by_id(ids)
             requests = []
             for item_id, number in zip(ids, numbers):
@@ -2052,10 +2046,6 @@ class InventoryWriter:
                     raise RuleViolation("Refused: a vendor number can't be blank (removing one isn't supported).")
                 if number.lower() == old.lower() and number == old:
                     raise RuleViolation(f"Refused: {item_label(item)} already has vendor number {number}.")
-                holder = self._vendor_number_holder(vendor_id, number)
-                if holder and str(holder.get("itemID")) != item_id:
-                    raise RuleViolation(f"Refused: vendor number '{number}' is already on {item_label(holder)}. Each "
-                                        "vendor number must belong to one item.")
                 records = []
                 for v in intake.vendor_numbers(item):
                     record = {k: v.get(k) for k in ("itemVendorNumID", "vendorID", "value", "cost")

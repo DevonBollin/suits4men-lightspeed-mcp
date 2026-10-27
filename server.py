@@ -781,7 +781,7 @@ def remove_po_lines(
 
 class VendorNumber(BaseModel):
     item_id: Annotated[int, Field(description="The item.")]
-    vendor_number: Annotated[str, Field(description="The vendor's own number for exactly this item.")]
+    vendor_number: Annotated[str, Field(description="The vendor's own number or style code for this item, as printed on its invoices.")]
 
 
 @write_tool
@@ -792,8 +792,10 @@ def set_vendor_numbers(
     confirm_code: ConfirmCode = None,
 ) -> str:
     """Save a vendor's own item number on items (Lightspeed's Vendor ID field, one per vendor per
-    item), so that vendor's invoices match them. Each number must belong to one item: a style number
-    shared by all sizes or colors is refused. Existing vendor numbers are kept."""
+    item), so that vendor's invoices match them. The same number may go on many items: vendors print
+    one code for a style and color (e.g. Renoir '201-19') across every size and fit, and across the
+    suit, vest and pants of one fabric; invoices are then matched by matrix and color/size/fit. Warns
+    when a number is already on other items. Existing vendor numbers are kept."""
     return run(lambda w: w.set_vendor_numbers(vendor_id, [i.model_dump() for i in items], dry_run, confirm_code),
                writer)
 
@@ -810,7 +812,7 @@ def intake_invoice(
     other_cost: Annotated[float | None, Field(description="Other charges on the document.")] = None,
     order_id: Annotated[int | None, Field(description="An existing unfinished PO this document belongs to; empty = create one.")] = None,
     mark_received: Annotated[bool, Field(description="True (default): the goods are here; mark each line received and put the PO in Check In.")] = True,
-    save_vendor_numbers: Annotated[bool, Field(description="Save each line's vendor number on its item when it belongs to that item alone.")] = True,
+    save_vendor_numbers: Annotated[bool, Field(description="Save each line's vendor number on its item, unless the item already has one for this vendor. Shared style codes are saved on every item they're printed for.")] = True,
     dry_run: DryRun = True,
     confirm_code: ConfirmCode = None,
 ) -> str:

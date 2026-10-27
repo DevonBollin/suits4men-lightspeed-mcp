@@ -249,7 +249,7 @@ across several entries and switched over atomically. See
 | `update_purchase_order` | `PUT Order/<id>.json`: reference, costs, ordered date (→ Ordered), received date (→ Check In) | Mark a PO finished or archive it |
 | `update_po_lines` | `PUT OrderLine/<id>.json`: quantity ordered and/or unit cost | Go below what was received, or re-cost what was checked in |
 | `remove_po_lines` | `DELETE OrderLine/<id>.json` for lines with nothing received (Lightspeed deletes them for good; logged first) | Remove a line with anything received |
-| `set_vendor_numbers` | `PUT Item/<id>.json` with the vendor's own number (Lightspeed's Vendor ID), keeping the item's other vendor numbers | Put one number on two items |
+| `set_vendor_numbers` | `PUT Item/<id>.json` with the vendor's own number or style code (Lightspeed's Vendor ID), keeping the item's other vendor numbers | Give an item a second number for the same vendor |
 | `intake_invoice` | A whole invoice or packing slip in one approval: PO, new items, vendor numbers, lines with what was received, Check In | Add the goods to stock (a click in Lightspeed) |
 | `update_matrix` | `PUT ItemMatrix/<id>.json`: description, category, brand, vendor, default cost, Default price, only what changes | Change the attribute set or values, or archive |
 | `create_vendor` | `POST Vendor.json`: name (as the vendor writes it) and account number | Create a duplicate or near-duplicate (see below); update or archive a vendor |
@@ -310,9 +310,13 @@ near-match is refused too, unless you confirm it really is a different company
 (e.g. "Tomy Hilfiger" next to "Tommy Hilfiger" and "Tommmy Hilfiger"). Checking
 a new vendor reads all ~680 vendors, so that dry run takes about 20 seconds.
 
-Vendor numbers: Lightspeed's "Vendor ID" on an item must belong to that item
-alone (its receive-by-Vendor-ID breaks otherwise). A number printed on several
-lines of one invoice is a style number shared by sizes or colors, and is not saved.
+Vendor numbers: vendors print one code for a style and color (Renoir
+`201-19`) on every size and fit, and often on the suit, vest and pants cut from
+one fabric. That code is saved on each of those items (one number per vendor
+per item). Invoice lines are matched by matrix and color/size/fit, not by the
+code alone: when a code is used in several matrices, the line needs the matrix
+for its garment type. The trade-off: Lightspeed's own lookups by Vendor ID
+(its purchase-order import) find several items for such a code.
 
 #### Inventory counts
 
