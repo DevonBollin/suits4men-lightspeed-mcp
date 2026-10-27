@@ -343,6 +343,21 @@ Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
   category and every other record were untouched.
 - 56 active items are now without a custom SKU; the highest SKU in use is 013471.
 
+### Second real write: first matrix update (2026-10-26 22:12, approved by the owner)
+
+- `update_matrix`: `PUT /API/V3/Account/304581/ItemMatrix/8.json` with
+  `{"description": "Giorgio Fiorelli Suit"}` (confirm code `10817dec52`), on a
+  matrix with **no items** (archived included), so nothing could cascade.
+  **HTTP 200**, reply under `ItemMatrix`.
+- **A matrix PUT merges too, confirmed live:** snapshots 2026-10-26_221043 and
+  2026-10-26_221219 differ in exactly matrix 8's `description` and `timeStamp`.
+  Its attribute set, attribute value lists, prices (549.95 / MSRP 795 / Online 0),
+  cost, vendor and category were untouched.
+- So the current scopes (`employee:inventory` + `employee:product_cost`, no
+  `product_edit`) can **update** a matrix. Creating one is still untested.
+- Still unconfirmed: what a matrix update does to a matrix's *items* (needs a
+  matrix with items; matrix 8 had none).
+
 ### Data findings (2026-10-26, from the snapshot)
 
 - **Custom SKUs:** 771 of the 830 items (archived included) have one; all are 6 digits and
