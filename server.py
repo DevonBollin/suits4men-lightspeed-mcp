@@ -135,8 +135,9 @@ How every write tool works:
    confirm_code. An approval covers that one change only. If anything changed in between, the code no longer
    matches and the call is refused: run the dry run again.
 Real writes are refused while the store owner has writes turned off on this computer; say so and stop. The
-store's rules (attribute set 5 Color/Size/Fit, matrices by garment type not color, vendor naming kept as is,
-pants by waist only, no 3-piece or boys' items, plain descriptions, one unique 6-digit custom SKU per item) are
+store's rules (suits, tuxedos, vests, pants and sport coats on attribute set 5 Color/Size/Fit, other garments on
+a store-made set, every set with Color; matrices by garment type not color; vendor naming kept as is; pants by
+waist only; no 3-piece or boys' items; plain descriptions; one unique 6-digit custom SKU per item) are
 enforced: a refusal says which rule.
 """
 
