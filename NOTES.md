@@ -358,6 +358,27 @@ Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
 - Still unconfirmed: what a matrix update does to a matrix's *items* (needs a
   matrix with items; matrix 8 had none).
 
+### Third real write: first move into a matrix (2026-10-26 22:16, approved by the owner)
+
+- `move_items_into_matrix`: `PUT /API/V3/Account/304581/Item/2321.json` with
+  `{"itemMatrixID": "7", "ItemAttributes": {"itemAttributeSetID": "5",
+  "attribute1": "Burgundy", "attribute2": "58L", "attribute3": "Slim"},
+  "categoryID": "83", "defaultVendorID": "1"}` (confirm code `b5c3466162`).
+  **HTTP 200**; the reply already showed `itemMatrixID` 7.
+- **Moving an existing item into a matrix by PUT works** (undocumented until now).
+  Snapshots 2026-10-26_221419 and 2026-10-26_221615 differ in exactly 2 records:
+  - item 2321: `itemMatrixID` 0 → 7, `ItemAttributes` set, `categoryID` 82 → 83,
+    `defaultVendorID` 0 → 1, `timeStamp`. **Its prices (599.95 / 799.95 / 549.95),
+    cost, SKU and description did not change**: joining a matrix does not apply
+    the matrix's own price (61.21) to the item.
+  - matrix 7: `attribute1Values` gained "Burgundy" (Lightspeed adds a new value
+    by itself, as documented for new items), and `timeStamp`. Its price and
+    every other item were untouched.
+- The write log now holds a completed move, so `move_items_into_matrix` allows
+  up to 100 items per call from here on (each call still needs approval).
+- Still unconfirmed for moves: what happens to the *old* matrix's attribute
+  lists when an item leaves a matrix (2321 was in none).
+
 ### Data findings (2026-10-26, from the snapshot)
 
 - **Custom SKUs:** 771 of the 830 items (archived included) have one; all are 6 digits and
