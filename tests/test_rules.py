@@ -41,6 +41,19 @@ def test_vendor_codes(description, codes):
     assert rules.vendor_codes_in(description) == codes
 
 
+@pytest.mark.parametrize("description", ["Dress Shirt White 15.5 32/33", "Oxford Shoe Black 10.5D",
+                                         "Dress Shirt Blue 16½ 34/35", "Polo Navy 3XL", "Loafer Brown 11W"])
+def test_shirt_and_shoe_sizes_are_plain_in_item_descriptions(description):
+    assert rules.check_plain_description(description, allow_sizes=True) == description
+
+
+@pytest.mark.parametrize("description, code", [("Shirt 320-0S2 White", "320-0S2"), ("Shoe A0000200IX", "A0000200IX"),
+                                               ("Tie BN-5851", "BN-5851")])
+def test_vendor_codes_still_refused_next_to_sizes(description, code):
+    with pytest.raises(RuleViolation, match=code):
+        rules.check_plain_description(description, allow_sizes=True)
+
+
 def test_sizes_are_allowed_in_item_descriptions_only():
     assert rules.check_plain_description("Caravelli Black 42R Slim", allow_sizes=True) == "Caravelli Black 42R Slim"
     with pytest.raises(RuleViolation, match="vendor code"):

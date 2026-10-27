@@ -78,26 +78,77 @@ class Route:
 ITEM_FIELDS = {"description", "itemType", "tax", "taxClassID", "categoryID", "manufacturerID", "defaultVendorID",
                "defaultCost", "Prices"}
 
-# Tool name -> the one kind of request it may send. Nothing else can be written.
-WRITE_ROUTES: dict[str, Route] = {
-    "create_matrix": Route("POST", re.compile(r"ItemMatrix\.json"),
-                           frozenset(ITEM_FIELDS | {"itemAttributeSetID"})),
-    "add_matrix_variants": Route("POST", re.compile(r"Item\.json"),
-                                 frozenset(ITEM_FIELDS | {"itemMatrixID", "customSku", "ItemAttributes"})),
-    "update_item_fields": Route("PUT", re.compile(r"Item/\d+\.json"),
-                                frozenset({"customSku", "defaultCost", "description"})),  # never prices or stock
-    "add_po_lines": Route("POST", re.compile(r"OrderLine\.json"),
-                          frozenset({"orderID", "itemID", "quantity", "price", "originalPrice", "numReceived"})),
-    "receive_po_lines": Route("PUT", re.compile(r"OrderLine/\d+\.json"), frozenset({"numReceived"})),
-    # Put an existing item into a matrix: its matrix, Color/Size/Fit, and (optionally) the
-    # matrix's description pattern, category, vendor and manufacturer. Never prices, cost or stock.
-    "move_items_into_matrix": Route("PUT", re.compile(r"Item/\d+\.json"),
-                                    frozenset({"itemMatrixID", "ItemAttributes", "description", "categoryID",
-                                               "manufacturerID", "defaultVendorID"})),
-    "assign_custom_skus": Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"customSku"})),
-    # Lightspeed archives an item on DELETE (items are never really deleted). Items only, never a matrix.
-    "archive_item": Route("DELETE", re.compile(r"Item/\d+\.json"), frozenset()),
+# The kinds of request the write tools can make. Each tool lists the ones it may use (WRITE_ROUTES below).
+NEW_MATRIX = Route("POST", re.compile(r"ItemMatrix\.json"), frozenset(ITEM_FIELDS | {"itemAttributeSetID"}))
+# An existing matrix. Lightspeed applies description, category, brand and vendor ("Shared values") to
+# every item in it; price and cost are defaults for new items. Never the attribute set, attribute
+# values or anything that archives.
+UPDATE_MATRIX = Route("PUT", re.compile(r"ItemMatrix/\d+\.json"),
+                      frozenset({"description", "categoryID", "manufacturerID", "defaultVendorID", "defaultCost",
+                                 "Prices"}))
+NEW_MATRIX_ITEM = Route("POST", re.compile(r"Item\.json"),
+                        frozenset(ITEM_FIELDS | {"itemMatrixID", "customSku", "ItemAttributes", "ItemVendorNums"}))
+ITEM_SKU_COST_DESCRIPTION = Route("PUT", re.compile(r"Item/\d+\.json"),
+                                  frozenset({"customSku", "defaultCost", "description"}))  # never prices or stock
+# Put an existing item into a matrix: its matrix, Color/Size/Fit, and (optionally) the
+# matrix's description pattern, category, vendor and manufacturer. Never prices, cost or stock.
+ITEM_INTO_MATRIX = Route("PUT", re.compile(r"Item/\d+\.json"),
+                         frozenset({"itemMatrixID", "ItemAttributes", "description", "categoryID", "manufacturerID",
+                                    "defaultVendorID"}))
+ITEM_SKU = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"customSku"}))
+# A new item outside any matrix (shirts, ties, shoes): no itemMatrixID, no ItemAttributes.
+NEW_STANDALONE_ITEM = Route("POST", re.compile(r"Item\.json"), frozenset(ITEM_FIELDS | {"customSku", "ItemVendorNums"}))
+# The vendor's own item number(s) on an existing item. The body lists the item's existing vendor
+# numbers too, so they are kept whether Lightspeed merges or replaces the list.
+ITEM_VENDOR_NUMBERS = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"ItemVendorNums"}))
+# Lightspeed archives an item on DELETE (items are never really deleted). Items only, never a matrix.
+ARCHIVE_ITEM = Route("DELETE", re.compile(r"Item/\d+\.json"), frozenset())
+NEW_ORDER_LINE = Route("POST", re.compile(r"OrderLine\.json"),
+                       frozenset({"orderID", "itemID", "quantity", "price", "originalPrice", "numReceived"}))
+ORDER_LINE_RECEIVED = Route("PUT", re.compile(r"OrderLine/\d+\.json"), frozenset({"numReceived"}))
+# Lightspeed deletes a PO line for good (no archive). Only lines with nothing received, on unfinished POs.
+REMOVE_ORDER_LINE = Route("DELETE", re.compile(r"OrderLine/\d+\.json"), frozenset())
+# A new, empty purchase order (lines are added separately; the docs don't allow lines in this POST).
+NEW_ORDER = Route("POST", re.compile(r"Order\.json"),
+                  frozenset({"vendorID", "shopID", "refNum", "shipCost", "otherCost"}))
+# A PO's own fields. orderedDate moves it to Ordered, receivedDate to Check In. Never `complete`
+# or `archived`: finishing a PO stays a click in Lightspeed, after Add Received To Inventory.
+ORDER_HEADER = Route("PUT", re.compile(r"Order/\d+\.json"),
+                     frozenset({"refNum", "shipCost", "otherCost", "orderedDate", "receivedDate"}))
+# A line's quantity and unit cost (price = originalPrice = the invoice's unit cost; Lightspeed
+# spreads shipping into price later, by the PO's own setting).
+ORDER_LINE_EDIT = Route("PUT", re.compile(r"OrderLine/\d+\.json"), frozenset({"quantity", "price", "originalPrice"}))
+# Intake: the same, plus what was received.
+ORDER_LINE_INTAKE = Route("PUT", re.compile(r"OrderLine/\d+\.json"),
+                          frozenset({"quantity", "price", "originalPrice", "numReceived"}))
+
+# Tool name -> the kinds of request it may send. Nothing else can be written.
+WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
+    "create_matrix": (NEW_MATRIX,),
+    "add_matrix_variants": (NEW_MATRIX_ITEM,),
+    "update_item_fields": (ITEM_SKU_COST_DESCRIPTION,),
+    "add_po_lines": (NEW_ORDER_LINE,),
+    "receive_po_lines": (ORDER_LINE_RECEIVED,),
+    "move_items_into_matrix": (ITEM_INTO_MATRIX,),
+    "assign_custom_skus": (ITEM_SKU,),
+    "archive_item": (ARCHIVE_ITEM,),
+    "create_items": (NEW_STANDALONE_ITEM,),
+    "create_purchase_order": (NEW_ORDER,),
+    "remove_po_lines": (REMOVE_ORDER_LINE,),
+    "update_purchase_order": (ORDER_HEADER,),
+    "update_po_lines": (ORDER_LINE_EDIT,),
+    "set_vendor_numbers": (ITEM_VENDOR_NUMBERS,),
+    # One invoice or packing slip, approved once: a PO (new or existing), new items, vendor
+    # numbers, lines and received quantities, and the PO's dates.
+    "intake_invoice": (NEW_ORDER, NEW_MATRIX_ITEM, NEW_STANDALONE_ITEM, ITEM_VENDOR_NUMBERS, NEW_ORDER_LINE,
+                       ORDER_LINE_INTAKE, ORDER_HEADER),
+    "update_matrix": (UPDATE_MATRIX,),
 }
+
+
+def all_routes() -> list[tuple[str, Route]]:
+    """Every (tool, route) pair."""
+    return [(tool, route) for tool, routes in WRITE_ROUTES.items() for route in routes]
 
 
 class WriteSwitch:
@@ -185,7 +236,7 @@ def make_write_http(base_url: str, switch: WriteSwitch, transport: httpx.BaseTra
         url = str(request.url)
         relative = url[len(base_url):] if url.startswith(base_url) else None
         if relative is None or request.url.query or not any(
-                route_allows(r, request.method, relative) for r in WRITE_ROUTES.values()):
+                route_allows(r, request.method, relative) for _, r in all_routes()):
             raise WriteBlockedError(f"Blocked {request.method} {request.url.path}: not one of the write tools' requests.")
 
     return httpx.Client(
@@ -243,20 +294,22 @@ class WriteClient:
 
         Dry runs call this too, so every payload a dry run shows is one the write path would accept.
         """
-        route = WRITE_ROUTES.get(tool)
-        if route is None:
+        routes = WRITE_ROUTES.get(tool)
+        if routes is None:
             raise WriteBlockedError(f"'{tool}' is not a write tool; only {', '.join(WRITE_ROUTES)} can write.")
-        if not route_allows(route, method, path):
-            raise WriteBlockedError(f"{tool} may only send {route.method} {route.path.pattern}, not {method} {path}.")
-        if route.method == "DELETE":
+        matching = [r for r in routes if route_allows(r, method, path)]
+        if not matching:
+            allowed = "; ".join(f"{r.method} {r.path.pattern}" for r in routes)
+            raise WriteBlockedError(f"{tool} may only send {allowed}, not {method} {path}.")
+        if method.upper() == "DELETE":
             if body:
                 raise WriteBlockedError(f"{tool}: a DELETE has no body.")
             return
         if not isinstance(body, dict) or not body:
             raise WriteBlockedError(f"{tool}: the request body must be a non-empty JSON object.")
-        extra = sorted(set(body) - route.fields)
-        if extra:
-            raise WriteBlockedError(f"{tool} may not send the field(s) {', '.join(extra)}.")
+        if not any(set(body) <= r.fields for r in matching):
+            extra = sorted(set(body) - frozenset().union(*(r.fields for r in matching)))
+            raise WriteBlockedError(f"{tool} may not send the field(s) {', '.join(extra) or 'in this combination'}.")
 
     def send(self, tool: str, method: str, path: str, body: dict | None, confirm_code: str,
              before: dict | None = None) -> dict:

@@ -67,8 +67,9 @@ BOYS_PATTERN = re.compile(r"\b(boy|boys|boy's|boys'|kid|kids|kid's|child|childre
 PLAIN_WORDS_WITH_DIGITS = re.compile(r"^(\d{2,3}'?s|2pc|\d-button|\d+%)$", re.IGNORECASE)
 
 # Sizes, allowed in an item's description (a matrix child is "Caravelli Black 42R Slim")
-# but not in a matrix's: chest + length like 42R, 40XL, 50S, or a waist like 34.
-SIZE_WORD = re.compile(r"^\d{2}(S|R|L|XL|XXL)?$", re.IGNORECASE)
+# but not in a matrix's: suit chest + length (42R, 40XL, 50S), waist (34), shirt neck
+# (15.5, 16½) and sleeve (32/33), shoe size and width (10, 10.5D, 9EE, 11W), 3XL.
+SIZE_WORD = re.compile(r"^(\d{1,2}(\.5|½)?(S|R|L|XL|XXL|M|W|[A-E]{1,3})?|\d{2}/\d{2})$", re.IGNORECASE)
 
 
 class RuleViolation(LightspeedError, ValueError):

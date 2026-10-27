@@ -33,10 +33,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
+from datetime import date, datetime
 
 from . import format as fmt
-from . import rules
+from . import intake, rules
 from .errors import ApiError, LightspeedError, WriteRefused
 from .reader import InventoryReader, batches, id_filter, relations
 from .rules import RuleViolation
@@ -44,6 +46,7 @@ from .write_path import WriteClient
 
 MAX_REQUESTS_PER_CALL = 100  # variants or PO lines in one call
 MAX_LINE_QUANTITY = 1000  # a sanity limit for one PO line
+MAX_INVOICE_LINES = 100  # one invoice; each line can need up to 3 requests (item, vendor number, PO line)
 
 
 # ---- the plan: exactly what would be sent ---------------------------------------------------
@@ -55,7 +58,46 @@ class PlannedRequest:
     method: str
     path: str  # relative to the account, e.g. "Item.json"
     body: dict | None  # None for a DELETE
-    before: dict | None = None  # the record as it is now, saved in the write log (for archiving)
+    before: dict | None = None  # the record as it is now, saved in the write log (archiving, removing)
+    # For a request that creates a record another request in the same plan needs (an invoice's
+    # new PO, a new item): its name, e.g. "order". Later bodies say "{new:order}" where the new
+    # record's ID goes; the real ID is filled in from Lightspeed's reply when the plan is run.
+    creates: str | None = None
+
+
+# Which ID field a created record's ID is read from, by record type.
+CREATED_ID_FIELDS = {"Order": "orderID", "Item": "itemID", "OrderLine": "orderLineID", "ItemMatrix": "itemMatrixID"}
+
+
+def new_ref(name: str) -> str:
+    """How a body refers to a record the same plan creates first."""
+    return "{new:" + name + "}"
+
+
+NEW_REF = re.compile(r"\{new:([^}]+)\}")
+
+
+def fill_in_path(path: str, created: dict[str, str]) -> str:
+    """'Order/{new:order}.json' -> 'Order/900.json' once the new PO exists."""
+    def replace(m):
+        if m.group(1) not in created:
+            raise WriteRefused(f"'{m.group(1)}' was not created, so this request can't be sent.")
+        return created[m.group(1)]
+    return NEW_REF.sub(replace, path)
+
+
+def fill_in_new_ids(value, created: dict[str, str]):
+    """Replace every "{new:name}" in a body with the ID that request got. Unknown names are an error."""
+    if isinstance(value, dict):
+        return {k: fill_in_new_ids(v, created) for k, v in value.items()}
+    if isinstance(value, list):
+        return [fill_in_new_ids(v, created) for v in value]
+    if isinstance(value, str) and value.startswith("{new:") and value.endswith("}"):
+        name = value[5:-1]
+        if name not in created:
+            raise WriteRefused(f"'{name}' was not created, so this request can't be sent.")
+        return created[name]
+    return value
 
 
 @dataclass
@@ -68,6 +110,7 @@ class Plan:
     # Facts the plan relies on that the requests don't show (e.g. an item's stock before
     # archiving). They are part of the confirm code, so a change since the dry run is caught.
     basis: dict | None = None
+    max_requests: int = 100  # an invoice intake may need more (a PO, items, lines, dates)
 
     def confirm_code(self) -> str:
         """A short fingerprint of the exact requests (and basis). Any change to either changes it."""
@@ -102,6 +145,40 @@ def quantity(value, what: str = "quantity") -> int:
     return n
 
 
+def money_or_zero(value, what: str) -> str:
+    """Like money(), but 0 is allowed (e.g. no shipping cost on an invoice)."""
+    if value in (None, "", 0, 0.0, "0"):
+        return "0.00"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise RuleViolation(f"Refused: {what} '{value}' is not a number.") from None
+    if not math.isfinite(amount) or amount < 0:
+        raise RuleViolation(f"Refused: {what} can't be negative (got {value}).")
+    return f"{round(amount, 2):.2f}"
+
+
+def signed_money(value, what: str) -> str:
+    """An amount that may be negative (a PO's other costs: negative is a discount, per Lightspeed's docs)."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise RuleViolation(f"Refused: {what} '{value}' is not a number.") from None
+    if not math.isfinite(amount):
+        raise RuleViolation(f"Refused: {what} '{value}' is not a number.")
+    return f"{round(amount, 2):.2f}"
+
+
+def iso_date(value, what: str) -> str:
+    """A date as YYYY-MM-DD (Lightspeed accepts a date alone and stores it as a full timestamp)."""
+    text = rules.clean(value)
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        raise RuleViolation(f"Refused: {what} '{value}' is not a date like 2026-10-26.") from None
+    return text
+
+
 def default_price(amount: str) -> dict:
     """The Prices block for a Default price only. MSRP and Online are never sent."""
     return {"ItemPrice": [{"amount": amount, "useTypeID": "1", "useType": "Default"}]}
@@ -110,6 +187,51 @@ def default_price(amount: str) -> dict:
 def item_label(item: dict) -> str:
     sku = fmt.text(item.get("customSku"))
     return f"item {item.get('itemID')} '{fmt.text(item.get('description'))}'" + (f" (SKU {sku})" if sku else " (no SKU)")
+
+
+class SkuAllocator:
+    """Custom SKUs for one plan: checks the ones given, picks the next free ones for the rest.
+
+    Built from every item (archived ones too), so a SKU still on an old label is never reused.
+    Picked SKUs continue after the highest 6-digit SKU in use; gaps below it are not reused.
+    """
+
+    def __init__(self, all_items: list[dict], given: list[str | None]):
+        self.items_by_id = {str(i.get("itemID")): i for i in all_items}
+        self.holders: dict[str, dict] = {}
+        for i in all_items:
+            if fmt.text(i.get("customSku")):
+                self.holders.setdefault(fmt.text(i.get("customSku")), i)
+        six_digit = sorted(s for s in self.holders if rules.CUSTOM_SKU_PATTERN.match(s))
+        self.highest = six_digit[-1] if six_digit else None
+        self.next_free = int(self.highest) + 1 if self.highest else 1
+        self.picked = 0
+        # The SKUs given in the request are checked and set aside first, so none is picked for another item.
+        given = [rules.check_custom_sku_format(sku) for sku in given if sku]
+        rules.check_skus_unique_in_request(given)
+        for sku in given:
+            if sku in self.holders:
+                raise RuleViolation(f"Refused: custom SKU {sku} is already used by {item_label(self.holders[sku])}. "
+                                    "Every item gets its own SKU.")
+        self.reserved = set(given)
+
+    def take(self, given: str | None) -> str:
+        """The given SKU (already checked), or the next number nobody holds or is about to get."""
+        if given:
+            return rules.clean(given)
+        while f"{self.next_free:06d}" in self.holders or f"{self.next_free:06d}" in self.reserved:
+            self.next_free += 1
+        if self.next_free > 999_999:
+            raise RuleViolation("Refused: the 6-digit SKU range is used up.")
+        sku = f"{self.next_free:06d}"
+        self.reserved.add(sku)
+        self.picked += 1
+        return sku
+
+    def picked_note(self) -> str:
+        if not self.picked:
+            return ""
+        return f" ({self.picked} picked automatically, continuing after the highest in use, {self.highest})"
 
 
 class InventoryWriter:
@@ -129,10 +251,11 @@ class InventoryWriter:
                     "after the user has seen and approved that dry run. Nothing was sent."
                 )
         plan = build()
-        if len(plan.requests) > MAX_REQUESTS_PER_CALL:
-            raise RuleViolation(f"Refused: {len(plan.requests)} requests in one call; the limit is {MAX_REQUESTS_PER_CALL}.")
+        if len(plan.requests) > plan.max_requests:
+            raise RuleViolation(f"Refused: {len(plan.requests)} requests in one call; the limit is {plan.max_requests}.")
         for r in plan.requests:
-            self.writes.check(tool, r.method, r.path, r.body)
+            # A path naming a record the plan creates first is checked with a stand-in ID.
+            self.writes.check(tool, r.method, NEW_REF.sub("0", r.path), r.body)
         code = plan.confirm_code()
         if dry_run:
             return self._dry_run_result(plan, code)
@@ -168,24 +291,39 @@ class InventoryWriter:
 
     def _execute(self, plan: Plan, code: str) -> dict:
         done = []
+        created: dict[str, str] = {}  # "{new:...}" name -> the ID Lightspeed gave the new record
         for index, r in enumerate(plan.requests):
             try:
-                sent = self.writes.send(plan.tool, r.method, r.path, r.body, code, before=r.before)
+                path, body = fill_in_path(r.path, created), fill_in_new_ids(r.body, created)
+                sent = self.writes.send(plan.tool, r.method, path, body, code, before=r.before)
             except LightspeedError as e:
-                return fmt.prune({
-                    "dry_run": False,
-                    "finished": False,
-                    "summary": plan.summary,
-                    "done": done,
-                    "failed": {"does": r.label, "method": r.method, "path": self.writes.full_path(r.path), "error": str(e)},
-                    "not_sent": [p.label for p in plan.requests[index + 1:]],
-                    "note": "Stopped at the first failure. Requests under 'done' were made in Lightspeed; nothing after "
-                            "the failure was sent. Check Lightspeed before trying anything again.",
-                    "write_log": str(self.writes.write_log.path),
-                })
+                failed = {"does": r.label, "method": r.method, "path": self.writes.full_path(r.path), "error": str(e)}
+                return self._stopped(plan, done, created, failed, plan.requests[index + 1:])
             done.append({"does": r.label, "status": sent["status"], "affected_ids": sent["affected_ids"]})
+            if r.creates:
+                record_type = r.path.removesuffix(".json").split("/")[0]
+                new_id = fmt.text(sent["record"].get(CREATED_ID_FIELDS.get(record_type, "")))
+                if not new_id:
+                    failed = {"does": r.label, "error": f"Lightspeed's reply had no new {record_type} ID, so nothing "
+                                                        "that depends on it was sent."}
+                    return self._stopped(plan, done, created, failed, plan.requests[index + 1:])
+                created[r.creates] = new_id
         return fmt.prune({"dry_run": False, "finished": True, "summary": plan.summary, "done": done,
-                          "after": plan.after, "write_log": str(self.writes.write_log.path)})
+                          "created": created, "after": plan.after, "write_log": str(self.writes.write_log.path)})
+
+    def _stopped(self, plan: Plan, done: list, created: dict, failed: dict, not_sent: list[PlannedRequest]) -> dict:
+        return fmt.prune({
+            "dry_run": False,
+            "finished": False,
+            "summary": plan.summary,
+            "done": done,
+            "created": created,
+            "failed": failed,
+            "not_sent": [p.label for p in not_sent],
+            "note": "Stopped at the first failure. Requests under 'done' were made in Lightspeed; nothing after "
+                    "the failure was sent. Check Lightspeed before trying anything again.",
+            "write_log": str(self.writes.write_log.path),
+        })
 
     # ---- lookups (GET only) -------------------------------------------------------------
 
@@ -228,11 +366,82 @@ class InventoryWriter:
                     found.setdefault(sku, []).append(r)
         return {sku: found.get(sku, []) for sku in skus}
 
+    def _tax_fields(self, warnings: list[str]) -> dict:
+        """Taxable, with the store's tax class, like every existing matrix and item (one tax class: 1 "Item")."""
+        tax_classes, _ = self.client.get_all("TaxClass.json")
+        if len(tax_classes) == 1:
+            return {"tax": "true", "taxClassID": str(tax_classes[0].get("taxClassID"))}
+        warnings.append(f"The account has {len(tax_classes)} tax classes, so none is set; Lightspeed's default applies.")
+        return {}
+
+    def _active_vendor(self, vendor_id) -> dict:
+        vendor = self._get_record(f"Vendor/{int(vendor_id)}.json", "Vendor")
+        if not vendor or fmt.flag(vendor.get("archived")):
+            raise RuleViolation(f"Refused: vendor {vendor_id} does not exist (or is archived).")
+        return vendor
+
+    def _active_category_path(self, category_id) -> str:
+        category = self.reader.categories().get(str(int(category_id)))
+        if not category or fmt.flag(category.get("archived")):
+            raise RuleViolation(f"Refused: category {category_id} does not exist (or is archived).")
+        path = fmt.text(category.get("fullPathName")) or ""
+        rules.check_not_boys(path)
+        return path
+
+    def _standalone_item(self, entry: dict, skus: SkuAllocator, tax: dict, taken_descriptions: dict[str, dict],
+                         matrices: list[dict], warnings: list[str]) -> tuple[dict, str]:
+        """The POST Item.json body for one new item outside any matrix, and its description."""
+        desc = rules.check_plain_description(entry.get("description"), "item description", allow_sizes=True)
+        if rules.is_pants(desc):
+            raise RuleViolation(f"Refused: '{desc}' is pants. Pants are stocked in their own matrices, sized by waist: "
+                                "use create_matrix (garment type pants) and add_matrix_variants.")
+        if desc.lower() in taken_descriptions:
+            raise RuleViolation(f"Refused: {item_label(taken_descriptions[desc.lower()])} already has the description "
+                                f"'{desc}'. Use that item, or describe the new one differently.")
+        taken_descriptions[desc.lower()] = {"itemID": "(new)", "description": desc}
+        for garment, words in rules.GARMENT_WORDS.items():
+            if garment != "pants" and any(re.search(rf"\b{re.escape(w)}\b", desc, re.IGNORECASE) for w in words):
+                warnings.append(f"'{desc}' looks like a {garment}; suits, tuxedos, vests and sport coats usually go in "
+                                "a matrix (add_matrix_variants).")
+                break
+        for m in matrices:
+            m_desc = fmt.text(m.get("description")) or ""
+            if m_desc and not fmt.flag(m.get("archived")) and desc.lower().startswith(m_desc.lower() + " "):
+                warnings.append(f"'{desc}' looks like a variant of matrix {m.get('itemMatrixID')} '{m_desc}'.")
+                break
+
+        category_path = self._active_category_path(entry.get("category_id"))
+        vendor = self._active_vendor(entry.get("vendor_id"))
+        body: dict = {"description": desc, "itemType": "default", "categoryID": str(int(entry["category_id"])),
+                      "defaultVendorID": str(vendor.get("vendorID")), **tax}
+        if entry.get("manufacturer_id"):
+            if not self._get_record(f"Manufacturer/{int(entry['manufacturer_id'])}.json", "Manufacturer"):
+                raise RuleViolation(f"Refused: manufacturer {entry['manufacturer_id']} does not exist.")
+            body["manufacturerID"] = str(int(entry["manufacturer_id"]))
+        price_text, cost_text = money(entry.get("price"), "price"), money(entry.get("cost"), "cost")
+        if float(price_text) <= float(cost_text):
+            warnings.append(f"'{desc}': the price {price_text} is not above the cost {cost_text}.")
+        body.update(customSku=skus.take(entry.get("custom_sku")), defaultCost=cost_text,
+                    Prices=default_price(price_text))
+        return body, desc
+
+    @staticmethod
+    def _active_descriptions(skus: SkuAllocator) -> dict[str, dict]:
+        """Lower-cased description -> active item, to refuse a second item with the same description."""
+        return {(fmt.text(i.get("description")) or "").lower(): i for i in skus.items_by_id.values()
+                if not fmt.flag(i.get("archived")) and fmt.text(i.get("description"))}
+
+    def _sku_allocator(self, given: list[str | None]) -> SkuAllocator:
+        """One pass over every item (archived too): who holds which SKU, and the highest in use."""
+        everything, _ = self.client.get_all("Item.json", {"archived": "true"})
+        return SkuAllocator(everything, given)
+
     def _items_by_id(self, item_ids: list[str]) -> dict[str, dict]:
         items: dict[str, dict] = {}
         for batch in batches(sorted(set(item_ids), key=int)):
             rows, _ = self.client.get_all("Item.json", {"itemID": id_filter(batch), "archived": "true",
-                                                        "load_relations": relations("ItemShops", "ItemAttributes")})
+                                                        "load_relations": relations("ItemShops", "ItemAttributes",
+                                                                                    "ItemVendorNums")})
             items.update({str(r.get("itemID")): r for r in rows})
         return items
 
@@ -268,6 +477,69 @@ class InventoryWriter:
         rules.check_not_three_piece(matrix_desc)
         rules.check_not_boys(matrix_desc, category_path)
         return matrix, matrix_desc, rules.is_pants(matrix_desc, category_path)
+
+    @staticmethod
+    def _variant_body(matrix: dict, matrix_desc: str, values: tuple[str, str, str], sku: str, cost_text: str,
+                      price_text: str) -> dict:
+        """The POST Item.json body for a new item in a matrix: '<matrix description> <color> <size> <fit>',
+        the given SKU, cost and Default price, and the matrix's category, vendor, manufacturer and tax."""
+        color, size, fit = values
+        attributes = {"itemAttributeSetID": str(rules.STORE_ATTRIBUTE_SET_ID), "attribute1": color, "attribute2": size}
+        if fit:
+            attributes["attribute3"] = fit
+        body = {
+            "description": " ".join(p for p in (matrix_desc, color, size, fit) if p),
+            "itemMatrixID": str(matrix.get("itemMatrixID")),
+            "itemType": fmt.text(matrix.get("itemType")) or "default",
+            "customSku": sku,
+            "defaultCost": cost_text,
+            "ItemAttributes": attributes,
+            "Prices": default_price(price_text),
+        }
+        for key in ("categoryID", "manufacturerID", "defaultVendorID", "taxClassID"):
+            if fmt.ref_id(matrix.get(key)):
+                body[key] = str(matrix.get(key))
+        if matrix.get("tax") not in (None, ""):
+            body["tax"] = str(matrix.get("tax"))
+        return body
+
+    # ---- vendor item numbers (Lightspeed's "Vendor ID" on an item; one per vendor) -----------------
+
+    def _vendor_number_holder(self, vendor_id, value: str, items: list[dict] | None = None) -> dict | None:
+        """The item (archived too) that already has this vendor number for this vendor, if any."""
+        if items is None:
+            items, _ = self.client.get_all("Item.json", {
+                "ItemVendorNums.value": value, "archived": "true", "load_relations": relations("ItemVendorNums")},
+                max_records=20)
+        for item in items:
+            for v in intake.vendor_numbers(item):
+                if str(v.get("vendorID")) == str(vendor_id) and (fmt.text(v.get("value")) or "").lower() == value.lower():
+                    return item
+        return None
+
+    def _check_vendor_number(self, vendor_id, value: str, item: dict | None, items: list[dict] | None = None) -> str:
+        """Refuse a number another item already has for this vendor, or a second number for one vendor on an item."""
+        value = rules.clean(value)
+        if not value:
+            raise RuleViolation("Refused: a vendor number can't be blank.")
+        holder = self._vendor_number_holder(vendor_id, value, items)
+        if holder and (item is None or str(holder.get("itemID")) != str(item.get("itemID"))):
+            raise RuleViolation(
+                f"Refused: vendor number '{value}' is already on {item_label(holder)} for this vendor. Each vendor "
+                "number must belong to one item (Lightspeed's receive-by-Vendor-ID stops working otherwise), so a "
+                "style number shared by every size or color can't be saved as a vendor number.")
+        for v in intake.vendor_numbers(item or {}):
+            if str(v.get("vendorID")) == str(vendor_id) and (fmt.text(v.get("value")) or "").lower() != value.lower():
+                raise RuleViolation(f"Refused: {item_label(item)} already has vendor number '{fmt.text(v.get('value'))}' "
+                                    "for this vendor, and Lightspeed allows one per vendor.")
+        return value
+
+    @staticmethod
+    def _vendor_numbers_body(item: dict | None, vendor_id, value: str) -> dict:
+        """ItemVendorNums for a PUT/POST: the item's existing numbers (kept as they are) plus the new one."""
+        kept = [{k: v.get(k) for k in ("itemVendorNumID", "vendorID", "value", "cost") if v.get(k) not in (None, "")}
+                for v in intake.vendor_numbers(item or {})]
+        return {"ItemVendorNum": kept + [{"vendorID": str(vendor_id), "value": value}]}
 
     @staticmethod
     def _clean_values(entry: dict, what: str) -> tuple[str, str, str]:
@@ -457,26 +729,8 @@ class InventoryWriter:
 
             requests = []
             for color, size, fit, sku in cleaned:
-                description = " ".join(p for p in (matrix_desc, color, size, fit) if p)
-                attributes = {"itemAttributeSetID": str(rules.STORE_ATTRIBUTE_SET_ID), "attribute1": color, "attribute2": size}
-                if fit:
-                    attributes["attribute3"] = fit
-                body = {
-                    "description": description,
-                    "itemMatrixID": str(int(matrix_id)),
-                    "itemType": fmt.text(matrix.get("itemType")) or "default",
-                    "customSku": sku,
-                    "defaultCost": cost_text,
-                    "ItemAttributes": attributes,
-                    "Prices": default_price(price_text),
-                }
-                # Category, vendor, manufacturer and tax come from the matrix.
-                for key in ("categoryID", "manufacturerID", "defaultVendorID", "taxClassID"):
-                    if fmt.ref_id(matrix.get(key)):
-                        body[key] = str(matrix.get(key))
-                if matrix.get("tax") not in (None, ""):
-                    body["tax"] = str(matrix.get("tax"))
-                requests.append(PlannedRequest(f"create '{description}' (SKU {sku})", "POST", "Item.json", body))
+                body = self._variant_body(matrix, matrix_desc, (color, size, fit), sku, cost_text, price_text)
+                requests.append(PlannedRequest(f"create '{body['description']}' (SKU {sku})", "POST", "Item.json", body))
 
             summary = (f"Create {len(requests)} new item(s) in matrix {matrix_id} '{matrix_desc}'"
                        + (" (pants: sized by waist)" if pants else "")
@@ -792,27 +1046,10 @@ class InventoryWriter:
             if len(set(ids)) != len(ids):
                 raise RuleViolation("Refused: the same item is listed twice.")
 
-            # One pass over every item (archived too): who holds which SKU, and the highest in use.
-            everything, _ = self.client.get_all("Item.json", {"archived": "true"})
-            by_id = {str(i.get("itemID")): i for i in everything}
-            holders: dict[str, dict] = {}
-            for i in everything:
-                if fmt.text(i.get("customSku")):
-                    holders.setdefault(fmt.text(i.get("customSku")), i)
-            six_digit = sorted(s for s in holders if rules.CUSTOM_SKU_PATTERN.match(s))
-            highest = six_digit[-1] if six_digit else None
-            next_free = int(highest) + 1 if highest else 1
-
-            given = [rules.check_custom_sku_format(entry["custom_sku"]) for entry in items if entry.get("custom_sku")]
-            rules.check_skus_unique_in_request(given)
-            for sku in given:
-                if sku in holders:
-                    raise RuleViolation(f"Refused: custom SKU {sku} is already used by {item_label(holders[sku])}.")
-            reserved = set(given)
-
-            requests, picked = [], 0
+            skus = self._sku_allocator([entry.get("custom_sku") for entry in items])
+            requests = []
             for entry, item_id in zip(items, ids):
-                item = by_id.get(item_id)
+                item = skus.items_by_id.get(item_id)
                 if item is None:
                     raise RuleViolation(f"Refused: item {item_id} was not found.")
                 if fmt.flag(item.get("archived")):
@@ -820,24 +1057,13 @@ class InventoryWriter:
                 if fmt.text(item.get("customSku")):
                     raise RuleViolation(f"Refused: {item_label(item)} already has a SKU. This tool only fills in "
                                         "missing ones; update_item_fields changes an existing SKU.")
-                if entry.get("custom_sku"):
-                    sku = rules.clean(entry["custom_sku"])
-                else:  # the next number nobody holds or is about to get
-                    while f"{next_free:06d}" in holders or f"{next_free:06d}" in reserved:
-                        next_free += 1
-                    if next_free > 999_999:
-                        raise RuleViolation("Refused: the 6-digit SKU range is used up.")
-                    sku = f"{next_free:06d}"
-                    reserved.add(sku)
-                    picked += 1
+                sku = skus.take(entry.get("custom_sku"))
                 requests.append(PlannedRequest(f"{item_label(item)} -> SKU {sku}", "PUT", f"Item/{item_id}.json",
                                                {"customSku": sku}))
 
-            summary = (f"Give {len(requests)} item(s) their own custom SKU"
-                       + (f" ({picked} picked automatically, continuing after the highest in use, {highest})"
-                          if picked else "")
-                       + ". Only customSku is sent: nothing else on the items changes. Each SKU is checked against "
-                         "every item, archived ones included.")
+            summary = (f"Give {len(requests)} item(s) their own custom SKU{skus.picked_note()}. Only customSku is "
+                       "sent: nothing else on the items changes. Each SKU is checked against every item, archived "
+                       "ones included.")
             return Plan("assign_custom_skus", summary, requests)
 
         return self._run("assign_custom_skus", dry_run, confirm_code, build)
@@ -895,3 +1121,600 @@ class InventoryWriter:
                         basis={"itemID": item.get("itemID"), "timeStamp": item.get("timeStamp"), "stock": stock})
 
         return self._run("archive_item", dry_run, confirm_code, build)
+
+    # ---- 8. create items outside any matrix -------------------------------------------------------
+
+    def create_items(self, items: list[dict], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            warnings: list[str] = []
+            skus = self._sku_allocator([entry.get("custom_sku") for entry in items])
+            taken = self._active_descriptions(skus)
+            tax, matrices = self._tax_fields(warnings), self._all_matrices()
+            requests = []
+            for entry in items:
+                body, desc = self._standalone_item(entry, skus, tax, taken, matrices, warnings)
+                requests.append(PlannedRequest(f"create '{desc}' (SKU {body['customSku']}, cost {body['defaultCost']}, "
+                                               f"price {body['Prices']['ItemPrice'][0]['amount']})", "POST",
+                                               "Item.json", body))
+            summary = (f"Create {len(requests)} new item(s) outside any matrix, each with its own custom SKU"
+                       f"{skus.picked_note()}, the cost and Default price given, and the store's tax class. Stock "
+                       "starts at 0.")
+            return Plan("create_items", summary, requests, warnings)
+
+        return self._run("create_items", dry_run, confirm_code, build)
+
+    # ---- 9. purchase orders: create, remove unreceived lines ------------------------------------
+
+    def _new_order(self, vendor_id, ref_num, ship_cost=None, other_cost=None) -> tuple[dict, str, list[str]]:
+        """The POST Order.json body for a new, empty PO; the vendor's name; summary parts."""
+        vendor = self._active_vendor(vendor_id)
+        ref = rules.clean(ref_num)
+        if not ref:
+            raise RuleViolation("Refused: give the invoice or order number (ref_num), so the PO can be found later and "
+                                "the same invoice can't be entered twice.")
+        # The same vendor + reference already on a PO (any status, archived too) means it was entered before.
+        same, _ = self.client.get_all("Order.json", {"vendorID": str(vendor.get("vendorID")), "refNum": ref,
+                                                     "archived": "true"})
+        same = [o for o in same if (fmt.text(o.get("refNum")) or "").lower() == ref.lower()]
+        if same:
+            raise RuleViolation(f"Refused: {fmt.text(vendor.get('name'))} reference {ref} is already purchase order "
+                                f"{same[0].get('orderID')}. Use that PO instead of making a second one.")
+        shops = sorted(self.reader.shop_names(), key=lambda s: int(s) if s.isdigit() else 0)
+        shops = [s for s in shops if s != "0"]
+        if len(shops) != 1:
+            raise RuleViolation(f"Refused: the account has {len(shops)} shops readable; this tool expects exactly one.")
+        body = {"vendorID": str(vendor.get("vendorID")), "shopID": shops[0], "refNum": ref,
+                "shipCost": money_or_zero(ship_cost, "shipping cost"), "otherCost": money_or_zero(other_cost, "other cost")}
+        parts = [f"shipping {body['shipCost']}", f"other costs {body['otherCost']}"]
+        return body, fmt.text(vendor.get("name")) or "", parts
+
+    def create_purchase_order(self, vendor_id: int, ref_num: str, ship_cost: float | None = None,
+                              other_cost: float | None = None, dry_run: bool = True,
+                              confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            body, vendor_name, parts = self._new_order(vendor_id, ref_num, ship_cost, other_cost)
+            summary = (f"Create a new, empty purchase order for {vendor_name}, reference {body['refNum']}, "
+                       f"{', '.join(parts)}. Add its lines with add_po_lines. Lightspeed only lets a PO be marked "
+                       "ordered or received once it has lines.")
+            return Plan("create_purchase_order", summary,
+                        [PlannedRequest(f"create PO for {vendor_name}, ref {body['refNum']}", "POST", "Order.json", body)])
+
+        return self._run("create_purchase_order", dry_run, confirm_code, build)
+
+    def remove_po_lines(self, order_id: int, order_line_ids: list[int], dry_run: bool = True,
+                        confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            if not order_line_ids:
+                raise RuleViolation("Refused: give at least one order_line_id.")
+            wanted = [str(int(i)) for i in order_line_ids]
+            if len(set(wanted)) != len(wanted):
+                raise RuleViolation("Refused: the same PO line is listed twice.")
+            self._open_order(order_id)
+            lines = {str(line.get("orderLineID")): line for line in self._order_lines(order_id)}
+            items = self._items_by_id([str(lines[w].get("itemID")) for w in wanted if w in lines])
+            requests = []
+            for line_id in wanted:
+                line = lines.get(line_id)
+                if line is None:
+                    raise RuleViolation(f"Refused: line {line_id} is not on purchase order {order_id}.")
+                item = items.get(str(line.get("itemID"))) or {"itemID": line.get("itemID")}
+                received, checked_in = fmt.integer(line.get("numReceived")) or 0, fmt.integer(line.get("checkedIn")) or 0
+                if received or checked_in:
+                    raise RuleViolation(f"Refused: line {line_id} ({item_label(item)}) has {received} received and "
+                                        f"{checked_in} checked in. Only lines with nothing received can be removed.")
+                before = {k: line.get(k) for k in ("orderLineID", "orderID", "itemID", "quantity", "price",
+                                                   "originalPrice", "numReceived", "checkedIn")}
+                requests.append(PlannedRequest(f"remove line {line_id}: {fmt.integer(line.get('quantity'))} x "
+                                               f"{item_label(item)} at {line.get('price')}", "DELETE",
+                                               f"OrderLine/{line_id}.json", None, before=before))
+            warnings = ["Lightspeed deletes PO lines for good; each line's values are saved in the write log."]
+            if len(wanted) == len(lines):
+                warnings.append(f"This removes every line; purchase order {order_id} would be left empty.")
+            summary = (f"Remove {len(requests)} line(s) with nothing received from purchase order {order_id}. The "
+                       "items themselves, their stock and other lines are not touched.")
+            return Plan("remove_po_lines", summary, requests, warnings,
+                        basis={line_id: lines[line_id].get("timeStamp") for line_id in wanted})
+
+        return self._run("remove_po_lines", dry_run, confirm_code, build)
+
+    def _ref_taken(self, vendor_id, ref: str, except_order=None) -> dict | None:
+        """Another PO (any status, archived too) for this vendor with this reference number."""
+        rows, _ = self.client.get_all("Order.json", {"vendorID": str(vendor_id), "refNum": ref, "archived": "true"})
+        return next((o for o in rows if (fmt.text(o.get("refNum")) or "").lower() == ref.lower()
+                     and str(o.get("orderID")) != str(except_order)), None)
+
+    def update_purchase_order(self, order_id: int, ref_num: str | None = None, ship_cost: float | None = None,
+                              other_cost: float | None = None, ordered_date: str | None = None,
+                              received_date: str | None = None, dry_run: bool = True,
+                              confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            order = self._open_order(order_id)
+            body: dict = {}
+            changes: list[str] = []
+            warnings: list[str] = []
+            if ref_num is not None:
+                ref = rules.clean(ref_num)
+                if not ref:
+                    raise RuleViolation("Refused: the reference number can't be blank.")
+                if ref != fmt.text(order.get("refNum")):
+                    other = self._ref_taken(order.get("vendorID"), ref, except_order=order_id)
+                    if other:
+                        raise RuleViolation(f"Refused: reference {ref} is already purchase order {other.get('orderID')} "
+                                            "for this vendor.")
+                    body["refNum"] = ref
+                    changes.append(f"reference {fmt.text(order.get('refNum')) or '-'} -> {ref}")
+            for value, key, label, convert in ((ship_cost, "shipCost", "shipping", money_or_zero),
+                                               (other_cost, "otherCost", "other costs", signed_money)):
+                if value is not None:
+                    text = convert(value, label)
+                    if abs(float(text) - (fmt.number(order.get(key)) or 0)) > 0.001:
+                        body[key] = text
+                        changes.append(f"{label} {fmt.number(order.get(key)) or 0:.2f} -> {text}")
+            for value, key, label in ((ordered_date, "orderedDate", "ordered date (status Ordered)"),
+                                      (received_date, "receivedDate", "received date (status Check In)")):
+                if value is not None:
+                    day = iso_date(value, label)
+                    if (fmt.date(order.get(key)) or "")[:10] != day:
+                        body[key] = day
+                        changes.append(f"{label} {(fmt.date(order.get(key)) or 'none')[:10]} -> {day}")
+            if not body:
+                raise RuleViolation(f"Refused: nothing to change on purchase order {order_id}.")
+            if ("orderedDate" in body or "receivedDate" in body) and not self._order_lines(order_id):
+                raise RuleViolation(f"Refused: purchase order {order_id} has no lines yet, and Lightspeed only lets a "
+                                    "PO be marked ordered or received once it has lines.")
+            if "receivedDate" in body:
+                warnings.append("A received date puts the PO in Check In. Stock still changes only when someone "
+                                "clicks Add Received To Inventory on it in Lightspeed.")
+            summary = (f"Change purchase order {order_id}: " + "; ".join(changes) + ". Its lines are not touched, and it "
+                       "is not marked finished (that stays a click in Lightspeed).")
+            return Plan("update_purchase_order", summary,
+                        [PlannedRequest(f"update PO {order_id}", "PUT", f"Order/{int(order_id)}.json", body)], warnings)
+
+        return self._run("update_purchase_order", dry_run, confirm_code, build)
+
+    def update_po_lines(self, order_id: int, lines: list[dict], dry_run: bool = True,
+                        confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            if not lines:
+                raise RuleViolation("Refused: give at least one line.")
+            self._open_order(order_id)
+            on_po = {str(line.get("orderLineID")): line for line in self._order_lines(order_id)}
+            wanted = [str(int(entry.get("order_line_id"))) for entry in lines]
+            if len(set(wanted)) != len(wanted):
+                raise RuleViolation("Refused: the same PO line is listed twice.")
+            items = self._items_by_id([str(on_po[w].get("itemID")) for w in wanted if w in on_po])
+            requests = []
+            for entry, line_id in zip(lines, wanted):
+                line = on_po.get(line_id)
+                if line is None:
+                    raise RuleViolation(f"Refused: line {line_id} is not on purchase order {order_id}.")
+                item = items.get(str(line.get("itemID"))) or {"itemID": line.get("itemID")}
+                ordered = fmt.integer(line.get("quantity")) or 0
+                received = fmt.integer(line.get("numReceived")) or 0
+                checked_in = fmt.integer(line.get("checkedIn")) or 0
+                body, changes = {}, []
+                if entry.get("quantity") is not None:
+                    qty = quantity(entry["quantity"])
+                    if qty < received + checked_in:
+                        raise RuleViolation(f"Refused: line {line_id} ({item_label(item)}) already has {received} "
+                                            f"received and {checked_in} checked in; it can't be lowered to {qty}.")
+                    if qty != ordered:
+                        body["quantity"] = str(qty)
+                        changes.append(f"quantity {ordered} -> {qty}")
+                if entry.get("unit_cost") is not None:
+                    cost = money(entry["unit_cost"], "unit cost")
+                    if abs(float(cost) - (fmt.number(line.get("originalPrice") or line.get("price")) or 0)) > 0.001:
+                        if checked_in:
+                            raise RuleViolation(f"Refused: line {line_id} ({item_label(item)}) has {checked_in} already "
+                                                "added to inventory at its current cost; its cost can't change now.")
+                        body.update(price=cost, originalPrice=cost)
+                        changes.append(f"unit cost {line.get('originalPrice')} -> {cost}")
+                if body:
+                    requests.append(PlannedRequest(f"line {line_id} ({item_label(item)}): " + "; ".join(changes), "PUT",
+                                                   f"OrderLine/{line_id}.json", body))
+            if not requests:
+                raise RuleViolation("Refused: nothing to change on these lines.")
+            summary = (f"Change {len(requests)} line(s) of purchase order {order_id}: quantities ordered and/or unit "
+                       "costs only. Received quantities, items and stock are not touched. Shipping is spread onto the "
+                       "lines by the PO's own setting.")
+            return Plan("update_po_lines", summary, requests)
+
+        return self._run("update_po_lines", dry_run, confirm_code, build)
+
+    def set_vendor_numbers(self, vendor_id: int, items: list[dict], dry_run: bool = True,
+                           confirm_code: str | None = None) -> dict:
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            vendor = self._active_vendor(vendor_id)
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            numbers = [rules.clean(entry.get("vendor_number")) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            if len({n.lower() for n in numbers}) != len(numbers):
+                raise RuleViolation("Refused: the same vendor number is listed for two items. Each vendor number must "
+                                    "belong to one item.")
+            found = self._items_by_id(ids)
+            requests = []
+            for item_id, number in zip(ids, numbers):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                number = self._check_vendor_number(vendor_id, number, item)
+                if any(str(v.get("vendorID")) == str(vendor_id) for v in intake.vendor_numbers(item)):
+                    raise RuleViolation(f"Refused: {item_label(item)} already has vendor number {number}.")
+                requests.append(PlannedRequest(f"{item_label(item)}: vendor number {number}", "PUT", f"Item/{item_id}.json",
+                                               {"ItemVendorNums": self._vendor_numbers_body(item, vendor_id, number)}))
+            summary = (f"Save {fmt.text(vendor.get('name'))}'s own item number on {len(requests)} item(s) (Lightspeed's "
+                       "Vendor ID field), so their invoices match these items. Any vendor numbers the items already "
+                       "have are sent back unchanged. Nothing else on the items changes.")
+            return Plan("set_vendor_numbers", summary, requests)
+
+        return self._run("set_vendor_numbers", dry_run, confirm_code, build)
+
+    # ---- 10. an invoice or packing slip: one plan, one approval -------------------------------------
+
+    def intake_invoice(
+        self,
+        vendor_id: int,
+        invoice_number: str,
+        lines: list[dict],
+        invoice_date: str | None = None,
+        ship_cost: float | None = None,
+        other_cost: float | None = None,
+        order_id: int | None = None,
+        mark_received: bool = True,
+        save_vendor_numbers: bool = True,
+        dry_run: bool = True,
+        confirm_code: str | None = None,
+    ) -> dict:
+        """See intake.py for how lines are matched. The plan, in order: the PO (new, or the one given),
+        new items, vendor numbers, PO lines with what arrived, and the PO's dates (ordered = the
+        invoice date, received = today, which puts it in Check In)."""
+
+        def build() -> Plan:
+            if not lines:
+                raise RuleViolation("Refused: give the invoice's lines.")
+            if len(lines) > MAX_INVOICE_LINES:
+                raise RuleViolation(f"Refused: {len(lines)} lines; the limit is {MAX_INVOICE_LINES} per invoice.")
+            vendor = self._active_vendor(vendor_id)
+            vendor_name = fmt.text(vendor.get("name")) or ""
+            matcher = intake.InvoiceMatcher(self.reader)
+            matches = matcher.match(vendor_id, lines)
+            unresolved = [m for m in matches if m.status == "unresolved"]
+            if unresolved:
+                raise RuleViolation("Refused: some lines don't match an item yet. " + " ".join(
+                    f"Line {m.number}: {m.reason}" for m in unresolved[:10]) + " match_invoice_lines lists candidates.")
+            invoice_day = iso_date(invoice_date, "invoice date") if invoice_date else None
+            warnings: list[str] = []
+            requests: list[PlannedRequest] = []
+
+            # 1. The purchase order.
+            if order_id is not None:
+                order = self._open_order(order_id)
+                if str(order.get("vendorID")) != str(vendor.get("vendorID")):
+                    raise RuleViolation(f"Refused: purchase order {order_id} is for another vendor.")
+                order_ref, on_po = str(int(order_id)), self._order_lines(order_id)
+                ref = rules.clean(invoice_number)
+                if ref and ref.lower() != (fmt.text(order.get("refNum")) or "").lower():
+                    warnings.append(f"PO {order_id}'s reference is {fmt.text(order.get('refNum')) or 'blank'}; this "
+                                    f"document's number is {ref}.")
+                po_text = f"purchase order {order_id}"
+            else:
+                body, _, parts = self._new_order(vendor_id, invoice_number, ship_cost, other_cost)
+                requests.append(PlannedRequest(f"create a PO for {vendor_name}, ref {body['refNum']} ({', '.join(parts)})",
+                                               "POST", "Order.json", body, creates="order"))
+                order, order_ref, on_po = {}, new_ref("order"), []
+                po_text = f"the new purchase order (ref {body['refNum']})"
+
+            # 2. Each item once per invoice.
+            seen: dict[tuple, int] = {}
+            for m in matches:
+                if m.status == "existing":
+                    key = ("item", str(m.item.get("itemID")))
+                elif m.status == "new_variant":
+                    key = ("variant", str(m.matrix.get("itemMatrixID")), *(v.lower() for v in m.values))
+                else:
+                    key = ("new", rules.clean((m.line.get("new_item") or {}).get("description")).lower())
+                if key in seen:
+                    raise RuleViolation(f"Refused: lines {seen[key]} and {m.number} are the same item. Combine them "
+                                        "into one line.")
+                seen[key] = m.number
+
+            # 3. New items: variants (checked per matrix, like add_matrix_variants) and standalone items.
+            new_matches = [m for m in matches if m.status != "existing"]
+            skus = self._sku_allocator([m.line.get("custom_sku") or (m.line.get("new_item") or {}).get("custom_sku")
+                                        for m in new_matches])
+            matrix_info: dict[str, tuple[dict, str]] = {}
+            for mid in dict.fromkeys(str(m.matrix.get("itemMatrixID")) for m in matches if m.status == "new_variant"):
+                matrix, matrix_desc, pants = self._target_matrix(mid)
+                group = [m for m in matches if m.status == "new_variant" and str(m.matrix.get("itemMatrixID")) == mid]
+                combos = [self._clean_values({"color": m.values[0], "size": m.values[1], "fit": m.values[2]},
+                                             f"line {m.number}") for m in group]
+                self._check_matrix_values(mid, matrix, pants, combos, warnings)
+                matrix_info[mid] = (matrix, matrix_desc)
+            tax = self._tax_fields(warnings) if any(m.status == "new_item" for m in matches) else {}
+            taken_desc = self._active_descriptions(skus)
+            matrices = self._all_matrices() if any(m.status == "new_item" for m in matches) else []
+
+            # Vendor numbers printed on several lines are style numbers shared by sizes or colors:
+            # Lightspeed's Vendor ID must belong to one item, so those are not saved.
+            printed: dict[str, int] = {}
+            for m in matches:
+                number = rules.clean(m.line.get("vendor_number")).lower()
+                if number:
+                    printed[number] = printed.get(number, 0) + 1
+            shared = sorted(n for n, count in printed.items() if count > 1)
+            if save_vendor_numbers and shared:
+                warnings.append(f"Not saved as vendor numbers (each is on several lines, so it's a style number): "
+                                f"{', '.join(shared)}.")
+
+            item_refs: dict[int, str] = {}
+            costs: dict[int, tuple[int, str]] = {}
+            numbers_saved = 0
+            for m in matches:
+                qty = quantity(m.line.get("quantity"), f"line {m.number} quantity")
+                cost = money(m.line.get("unit_cost"), f"line {m.number} unit cost")
+                costs[m.number] = (qty, cost)
+                number = rules.clean(m.line.get("vendor_number"))
+                save_number = False
+                if save_vendor_numbers and number and number.lower() not in shared and not m.vendor_number_known:
+                    try:
+                        self._check_vendor_number(vendor_id, number, m.item, matcher.items)
+                        save_number = True
+                    except RuleViolation as e:
+                        warnings.append(f"Line {m.number}: vendor number not saved. {str(e).removeprefix('Refused: ')}")
+                if m.status == "new_variant":
+                    matrix, matrix_desc = matrix_info[str(m.matrix.get("itemMatrixID"))]
+                    if m.line.get("price") is None:
+                        raise RuleViolation(f"Refused: line {m.number} is a new item in matrix "
+                                            f"{matrix.get('itemMatrixID')} '{matrix_desc}': give its selling price.")
+                    body = self._variant_body(matrix, matrix_desc, m.values, skus.take(m.line.get("custom_sku")), cost,
+                                              money(m.line["price"], f"line {m.number} price"))
+                elif m.status == "new_item":
+                    entry = {**m.line["new_item"], "cost": m.line.get("unit_cost"), "vendor_id": vendor_id}
+                    entry["custom_sku"] = entry.get("custom_sku") or m.line.get("custom_sku")
+                    body, _ = self._standalone_item(entry, skus, tax, taken_desc, matrices, warnings)
+                else:
+                    item = m.item
+                    desc = fmt.text(item.get("description")) or ""
+                    rules.check_not_three_piece(desc)
+                    rules.check_not_boys(desc)
+                    item_refs[m.number] = str(item.get("itemID"))
+                    if save_number:
+                        numbers_saved += 1
+                        requests.append(PlannedRequest(
+                            f"line {m.number}: save vendor number {number} on {item_label(item)}", "PUT",
+                            f"Item/{item.get('itemID')}.json",
+                            {"ItemVendorNums": self._vendor_numbers_body(item, vendor_id, number)}))
+                    if not fmt.text(item.get("customSku")):
+                        warnings.append(f"Line {m.number}: {item_label(item)} has no custom SKU (assign_custom_skus).")
+                    if not fmt.ref_id(item.get("itemMatrixID")):
+                        warnings.append(f"Line {m.number}: {item_label(item)} is not in a matrix (a catch-all item?).")
+                    qoh = fmt.total_qoh(item)
+                    if qoh is not None and qoh < 0:
+                        warnings.append(f"Line {m.number}: {item_label(item)} has negative stock ({qoh}); after check-in "
+                                        f"it would be {qoh + qty}.")
+                    continue
+                if save_number:
+                    numbers_saved += 1
+                    body["ItemVendorNums"] = self._vendor_numbers_body(None, vendor_id, number)
+                name = f"item:{m.number}"
+                requests.append(PlannedRequest(
+                    f"line {m.number}: create '{body['description']}' (SKU {body['customSku']}, cost {cost}, price "
+                    f"{body['Prices']['ItemPrice'][0]['amount']})", "POST", "Item.json", body, creates=name))
+                item_refs[m.number] = new_ref(name)
+
+            # 4. The PO lines: what arrived, at the invoice's unit cost.
+            units, total = 0, 0.0
+            for m in matches:
+                qty, cost = costs[m.number]
+                units += qty
+                total += qty * float(cost)
+                item_ref = item_refs[m.number]
+                existing = [line for line in on_po if str(line.get("itemID")) == item_ref]
+                if len(existing) > 1:
+                    raise RuleViolation(f"Refused: line {m.number}'s item is on {len(existing)} lines of {po_text}.")
+                if existing:
+                    line = existing[0]
+                    ordered = fmt.integer(line.get("quantity")) or 0
+                    received = fmt.integer(line.get("numReceived")) or 0
+                    checked_in = fmt.integer(line.get("checkedIn")) or 0
+                    body, changes = {}, []
+                    if mark_received:
+                        body["numReceived"] = str(received + qty)
+                        changes.append(f"received {received} -> {received + qty}")
+                        if checked_in + received + qty > ordered:
+                            body["quantity"] = str(checked_in + received + qty)
+                            changes.append(f"ordered {ordered} -> {checked_in + received + qty}")
+                            warnings.append(f"Line {m.number}: more arrived than was ordered on PO line "
+                                            f"{line.get('orderLineID')}; its quantity is raised to match.")
+                    if abs(float(cost) - (fmt.number(line.get("originalPrice") or line.get("price")) or 0)) > 0.001:
+                        if checked_in:
+                            warnings.append(f"Line {m.number}: the invoice cost {cost} differs from the PO's "
+                                            f"{line.get('originalPrice')}, but some were already checked in; not changed.")
+                        else:
+                            body.update(price=cost, originalPrice=cost)
+                            changes.append(f"unit cost {line.get('originalPrice')} -> {cost}")
+                    if body:
+                        requests.append(PlannedRequest(f"line {m.number}: PO line {line.get('orderLineID')}: "
+                                                       + "; ".join(changes), "PUT",
+                                                       f"OrderLine/{line.get('orderLineID')}.json", body))
+                else:
+                    requests.append(PlannedRequest(
+                        f"line {m.number}: add {qty} x " + (item_label(m.item) if m.item else f"new item {item_ref}")
+                        + f" at {cost}" + (", received" if mark_received else ""), "POST", "OrderLine.json",
+                        {"orderID": order_ref, "itemID": item_ref, "quantity": str(qty), "price": cost,
+                         "originalPrice": cost, "numReceived": str(qty) if mark_received else "0"}))
+            if order_id is not None:
+                invoiced = set(item_refs.values())
+                missing = [line for line in on_po if str(line.get("itemID")) not in invoiced
+                           and (fmt.integer(line.get("quantity")) or 0) > (fmt.integer(line.get("checkedIn")) or 0)
+                           + (fmt.integer(line.get("numReceived")) or 0)]
+                if missing:
+                    warnings.append(f"{len(missing)} line(s) on {po_text} are not on this document (still to come?).")
+
+            # 5. The PO's own fields: costs on an existing PO, ordered date, Check In.
+            header: dict = {}
+            if order_id is not None:
+                for value, key, label, convert in ((ship_cost, "shipCost", "shipping", money_or_zero),
+                                                   (other_cost, "otherCost", "other costs", signed_money)):
+                    if value is not None:
+                        text = convert(value, label)
+                        if abs(float(text) - (fmt.number(order.get(key)) or 0)) > 0.001:
+                            header[key] = text
+            if invoice_day and not fmt.date(order.get("orderedDate")):
+                header["orderedDate"] = invoice_day
+            if mark_received and not fmt.date(order.get("receivedDate")):
+                header["receivedDate"] = date.today().isoformat()
+            if header:
+                requests.append(PlannedRequest(f"{po_text}: " + ", ".join(f"{k} {v}" for k, v in header.items()), "PUT",
+                                               f"Order/{order_ref}.json", header))
+
+            counts = {s: sum(1 for m in matches if m.status == s) for s in ("existing", "new_variant", "new_item")}
+            summary = (f"{vendor_name} document {rules.clean(invoice_number) or '-'}: {len(matches)} line(s), {units} "
+                       f"unit(s), {total:.2f} at cost, on {po_text}. Existing items: {counts['existing']}; new items in "
+                       f"a matrix: {counts['new_variant']}; new items outside a matrix: {counts['new_item']}"
+                       f"{skus.picked_note()}; vendor numbers saved: {numbers_saved}. "
+                       + ("Every line is marked received. " if mark_received else "Nothing is marked received. ")
+                       + "Prices of existing items are not touched.")
+            after = (f"Stock does NOT change yet. In Lightspeed, open {po_text}: it is in Check In with the received "
+                     "quantities filled in. Check them against the goods, click Add Received To Inventory, then "
+                     "Finished. Lightspeed's API has no call for that step. Shipping is spread onto the lines by the "
+                     "PO's own setting." if mark_received else
+                     f"Nothing is received. When the goods arrive, run this again with mark_received=true for {po_text}.")
+            return Plan("intake_invoice", summary, requests, warnings, after, max_requests=4 * MAX_INVOICE_LINES)
+
+        return self._run("intake_invoice", dry_run, confirm_code, build)
+
+    # ---- 11. update an existing matrix ----------------------------------------------------------------
+
+    def update_matrix(
+        self,
+        matrix_id: int,
+        description: str | None = None,
+        category_id: int | None = None,
+        manufacturer_id: int | None = None,
+        vendor_id: int | None = None,
+        default_cost: float | None = None,
+        price: float | None = None,
+        dry_run: bool = True,
+        confirm_code: str | None = None,
+    ) -> dict:
+        """Lightspeed's Retail help splits a matrix's fields in two ("Creating matrixes"): Shared values
+        (description, category, brand, vendor) are applied to every item in the matrix when it is saved,
+        and Default values (price, cost) are only used for new items or the "Reset Items To Defaults"
+        button. That split is not documented for the API, so the dry run spells out what each change
+        would reach if it did cascade."""
+
+        def build() -> Plan:
+            matrix = self.reader._matrix_record(int(matrix_id))
+            if matrix is None:
+                raise RuleViolation(f"Refused: matrix {matrix_id} was not found (or can't be read).")
+            if fmt.flag(matrix.get("archived")):
+                raise RuleViolation(f"Refused: matrix {matrix_id} is archived.")
+            current_desc = fmt.text(matrix.get("description")) or ""
+            children, _ = self.client.get_all("Item.json", {
+                "itemMatrixID": str(int(matrix_id)), "load_relations": relations("ItemAttributes")})
+            n = len(children)
+            body: dict = {}
+            changes: list[str] = []
+            warnings: list[str] = []
+
+            if description is not None and rules.clean(description) != current_desc:
+                desc = rules.check_plain_description(description, "matrix description")
+                if not any(re.search(rf"\b{re.escape(w)}\b", desc, re.IGNORECASE)
+                           for words in rules.GARMENT_WORDS.values() for w in words):
+                    raise RuleViolation(f"Refused: the matrix description '{desc}' doesn't say what garment it is "
+                                        f"(e.g. '{desc} Suit'). Matrices are split by garment type.")
+                matrices = self._all_matrices()
+                names = [self._vendor_name(matrix.get("defaultVendorID"))]
+                if fmt.ref_id(matrix.get("manufacturerID")):
+                    m = self._get_record(f"Manufacturer/{matrix.get('manufacturerID')}.json", "Manufacturer") or {}
+                    names.append(fmt.text(m.get("name")) or "")
+                rules.check_not_split_by_color(desc, self._known_colors(matrices), names)
+                for other in matrices:
+                    if (str(other.get("itemMatrixID")) != str(matrix_id) and not fmt.flag(other.get("archived"))
+                            and (fmt.text(other.get("description")) or "").lower() == desc.lower()):
+                        raise RuleViolation(f"Refused: matrix {other.get('itemMatrixID')} is already called '{desc}'.")
+                if desc != current_desc:
+                    body["description"] = desc
+                    changes.append(f"description '{current_desc}' -> '{desc}'")
+                    examples = []
+                    for child in children[:3]:
+                        new_child = " ".join(p for p in (desc, *intake.attribute_values(child)) if p)
+                        examples.append(f"'{fmt.text(child.get('description'))}' -> '{new_child}'")
+                    custom = [c for c in children if fmt.text(c.get("description")) != " ".join(
+                        p for p in (current_desc, *intake.attribute_values(c)) if p)]
+                    warnings.append(f"Lightspeed renames all {n} item(s) in the matrix to '<description> <color> <size> "
+                                    f"<fit>', e.g. " + "; ".join(examples) + "."
+                                    + (f" {len(custom)} of them have a description that doesn't follow the pattern "
+                                       "today and would be renamed too." if custom else ""))
+
+            for value, key, label, check in (
+                    (category_id, "categoryID", "category", lambda v: self._active_category_path(v)),
+                    (manufacturer_id, "manufacturerID", "brand (manufacturer)", self._manufacturer_name),
+                    (vendor_id, "defaultVendorID", "vendor", lambda v: fmt.text(self._active_vendor(v).get("name")))):
+                if value is None or str(int(value)) == str(matrix.get(key)):
+                    continue
+                name = check(value)
+                body[key] = str(int(value))
+                changes.append(f"{label} {matrix.get(key)} -> {int(value)} ({name})")
+                differ = sum(1 for c in children if str(c.get(key)) != str(int(value)))
+                warnings.append(f"Lightspeed applies the matrix's {label} to all {n} item(s); {differ} of them have a "
+                                "different one today.")
+
+            if default_cost is not None:
+                cost = money(default_cost, "default cost")
+                if abs(float(cost) - (fmt.number(matrix.get("defaultCost")) or 0)) > 0.001:
+                    body["defaultCost"] = cost
+                    changes.append(f"default cost {matrix.get('defaultCost')} -> {cost}")
+            if price is not None:
+                new_price = money(price, "price")
+                levels = fmt.as_list((matrix.get("Prices") or {}).get("ItemPrice"))
+                if abs(float(new_price) - (fmt.prices(matrix).get("Default") or 0)) > 0.001:
+                    # Every level is sent back, only Default changed: an empty or missing level could blank it.
+                    kept = [{k: p.get(k) for k in ("amount", "useTypeID", "useType")} for p in levels
+                            if str(p.get("useTypeID")) != "1"]
+                    body["Prices"] = {"ItemPrice": [{"amount": new_price, "useTypeID": "1", "useType": "Default"},
+                                                    *kept]}
+                    changes.append(f"Default price {fmt.prices(matrix).get('Default')} -> {new_price}")
+            if "defaultCost" in body or "Prices" in body:
+                selling: dict[float, int] = {}
+                for c in children:
+                    p = fmt.prices(c).get("Default")
+                    if p is not None:
+                        selling[p] = selling.get(p, 0) + 1
+                spread = ", ".join(f"{count} at {p:.2f}" for p, count in sorted(selling.items(), key=lambda s: -s[1]))
+                warnings.append("Lightspeed's help describes a matrix's price and cost as defaults for new items "
+                                "(existing items keep their own unless someone clicks Reset Items To Defaults). This "
+                                f"isn't documented for the API: if it did reach the items, all {n} would change. Today "
+                                f"they sell at: {spread or 'no prices'}.")
+            if not body:
+                raise RuleViolation(f"Refused: nothing to change on matrix {matrix_id}.")
+
+            summary = (f"Change matrix {matrix_id} '{current_desc}' ({n} active item(s)): " + "; ".join(changes) + ". "
+                       "Its attribute set, attribute values and items' SKUs, stock and own prices are not sent.")
+            after = ("Take a snapshot before (take_snapshot) and compare after (compare_snapshots): it shows exactly "
+                     "which items Lightspeed changed. This is the first matrix update, so what Lightspeed does to the "
+                     "items is still to be confirmed.")
+            return Plan("update_matrix", summary,
+                        [PlannedRequest(f"update matrix {matrix_id}", "PUT", f"ItemMatrix/{int(matrix_id)}.json", body)],
+                        warnings, after,
+                        basis={"timeStamp": matrix.get("timeStamp"), "items": n})
+
+        return self._run("update_matrix", dry_run, confirm_code, build)
+
+    def _manufacturer_name(self, manufacturer_id) -> str:
+        record = self._get_record(f"Manufacturer/{int(manufacturer_id)}.json", "Manufacturer")
+        if record is None:
+            raise RuleViolation(f"Refused: manufacturer {manufacturer_id} does not exist.")
+        return fmt.text(record.get("name")) or ""

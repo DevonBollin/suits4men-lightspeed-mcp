@@ -14,7 +14,7 @@ import pytest
 from lightspeed_mcp.config import STATE_DIR
 from lightspeed_mcp.errors import ApiError, WriteBlockedError, WriteOutcomeUnknown, WritesDisabledError
 from lightspeed_mcp.reader import InventoryReader
-from lightspeed_mcp.write_path import WRITE_ROUTES, WriteClient, WriteLog, WriteSwitch
+from lightspeed_mcp.write_path import WRITE_ROUTES, WriteClient, WriteLog, WriteSwitch, all_routes
 from tests.conftest import BASE, turn_on
 from tests.fakes import long_token
 
@@ -74,36 +74,66 @@ def test_request_hook_refuses_even_an_allowed_request_with_switch_off(make_write
 
 
 def test_exactly_these_write_tools():
-    assert set(WRITE_ROUTES) == {"create_matrix", "add_matrix_variants", "update_item_fields", "add_po_lines",
-                                 "receive_po_lines", "move_items_into_matrix", "assign_custom_skus", "archive_item"}
+    assert set(WRITE_ROUTES) == {
+        "create_matrix", "add_matrix_variants", "update_item_fields", "add_po_lines", "receive_po_lines",
+        "move_items_into_matrix", "assign_custom_skus", "archive_item", "create_items", "create_purchase_order",
+        "remove_po_lines", "update_purchase_order", "update_po_lines", "set_vendor_numbers", "intake_invoice",
+        "update_matrix"}
+
+
+def test_deletes_are_one_item_or_one_po_line_only():
+    deletes = {(tool, r.path.pattern) for tool, r in all_routes() if r.method == "DELETE"}
+    assert deletes == {("archive_item", r"Item/\d+\.json"), ("remove_po_lines", r"OrderLine/\d+\.json")}
+    for path in ("Order/853.json", "ItemMatrix/7.json", "Vendor/1.json", "Item.json", "OrderLine.json"):
+        assert not any(r.method == "DELETE" and r.path.fullmatch(path) for _, r in all_routes())
+
+
+def test_only_update_matrix_may_change_a_matrix_and_never_its_set_values_or_archive():
+    puts = [(tool, r) for tool, r in all_routes() if r.path.fullmatch("ItemMatrix/7.json")]
+    assert [(tool, r.method) for tool, r in puts] == [("update_matrix", "PUT")]
+    fields = puts[0][1].fields
+    assert not fields & {"itemAttributeSetID", "attribute1Values", "attribute2Values", "attribute3Values",
+                         "archived", "Items", "itemType", "tax", "taxClassID"}
+
+
+def test_a_po_is_never_marked_finished_or_archived():
+    for tool, r in all_routes():
+        assert not r.fields & {"complete", "archived"}, tool
+
+
+def only_route(tool):
+    [route] = WRITE_ROUTES[tool]
+    return route
 
 
 def test_the_only_delete_archives_one_item():
-    deletes = {tool: r for tool, r in WRITE_ROUTES.items() if r.method == "DELETE"}
-    assert list(deletes) == ["archive_item"]
-    route = deletes["archive_item"]
-    assert route.path.fullmatch("Item/1345.json") and route.fields == frozenset()
+    deletes = [(tool, r) for tool, r in all_routes() if r.method == "DELETE" and r.path.fullmatch("Item/1345.json")]
+    assert [tool for tool, _ in deletes] == ["archive_item"]
+    route = only_route("archive_item")
+    assert route.fields == frozenset()
     for path in ("Item.json", "ItemMatrix/7.json", "OrderLine/1.json", "Order/853.json", "Item/1345/Image.json"):
         assert not route.path.fullmatch(path)
 
 
-@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "POST"])
-def test_no_route_can_change_an_existing_matrix(method):
-    """A matrix can be created, never updated or archived: a matrix price save can reach every
-    item, and archiving a matrix archives all of its items. That stays manual in Lightspeed."""
-    assert not any(r.method == method and r.path.fullmatch("ItemMatrix/7.json") for r in WRITE_ROUTES.values())
+@pytest.mark.parametrize("method", ["PATCH", "DELETE", "POST"])
+def test_a_matrix_can_never_be_archived(method):
+    """Archiving a matrix archives all of its items: that stays manual in Lightspeed (owner's decision)."""
+    assert not any(r.method == method and r.path.fullmatch("ItemMatrix/7.json") for _, r in all_routes())
 
 
 def test_prices_and_stock_can_only_be_set_on_new_records():
-    for tool, route in WRITE_ROUTES.items():
+    """Prices go on new records (POST) and on a matrix's defaults (update_matrix); never on an item update."""
+    for tool, route in all_routes():
         assert "ItemShops" not in route.fields
         if "Prices" in route.fields:
-            assert route.method == "POST" and tool in ("create_matrix", "add_matrix_variants")
-    assert WRITE_ROUTES["update_item_fields"].fields == {"customSku", "defaultCost", "description"}
-    assert WRITE_ROUTES["receive_po_lines"].fields == {"numReceived"}
-    assert WRITE_ROUTES["assign_custom_skus"].fields == {"customSku"}
-    assert WRITE_ROUTES["move_items_into_matrix"].fields == {"itemMatrixID", "ItemAttributes", "description",
-                                                             "categoryID", "manufacturerID", "defaultVendorID"}
+            assert route.method == "POST" or tool == "update_matrix", tool
+        if route.method == "PUT" and route.path.fullmatch("Item/1.json"):
+            assert "Prices" not in route.fields, tool
+    assert only_route("update_item_fields").fields == {"customSku", "defaultCost", "description"}
+    assert only_route("receive_po_lines").fields == {"numReceived"}
+    assert only_route("assign_custom_skus").fields == {"customSku"}
+    assert only_route("move_items_into_matrix").fields == {"itemMatrixID", "ItemAttributes", "description",
+                                                           "categoryID", "manufacturerID", "defaultVendorID"}
 
 
 @pytest.mark.parametrize("tool, method, path", [
@@ -158,8 +188,8 @@ def test_fields_outside_a_route_are_refused(make_write_client, fake_api, write_s
 @pytest.mark.parametrize("method, url", [
     ("GET", BASE + "Item.json"),
     ("DELETE", BASE + "ItemMatrix/7.json"),
-    ("DELETE", BASE + "OrderLine/1.json"),
-    ("PUT", BASE + "ItemMatrix/7.json"),
+    ("DELETE", BASE + "Order/853.json"),
+    ("PUT", BASE + "ItemShop/5.json"),
     ("POST", BASE + "Customer.json"),
     ("POST", "https://evil.example.com/API/V3/Account/12345/Item.json"),
     ("POST", BASE + "Item.json?load_relations=x"),

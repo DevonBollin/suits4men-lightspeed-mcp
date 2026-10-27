@@ -402,6 +402,97 @@ Standard" (1387, stock −1,052; also on PO 20, which is not complete) was
 refused for stock. "Giorgio Fiorelli Boys Shirt" (1471) has stock 7, so it
 would be refused too.
 
+## Matrix updates, purchase orders, invoice intake (2026-10-26, night)
+
+Built on the owner's request ("hand Claude an invoice or packing slip and
+update the inventory"): `update_matrix`, `create_items`, `create_purchase_order`,
+`update_purchase_order`, `update_po_lines`, `remove_po_lines`,
+`set_vendor_numbers`, `intake_invoice` (one approval per document, as the owner
+chose) and the read-only `match_invoice_lines`. Owner's permissions: vendor
+style numbers, standalone items, removing unreceived PO lines.
+
+### Matrix updates (Retail help "Creating matrixes", imports help; not documented for the API)
+
+- The matrix screen has **"Shared Values – Applied to all items in the
+  matrix"** (description, category, brand, vendor, tax class, item type) and
+  **"Default Values"** (price, cost, tags), which only reach existing items via
+  the **Reset Items To Defaults** button.
+- **A new matrix description renames every item** to `<description> <attr1> <attr2> <attr3>`.
+  Renaming an attribute value in the UI renames its items too.
+- API: a PUT merges (omitted fields keep their values; empty/null blanks them).
+  Whether a PUT with `Prices`/`defaultCost` reaches the items is **unconfirmed**;
+  the ItemMatrix tutorial's example child kept prices 0 while its matrix had 20.
+- Not documented: changing `itemAttributeSetID` on a matrix with items; a
+  third-party integration reports API item writes failing after a set's
+  attribute count was reduced. So `update_matrix` never sends it, nor
+  attribute values (read-only, built from the items), `archived`, `itemType`, tax.
+- `update_matrix` sends only changed fields, re-sends every price level with
+  only Default changed (an empty level could blank it), and its dry run counts
+  the items each shared change reaches and previews renamed items.
+- **The first real matrix update is the test**: snapshot before, compare after.
+  (No test matrix may be created: the owner's rule.)
+
+### Purchase orders and receiving (Order, OrderLine, Shipment docs; Retail help on POs)
+
+- Still **no API call adds received goods to stock** for a PO: Order has
+  only GET/POST/PUT/DELETE, Shipment records are read-only, `checkedIn` is not
+  writable, and the changelog has no PO entry. (September 2026 added receive
+  actions for *inventory transfers* only.) UI steps: open the PO → status
+  **Check In** → # Received → **Add Received To Inventory** → **Finished**.
+  With `numReceived` already set through the API it is one click plus Finished.
+- Order writable: `orderedDate` (→ Ordered), `receivedDate` (→ Check In; both
+  need at least one line), `arrivalDate`, `refNum`, `shipCost`, `otherCost`
+  (negative = a discount), `discount` (%), instructions. `complete` and
+  `archived` are not in the writable list; DELETE archives a PO. No route sends them.
+- OrderLine: `originalPrice` = the vendor's unit cost; `price` = unit cost
+  after shipping/discount spreading. **Live data: on finished PO 219 (shipping
+  split "evenly") `price` 65.907 = `originalPrice` 63.50 + `shippingCost` 2.407.**
+  On every open PO `price` equals `originalPrice`: spreading happens later, by
+  the PO's `shippingCostMethod` (evenly 555 POs, total 295, proportionally 1).
+  So new lines get price = originalPrice = the invoice's unit cost.
+- No PO in the store uses a discount (0 of 853). 32 lines have a `vendorCost`.
+- OrderLine DELETE removes a line for good; `remove_po_lines` logs it first.
+- Lightspeed also offers a PO spreadsheet import (up to 500 items, no
+  received quantities, no matrix columns) and vendor catalogs; NuORDER for some brands.
+
+### Vendor numbers (ItemVendorNum)
+
+- A relation on Item (`ItemVendorNums.ItemVendorNum`: `itemVendorNumID`,
+  `vendorID`, `value`, `cost`), written through Item POST/PUT. Lightspeed allows
+  **one per vendor per item**.
+- **Live check (GET): `Item.json?ItemVendorNums.value=Christopher Lena` returned
+  only item 1468**, so items can be found by vendor number.
+- Lightspeed's PO screen can receive by Vendor ID, and that **fails when two
+  items share a Vendor ID**. So a number goes on one item only; a style number
+  printed on several invoice lines is not saved. `set_vendor_numbers` re-sends
+  the item's existing vendor numbers with their IDs, so they are kept whether
+  Lightspeed merges or replaces the list (which is unconfirmed).
+- Only one item (1468) has a vendor number today, and none has a manufacturer SKU.
+
+### Intake design
+
+- Claude reads the document; `match_invoice_lines` resolves each line (item_id;
+  vendor number; matrix + color/size/fit; or new); `intake_invoice` builds one
+  plan: [new PO] → [new items] → [vendor numbers] → [PO lines, received] →
+  [PO dates]. Later requests refer to records created earlier as `{new:order}`
+  / `{new:item:N}`; the real IDs are filled in from Lightspeed's replies, and the
+  confirm code covers the plan with those placeholders.
+- A vendor + reference already on any PO is refused (no double entry). The same
+  item twice on one document is refused (combine the lines). New variants need
+  their selling price; new items get the next free SKUs.
+- Against an existing PO: received quantities are added to `numReceived`; a line
+  that receives more than ordered has its quantity raised (warned); a different
+  invoice cost replaces the line's cost unless some was already checked in.
+
+### Findings from the dry runs (GET only)
+
+- Besides 2321, more Caravelli Burgundy suits sit outside matrix 7 without a
+  matrix (e.g. 1187 "Caravelli Burgundy 34S Slim", 1188 36R Slim, 1189 36S
+  Slim); matrix 7 has no Burgundy color.
+- Renaming matrix 7 to "Caravelli Suit" would rename all 399 items
+  ("Caravelli Beige 50S Classic" → "Caravelli Suit Beige 50S Classic").
+- All 399 of matrix 7's items sell at 599.95; its own price is 61.21, MSRP 995, Online 0.
+
 ## Helper tools (2026-10-26, evening)
 
 - `suggest_custom_skus`, `show_write_log`, `take_snapshot`, `compare_snapshots`.
@@ -416,5 +507,5 @@ would be refused too.
 ## Tooling
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
-  `check_tools.py --dry-runs` calls the eight write tools on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (388 tests).
+  `check_tools.py --dry-runs` calls every write tool on real records, always with `dry_run=true`.
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (478 tests).

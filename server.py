@@ -26,7 +26,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from lightspeed_mcp import snapshots
+from lightspeed_mcp import intake, snapshots
 from lightspeed_mcp.client import LightspeedClient
 from lightspeed_mcp.config import HTTP_TIMEOUT_SECONDS
 from lightspeed_mcp.errors import LightspeedError, NotBootstrappedError
@@ -47,9 +47,10 @@ mcp = MCPServer(
         "vendors, manufacturers, categories, purchase orders, stock and stock history, sales history, inventory "
         "counts, special orders, vendor returns and vendor catalogs. Results are trimmed JSON with IDs; long lists "
         "come as {columns, rows} tables. Use api_get for any field the other tools leave out. The read tools and "
-        "api_get can never change anything. Eight write tools (create_matrix, add_matrix_variants, "
-        "update_item_fields, add_po_lines, receive_po_lines, move_items_into_matrix, assign_custom_skus, "
-        "archive_item) default to dry runs that send nothing. Matrices can never be archived. Never make a "
+        "api_get can never change anything. The write tools (matrices, items, SKUs, vendor numbers, purchase "
+        "orders and their lines, invoice intake, archiving one item) default to dry runs that send nothing. "
+        "For an invoice or packing slip: match_invoice_lines, then intake_invoice. Matrices can never be "
+        "archived. Never make a "
         "real write unless the user, in this chat, has approved that exact dry run; an approval covers one write "
         "only. Real writes are refused while the store owner has writes turned off. suggest_custom_skus gives "
         "unused SKUs, show_write_log lists what has been written, and take_snapshot / compare_snapshots save and "
@@ -410,6 +411,40 @@ def suggest_custom_skus(
     return run(lambda r: r.suggest_custom_skus(count))
 
 
+class NewItemDetails(BaseModel):
+    description: Annotated[str, Field(description="Plain-language description, sizes allowed, no vendor codes, e.g. 'Dress Shirt White 15.5 32/33'.")]
+    category_id: Annotated[int, Field(description="Category (list_categories).")]
+    price: Annotated[float, Field(description="Default selling price.")]
+    custom_sku: Annotated[str | None, Field(description="6-digit SKU as text; empty = the next free one.")] = None
+    manufacturer_id: Annotated[int | None, Field(description="Brand (list_manufacturers).")] = None
+
+
+class InvoiceLine(BaseModel):
+    quantity: Annotated[int, Field(description="Units on this line (that arrived, for a packing slip).")]
+    unit_cost: Annotated[float, Field(description="Unit cost on the invoice.")]
+    item_id: Annotated[int | None, Field(description="The item, when already known.")] = None
+    vendor_number: Annotated[str | None, Field(description="The vendor's style / item number as printed.")] = None
+    matrix_id: Annotated[int | None, Field(description="For a suit, tux, vest or pants: its Color/Size/Fit matrix.")] = None
+    color: Annotated[str | None, Field(description="With matrix_id: color exactly as the vendor names it.")] = None
+    size: Annotated[str | None, Field(description="With matrix_id: size, e.g. '42R'; pants: waist only.")] = None
+    fit: Annotated[str | None, Field(description="With matrix_id: fit as the vendor names it.")] = None
+    description: Annotated[str | None, Field(description="The invoice's own text for the line (helps suggest matches).")] = None
+    price: Annotated[float | None, Field(description="For a matrix variant that doesn't exist yet: its selling price.")] = None
+    custom_sku: Annotated[str | None, Field(description="For a new item: its 6-digit SKU; empty = the next free one.")] = None
+    new_item: Annotated[NewItemDetails | None, Field(description="For a new item outside any matrix (shirts, ties, ...).")] = None
+
+
+@tool
+def match_invoice_lines(
+    vendor_id: Annotated[int, Field(description="The vendor the invoice or packing slip is from (list_vendors).")],
+    lines: Annotated[list[InvoiceLine], Field(description="The document's lines, as read from it.")],
+) -> str:
+    """Before an intake: match each invoice / packing-slip line to the store's items. Each line comes
+    back as existing (with the item), new_variant (a matrix gains a color/size/fit), new_item, or
+    unresolved (with the reason and candidate items by description). Read-only."""
+    return run(lambda r: intake.match_report(intake.InvoiceMatcher(r).match(vendor_id, [l.model_dump() for l in lines])))
+
+
 @tool
 def show_write_log(
     limit: Annotated[int, Field(description="Maximum writes to list, newest first (1-500).")] = 20,
@@ -601,6 +636,154 @@ def archive_item(
     and that can't be undone. One item per call. Matrices can never be archived with this
     server; that stays manual in Lightspeed. The item's values are saved in the write log first."""
     return run(lambda w: w.archive_item(item_id, dry_run, confirm_code), writer)
+
+
+class NewItem(NewItemDetails):
+    vendor_id: Annotated[int, Field(description="Default vendor (list_vendors).")]
+    cost: Annotated[float, Field(description="Default cost.")]
+
+
+@write_tool
+def create_items(
+    items: Annotated[list[NewItem], Field(description="The new items (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Create items outside any matrix (shirts, ties, shoes, accessories), each with its own custom
+    SKU (the next free one unless given), cost, Default price and the store's tax class. Refuses
+    pants (they go in a pants matrix), 3-piece or boys' items, vendor codes in the description, and
+    a description an active item already has. Warns about suits, tuxedos and vests, which usually
+    belong in a matrix."""
+    return run(lambda w: w.create_items([i.model_dump() for i in items], dry_run, confirm_code), writer)
+
+
+@write_tool
+def create_purchase_order(
+    vendor_id: Annotated[int, Field(description="The vendor (list_vendors).")],
+    ref_num: Annotated[str, Field(description="The vendor's invoice or order number.")],
+    ship_cost: Annotated[float | None, Field(description="Shipping on the invoice.")] = None,
+    other_cost: Annotated[float | None, Field(description="Other charges on the invoice.")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Create a new, empty purchase order. Refuses a reference number this vendor already has on a PO
+    (so one invoice can't be entered twice). Lines are added with add_po_lines; for a whole invoice,
+    intake_invoice does everything in one approval."""
+    return run(lambda w: w.create_purchase_order(vendor_id, ref_num, ship_cost, other_cost, dry_run, confirm_code),
+               writer)
+
+
+@write_tool
+def update_purchase_order(
+    order_id: Annotated[int, Field(description="An unfinished purchase order.")],
+    ref_num: Annotated[str | None, Field(description="New reference number.")] = None,
+    ship_cost: Annotated[float | None, Field(description="New shipping cost.")] = None,
+    other_cost: Annotated[float | None, Field(description="New other costs (negative = a discount).")] = None,
+    ordered_date: Annotated[str | None, Field(description="YYYY-MM-DD; puts the PO in Ordered.")] = None,
+    received_date: Annotated[str | None, Field(description="YYYY-MM-DD; puts the PO in Check In.")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Change a PO's reference, shipping or other costs, or its ordered / received date (which move it to
+    Ordered / Check In; Lightspeed needs at least one line for that). Never marks it finished: that and
+    Add Received To Inventory stay clicks in Lightspeed."""
+    return run(lambda w: w.update_purchase_order(order_id, ref_num, ship_cost, other_cost, ordered_date,
+                                                 received_date, dry_run, confirm_code), writer)
+
+
+class PoLineEdit(BaseModel):
+    order_line_id: Annotated[int, Field(description="The PO line (get_purchase_order lists them).")]
+    quantity: Annotated[int | None, Field(description="New quantity ordered.")] = None
+    unit_cost: Annotated[float | None, Field(description="New unit cost.")] = None
+
+
+@write_tool
+def update_po_lines(
+    order_id: Annotated[int, Field(description="An unfinished purchase order.")],
+    lines: Annotated[list[PoLineEdit], Field(description="Lines and their new quantity and/or unit cost.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Change PO lines' quantity ordered and/or unit cost. Refuses lowering a quantity below what was
+    already received, and changing the cost of a line some of which was already added to inventory."""
+    return run(lambda w: w.update_po_lines(order_id, [l.model_dump() for l in lines], dry_run, confirm_code), writer)
+
+
+@write_tool
+def remove_po_lines(
+    order_id: Annotated[int, Field(description="An unfinished purchase order.")],
+    order_line_ids: Annotated[list[int], Field(description="The lines to remove.")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Remove PO lines that have nothing received or checked in. Lightspeed deletes PO lines for good,
+    so each line's values are saved in the write log first."""
+    return run(lambda w: w.remove_po_lines(order_id, order_line_ids, dry_run, confirm_code), writer)
+
+
+class VendorNumber(BaseModel):
+    item_id: Annotated[int, Field(description="The item.")]
+    vendor_number: Annotated[str, Field(description="The vendor's own number for exactly this item.")]
+
+
+@write_tool
+def set_vendor_numbers(
+    vendor_id: Annotated[int, Field(description="The vendor whose numbers these are.")],
+    items: Annotated[list[VendorNumber], Field(description="Items and their vendor numbers (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Save a vendor's own item number on items (Lightspeed's Vendor ID field, one per vendor per
+    item), so that vendor's invoices match them. Each number must belong to one item: a style number
+    shared by all sizes or colors is refused. Existing vendor numbers are kept."""
+    return run(lambda w: w.set_vendor_numbers(vendor_id, [i.model_dump() for i in items], dry_run, confirm_code),
+               writer)
+
+
+@write_tool
+def intake_invoice(
+    vendor_id: Annotated[int, Field(description="The vendor on the invoice or packing slip.")],
+    invoice_number: Annotated[str, Field(description="The document's invoice / order number (the PO's reference).")],
+    lines: Annotated[list[InvoiceLine], Field(description="Every line on the document (max 100).")],
+    invoice_date: Annotated[str | None, Field(description="YYYY-MM-DD, the document's date (the PO's ordered date).")] = None,
+    ship_cost: Annotated[float | None, Field(description="Shipping on the document.")] = None,
+    other_cost: Annotated[float | None, Field(description="Other charges on the document.")] = None,
+    order_id: Annotated[int | None, Field(description="An existing unfinished PO this document belongs to; empty = create one.")] = None,
+    mark_received: Annotated[bool, Field(description="True (default): the goods are here; mark each line received and put the PO in Check In.")] = True,
+    save_vendor_numbers: Annotated[bool, Field(description="Save each line's vendor number on its item when it belongs to that item alone.")] = True,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Enter a whole invoice or packing slip in one approval. Read the document, call
+    match_invoice_lines first and resolve every line, then call this. The plan: create the PO (or use
+    order_id; a reference already used for this vendor is refused), create missing items (variants
+    in a matrix with their price, or standalone items), save vendor numbers, add or update the PO
+    lines at the invoice's unit cost with what was received, and set the PO's ordered date and Check In.
+    Stock changes only when the user clicks Add Received To Inventory on the PO in Lightspeed (no API
+    call exists for it): always tell them."""
+    return run(lambda w: w.intake_invoice(vendor_id, invoice_number, [l.model_dump() for l in lines], invoice_date,
+                                          ship_cost, other_cost, order_id, mark_received, save_vendor_numbers,
+                                          dry_run, confirm_code), writer)
+
+
+@write_tool
+def update_matrix(
+    matrix_id: Annotated[int, Field(description="The matrix to change.")],
+    description: Annotated[str | None, Field(description="New plain-language description naming the garment type (renames every item in the matrix).")] = None,
+    category_id: Annotated[int | None, Field(description="New category (applies to every item).")] = None,
+    manufacturer_id: Annotated[int | None, Field(description="New brand (applies to every item).")] = None,
+    vendor_id: Annotated[int | None, Field(description="New default vendor (applies to every item).")] = None,
+    default_cost: Annotated[float | None, Field(description="New default cost for new items.")] = None,
+    price: Annotated[float | None, Field(description="New Default price for new items (other price levels kept).")] = None,
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Change an existing matrix. Lightspeed applies description, category, brand and vendor to every
+    item in the matrix (the dry run shows how many change and previews renamed items); price and
+    default cost are defaults for new items. Never changes the attribute set or attribute values, and
+    never archives (archiving a matrix stays manual). Only fields that actually change are sent."""
+    return run(lambda w: w.update_matrix(matrix_id, description, category_id, manufacturer_id, vendor_id,
+                                         default_cost, price, dry_run, confirm_code), writer)
 
 
 if __name__ == "__main__":

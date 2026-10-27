@@ -2,9 +2,10 @@
 
 A local MCP server that lets Claude Desktop read the Suits 4 Men Lightspeed
 Retail (R-Series) account (items, matrices, attribute sets, vendors,
-categories, purchase orders and stock) and, with your approval, make eight
-narrow kinds of change. Matrices can never be updated or archived through it:
-that stays manual in Lightspeed.
+categories, purchase orders and stock) and, with your approval, make narrow,
+task-shaped changes: items and matrices, SKUs, vendor numbers, purchase orders
+and their lines, and whole invoices or packing slips in one approval.
+Matrices can never be archived through it: that stays manual in Lightspeed.
 
 - **Read tools** (Phase 1) use a client that refuses every request except GET.
   They can never change Lightspeed.
@@ -141,6 +142,7 @@ across several entries and switched over atomically. See
 | `show_write_log` | Whether writes are on, and every write sent from this computer: payload, outcome, status, affected IDs |
 | `take_snapshot` | Saves a snapshot to `backups\` in the background (about 75 s). GET only; it adds files on this computer |
 | `compare_snapshots` | Lists snapshots and compares two (by default the two newest), field by field |
+| `match_invoice_lines` | Matches an invoice's or packing slip's lines to items: existing, new variant, new item, or unresolved (with candidates) |
 
 ### Write tools
 
@@ -154,6 +156,14 @@ across several entries and switched over atomically. See
 | `move_items_into_matrix` | `PUT Item/<id>.json` per item: its matrix and Color/Size/Fit, plus (unless told not to) the matrix's description pattern, category, manufacturer and vendor | Send prices, cost, SKU or stock |
 | `assign_custom_skus` | `PUT Item/<id>.json` per item with only `customSku`, for items that have none; empty ones get the next free SKU | Replace an existing SKU |
 | `archive_item` | `DELETE Item/<id>.json` for **one** item with stock exactly 0 and on no open PO (Lightspeed archives on DELETE) | Archive a matrix, or an item with stock |
+| `create_items` | `POST Item.json` per new item outside any matrix (shirts, ties, shoes), own SKU, cost, price | Create pants (they go in a pants matrix) |
+| `create_purchase_order` | `POST Order.json`: a new, empty PO with the vendor's reference and shipping/other costs | Reuse a reference the vendor already has on a PO |
+| `update_purchase_order` | `PUT Order/<id>.json`: reference, costs, ordered date (→ Ordered), received date (→ Check In) | Mark a PO finished or archive it |
+| `update_po_lines` | `PUT OrderLine/<id>.json`: quantity ordered and/or unit cost | Go below what was received, or re-cost what was checked in |
+| `remove_po_lines` | `DELETE OrderLine/<id>.json` for lines with nothing received (Lightspeed deletes them for good; logged first) | Remove a line with anything received |
+| `set_vendor_numbers` | `PUT Item/<id>.json` with the vendor's own number (Lightspeed's Vendor ID), keeping the item's other vendor numbers | Put one number on two items |
+| `intake_invoice` | A whole invoice or packing slip in one approval: PO, new items, vendor numbers, lines with what was received, Check In | Add the goods to stock (a click in Lightspeed) |
+| `update_matrix` | `PUT ItemMatrix/<id>.json`: description, category, brand, vendor, default cost, Default price, only what changes | Change the attribute set or values, or archive |
 
 `receive_po_lines` marks goods as received on the PO. Stock on hand changes
 only when someone presses **Add Received To Inventory** on that PO in
@@ -172,6 +182,39 @@ the item's values in the write log first, because Lightspeed's docs show
 archiving also switching the item to non-inventory and not taxable.
 Unarchiving may be possible but is not built.
 
+#### Entering an invoice or packing slip
+
+1. Give Claude the document (a PDF or a photo in the chat). It reads each line.
+2. Claude runs `match_invoice_lines`: each line comes back as an existing
+   item, a new size/color for a matrix, a new item outside any matrix, or
+   unresolved with the closest candidates. Unresolved lines need a decision
+   (which item, or that it is new and at what price).
+3. Claude runs `intake_invoice` as a dry run: one plan for the whole
+   document. It creates the PO (or uses the one you name), creates missing items
+   with their own SKUs, saves vendor numbers, adds the lines at the invoice's
+   unit cost with what was received, sets the ordered date and puts the PO in
+   **Check In**. A vendor's invoice number that is already on a PO is refused,
+   so one invoice can't be entered twice.
+4. You approve it once, as for any write.
+5. In Lightspeed, open the PO, check the received quantities against the
+   goods, click **Add Received To Inventory**, then **Finished**. Lightspeed's API
+   has no call for that step, so stock only changes when you click it.
+
+Vendor numbers: Lightspeed's "Vendor ID" on an item must belong to that item
+alone (its receive-by-Vendor-ID breaks otherwise). A number printed on several
+lines of one invoice is a style number shared by sizes or colors, and is not saved.
+
+#### Updating a matrix
+
+Lightspeed applies a matrix's description, category, brand and vendor to
+**every item in it** ("Shared values"). A new description renames all of them
+('Caravelli Suit Black 42R Slim'). The dry run says how many items each change
+reaches and previews the new names. Price and default cost are defaults for new
+items ("Default values"); Lightspeed's help says existing items keep their own
+unless someone clicks Reset Items To Defaults, which is not confirmed for the
+API, so the dry run also shows what the items sell at today. Take a snapshot
+before the first matrix update and compare after.
+
 The tools refuse (and say which rule) anything that breaks the store's rules:
 
 - a matrix outside attribute set 5;
@@ -181,11 +224,13 @@ The tools refuse (and say which rule) anything that breaks the store's rules:
 - a custom SKU that isn't 6 digits or is already used (archived items included);
 - a duplicate variant;
 - receiving more than was ordered;
-- archiving an item with stock or on an open PO.
+- archiving an item with stock or on an open PO;
+- pants outside a pants matrix; a new item whose description an active item already has;
+- an invoice number the vendor already has on a PO.
 
 Color and fit values are sent exactly as given, never re-cased. Prices are
-only ever set on new records, and only to the price you give. Matrix 7's own
-price (61.21, equal to its cost) is never copied. The patterns behind the text
+only ever set on new records and as a matrix's default, and only to the price
+you give. Matrix 7's own price (61.21, equal to its cost) is never copied. The patterns behind the text
 rules are at the top of `lightspeed_mcp/rules.py`.
 
 #### Making a change

@@ -52,6 +52,9 @@ CALLS = [
     ("suggest_custom_skus", {"count": 5}),
     ("show_write_log", {}),
     ("compare_snapshots", {"limit": 5}),  # local files only; take_snapshot is left out (it adds a folder)
+    ("match_invoice_lines", {"vendor_id": 1, "lines": [
+        {"matrix_id": 7, "color": "Black", "size": "42R", "fit": "Slim", "quantity": 2, "unit_cost": 63.5},
+        {"description": "CARAVELLI 2PC SUIT BURGUNDY 58L", "quantity": 1, "unit_cost": 63.5}]}),
 ]
 
 # Dry runs of the write tools on real records. dry_run is always True (checked below).
@@ -77,6 +80,25 @@ DRY_RUNS = [
     ("assign_custom_skus", {"items": [{"item_id": i} for i in (2321, 2322, 2323, 2324, 2325)]}),
     # Only to show the request: 1345 has stock 0 and is on no open PO.
     ("archive_item", {"item_id": 1345}),
+    # A shirt outside any matrix, like item 1468 "Premium Dress Shirts" (Christopher Lena, vendor 11).
+    ("create_items", {"items": [{"description": "Dress Shirt White 15.5 32/33", "category_id": 118, "vendor_id": 11,
+                                 "cost": 15, "price": 59.5}]}),
+    ("create_purchase_order", {"vendor_id": 1, "ref_num": "112500", "ship_cost": 58.82}),
+    ("update_purchase_order", {"order_id": 853, "ordered_date": "2026-10-20"}),
+    ("update_po_lines", {"order_id": 853, "lines": [{"order_line_id": 2695, "quantity": 2}]}),
+    ("remove_po_lines", {"order_id": 853, "order_line_ids": [2695]}),
+    ("set_vendor_numbers", {"vendor_id": 1, "items": [{"item_id": 1622, "vendor_number": "SM-CV-BEI-54R-C"}]}),
+    # A made-up San Malone packing slip: an existing suit, a size matrix 7 lacks, and a new tie.
+    ("intake_invoice", {"vendor_id": 1, "invoice_number": "SM-DRYRUN-1", "invoice_date": "2026-10-24",
+                        "ship_cost": 25, "lines": [
+                            {"matrix_id": 7, "color": "Black", "size": "42R", "fit": "Slim", "quantity": 2,
+                             "unit_cost": 63.5},
+                            {"matrix_id": 7, "color": "Cobalt", "size": "58R", "fit": "Slim", "quantity": 1,
+                             "unit_cost": 63.5, "price": 599.95},
+                            {"new_item": {"description": "Silk Tie Navy Paisley", "category_id": 63, "price": 39.95},
+                             "quantity": 6, "unit_cost": 8}]}),
+    ("update_matrix", {"matrix_id": 7, "description": "Caravelli Suit"}),
+    ("update_matrix", {"matrix_id": 7, "price": 599.95}),
 ]
 
 
