@@ -26,13 +26,14 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from lightspeed_mcp import snapshots
 from lightspeed_mcp.client import LightspeedClient
 from lightspeed_mcp.config import HTTP_TIMEOUT_SECONDS
 from lightspeed_mcp.errors import LightspeedError, NotBootstrappedError
 from lightspeed_mcp.reader import PO_STATUSES, InventoryReader
 from lightspeed_mcp.secret_store import SecretStore
 from lightspeed_mcp.tokens import TokenManager
-from lightspeed_mcp.write_path import WriteClient
+from lightspeed_mcp.write_path import WriteClient, WriteLog, WriteSwitch, write_log_report
 from lightspeed_mcp.writer import InventoryWriter
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -49,18 +50,24 @@ mcp = MCPServer(
         "api_get can never change anything. Five write tools (create_matrix, add_matrix_variants, "
         "update_item_fields, add_po_lines, receive_po_lines) default to dry runs that send nothing. Never make a "
         "real write unless the user, in this chat, has approved that exact dry run; an approval covers one write "
-        "only. Real writes are refused while the store owner has writes turned off."
+        "only. Real writes are refused while the store owner has writes turned off. suggest_custom_skus gives "
+        "unused SKUs, show_write_log lists what has been written, and take_snapshot / compare_snapshots save and "
+        "compare a read-only copy of the inventory data (good before and after a real write)."
     ),
 )
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 # Tells Claude Desktop these tools can change data (even though they default to dry runs).
-WRITES =ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
+WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True)
+# take_snapshot only reads Lightspeed, but it adds files to backups/ on this computer.
+LOCAL_FILES = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
 
 _reader: InventoryReader | None = None
 _reader_lock = threading.Lock()
 _writer: InventoryWriter | None = None
 _writer_lock = threading.Lock()
+_snapshots: snapshots.SnapshotRunner | None = None
+_snapshots_lock = threading.Lock()
 
 
 def reader() -> InventoryReader:
@@ -86,6 +93,21 @@ def writer() -> InventoryWriter:
             client = read.client
             _writer = InventoryWriter(read, WriteClient(client.account_id, client.tokens, client.limiter))
         return _writer
+
+
+def snapshot_runner() -> snapshots.SnapshotRunner:
+    """Takes snapshots in the background with the GET-only read client."""
+    global _snapshots
+    read = reader()
+    with _snapshots_lock:
+        if _snapshots is None:
+            _snapshots = snapshots.SnapshotRunner(read.client)
+        return _snapshots
+
+
+def local():
+    """For tools that only look at files on this computer: no Lightspeed client needed."""
+    return None
 
 
 def run(call, logic=reader) -> str:
@@ -372,6 +394,52 @@ def api_get(
     records (and relations that load them) are refused. Filter syntax: field=value,
     field=~,%text% (like), field=IN,[1,2], field=>,5. See developers.lightspeedhq.com/retail."""
     return run(lambda r: r.api_get(path, params, all_pages, max_records))
+
+
+# ---- SKUs, the write log, snapshots ---------------------------------------------------------
+
+
+@tool
+def suggest_custom_skus(
+    count: Annotated[int, Field(description="How many SKUs to suggest (1-200).")] = 10,
+) -> str:
+    """The next unused 6-digit custom SKUs, continuing after the highest SKU in use (archived
+    items included, so old numbers are never reused). Also the number of active items without
+    a SKU. Suggestions are not reserved; the write tools check again before using one."""
+    return run(lambda r: r.suggest_custom_skus(count))
+
+
+@tool
+def show_write_log(
+    limit: Annotated[int, Field(description="Maximum writes to list, newest first (1-500).")] = 20,
+) -> str:
+    """Whether writes to Lightspeed are turned on, and every write this computer has sent: when,
+    which tool, method, path, the JSON payload, the outcome (done / failed / unknown), HTTP status
+    and the IDs it affected. Reads the local log only."""
+    return run(lambda _: write_log_report(WriteSwitch(), WriteLog(), limit), local)
+
+
+@mcp.tool(annotations=LOCAL_FILES, structured_output=False)
+def take_snapshot() -> str:
+    """Start a snapshot of the store's inventory data: every item (stock, prices, costs, SKUs,
+    attributes), matrix, attribute set, category, manufacturer, vendor, tax class, purchase order,
+    PO line and receipt, saved as JSON under backups/ on this computer. GET only: it changes
+    nothing in Lightspeed. Runs in the background (about 75 seconds) and returns at once; use
+    compare_snapshots to see when it is complete. Good before and after any real write."""
+    return run(lambda _: snapshot_runner().start(), local)
+
+
+@tool
+def compare_snapshots(
+    older: Annotated[str | None, Field(description="Older snapshot name, e.g. '2026-10-26_202204'. Leave both empty for the two newest.")] = None,
+    newer: Annotated[str | None, Field(description="Newer snapshot name.")] = None,
+    record_type: Annotated[str | None, Field(description="Only this record type, e.g. 'Item', 'ItemMatrix', 'OrderLine'.")] = None,
+    limit: Annotated[int, Field(description="Records listed per type (1-200); counts always cover everything.")] = 20,
+) -> str:
+    """List snapshots (newest first, with complete / running / failed), and compare two: records
+    added, removed and changed, with each changed field's old and new value. Changes from normal
+    store activity (sales change stock and timestamps) show up too. Reads local files only."""
+    return run(lambda _: snapshots.compare_report(older, newer, record_type, limit), local)
 
 
 # ---- write tools (dry run by default) --------------------------------------------------------

@@ -360,8 +360,19 @@ Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
 - Taken at 20:22 and 20:39 on 2026-10-26, before and after building Phase 2:
   **identical, 0 differences in every record type.**
 
+## Helper tools (2026-10-26, evening)
+
+- `suggest_custom_skus`, `show_write_log`, `take_snapshot`, `compare_snapshots`.
+  None can write to Lightspeed. `take_snapshot` adds a folder under backups/.
+- Live: the next free SKUs are 013471 upward (highest in use 013470);
+  830 items checked; 57 active items without a SKU.
+- `take_snapshot` runs in a background thread of the server: the tool returns
+  at once, and `manifest.json` (written last) marks the folder complete.
+- A third snapshot (2026-10-26_211318) taken through the runner compared
+  identical to 203912: still 0 differences, so nothing changed in Lightspeed.
+
 ## Tooling
 
-- `check_tools.py` calls every read tool over stdio against the live account (GET only, 26 calls, about 90 s).
+- `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
   `check_tools.py --dry-runs` calls the five write tools on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (296 tests).
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (316 tests).

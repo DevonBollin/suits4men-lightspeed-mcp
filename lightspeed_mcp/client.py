@@ -172,13 +172,16 @@ class LightspeedClient:
         """GET one page (or one record). `path` is relative to the account, e.g. "Item/123.json"."""
         return self.request("GET", path, params)
 
-    def get_all(self, path: str, params: dict | None = None, max_records: int | None = None) -> tuple[list[dict], bool]:
+    def get_all(self, path: str, params: dict | None = None, max_records: int | None = None,
+                record_key: str | None = None) -> tuple[list[dict], bool]:
         """GET every page of a list endpoint.
 
         Returns (records, truncated). `truncated` is True when more records
-        exist beyond `max_records`.
+        exist beyond `max_records`. `record_key` is the JSON key holding the
+        records, when it is not the endpoint's name (Shipment.json answers
+        under "OrderShipment").
         """
-        record_key = self.record_key(path)
+        record_key = record_key or self.record_key(path)
         page_params = dict(params or {})
         page_size = MAX_PAGE_SIZE if max_records is None else max(1, min(MAX_PAGE_SIZE, max_records))
         page_params.setdefault("limit", str(page_size))

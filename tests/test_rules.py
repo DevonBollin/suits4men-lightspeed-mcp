@@ -88,12 +88,15 @@ def test_custom_sku_format(sku, ok):
 
 
 def test_server_marks_exactly_the_write_tools_as_writes():
-    """Every other tool is read-only; the five write tools are the only ones with a write route."""
+    """Every other tool is read-only, except take_snapshot, which only adds local files (GET only)."""
     import server
 
     tools = asyncio.run(server.mcp.list_tools())
-    writes = {t.name for t in tools if not (t.annotations and t.annotations.read_only_hint)}
-    assert writes == set(WRITE_ROUTES)
+    not_read_only = {t.name for t in tools if not (t.annotations and t.annotations.read_only_hint)}
+    assert not_read_only == set(WRITE_ROUTES) | {"take_snapshot"}
+    snapshot_tool = next(t for t in tools if t.name == "take_snapshot")
+    assert snapshot_tool.annotations.destructive_hint is False
+    writes = set(WRITE_ROUTES)
     for t in tools:
         if t.name in writes:
             assert "dry_run" in t.input_schema["properties"]

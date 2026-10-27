@@ -49,6 +49,9 @@ CALLS = [
     ("vendor_returns", {"vendor_return_id": 1}),
     ("search_vendor_catalog", {"vendor_number": "A0000200IX"}),
     ("api_get", {"path": "Manufacturer.json", "params": {"limit": "2"}}),
+    ("suggest_custom_skus", {"count": 5}),
+    ("show_write_log", {}),
+    ("compare_snapshots", {"limit": 5}),  # local files only; take_snapshot is left out (it adds a folder)
 ]
 
 # Dry runs of the write tools on real records. dry_run is always True (checked below).

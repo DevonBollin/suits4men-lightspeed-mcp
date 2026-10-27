@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from . import format as fmt
 from .client import LightspeedClient
 from .errors import ApiError
+from .rules import CUSTOM_SKU_PATTERN
 
 CACHE_SECONDS = 600
 MAX_IN_IDS = 100  # Lightspeed's limit for an IN,[...] filter
@@ -939,6 +940,38 @@ class InventoryReader:
         }
         if truncated:
             result["more_available"] = True
+        return result
+
+    # ---- custom SKUs ----------------------------------------------------------------------------
+
+    def suggest_custom_skus(self, count: int = 10) -> dict:
+        """The next unused 6-digit custom SKUs, counting up from the highest one in use.
+
+        Archived items count too, so an old number (maybe still on a printed
+        label) is never handed out again. Gaps below the highest are not reused
+        for the same reason. Nothing is reserved: the write tools check again.
+        """
+        count = max(1, min(int(count), 200))
+        items, _ = self.client.get_all("Item.json", {"archived": "true"})
+        in_use = {fmt.text(i.get("customSku")) for i in items if fmt.text(i.get("customSku"))}
+        six_digit = sorted(s for s in in_use if CUSTOM_SKU_PATTERN.match(s))
+        highest = six_digit[-1] if six_digit else None
+        start = int(highest) + 1 if highest else 1
+        suggested = [f"{n:06d}" for n in range(start, min(start + count, 1_000_000))]
+        result = {
+            "highest_in_use": highest,
+            "suggested": suggested,
+            "items_checked": len(items),
+            "active_items_without_sku": sum(1 for i in items
+                                            if not fmt.text(i.get("customSku")) and not fmt.flag(i.get("archived"))),
+            "note": "Suggestions continue after the highest SKU in use (archived items included) and are not "
+                    "reserved. add_matrix_variants and update_item_fields check again that each one is unused.",
+        }
+        other = sorted(in_use - set(six_digit))
+        if other:
+            result["skus_not_6_digit"] = other[:50]
+        if len(suggested) < count:
+            result["note"] += " The 6-digit range is nearly used up."
         return result
 
     # ---- escape hatch ---------------------------------------------------------------------

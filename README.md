@@ -136,6 +136,10 @@ across several entries and switched over atomically. See
 | `vendor_returns`, `list_special_orders` | Returns to vendors; customer special orders |
 | `search_vendor_catalog` | Exact UPC or style-number lookups in Lightspeed's vendor catalogs |
 | `api_get` | Read-only GET of an inventory endpoint, raw JSON. Customer, employee and payment data are refused |
+| `suggest_custom_skus` | The next unused 6-digit SKUs, after the highest in use (archived items included, so old numbers are never reused) |
+| `show_write_log` | Whether writes are on, and every write sent from this computer: payload, outcome, status, affected IDs |
+| `take_snapshot` | Saves a snapshot to `backups\` in the background (about 75 s). GET only; it adds files on this computer |
+| `compare_snapshots` | Lists snapshots and compares two (by default the two newest), field by field |
 
 ### Write tools
 
@@ -175,11 +179,10 @@ rules are at the top of `lightspeed_mcp/rules.py`.
    anything changed in between (your arguments or the data in Lightspeed), the code
    no longer matches and the call is refused until a fresh dry run is approved.
 
-It is a good habit to take a snapshot before and after a real write:
-
-```powershell
-.venv\Scripts\python.exe backup_lightspeed.py
-```
+It is a good habit to take a snapshot before and after a real write: ask
+Claude to take one (`take_snapshot`) and, afterwards, to compare the two
+(`compare_snapshots`). Or run `.venv\Scripts\python.exe backup_lightspeed.py`.
+`show_write_log` lists what was actually sent.
 
 #### Turning writes on and off
 
@@ -247,14 +250,19 @@ To see each write tool's dry run on real records (GET only, nothing is sent):
 
 ```powershell
 .venv\Scripts\python.exe backup_lightspeed.py
+.venv\Scripts\python.exe backup_lightspeed.py --list
 .venv\Scripts\python.exe backup_lightspeed.py --compare 2026-10-26_202204 2026-10-26_203912
 ```
 
 The first command saves every item (with stock, prices, costs, SKUs and
 attributes), matrix, attribute set, category, manufacturer, vendor, tax class,
 purchase order, PO line and receipt to `backups\<date_time>\` as JSON. It takes
-about 75 seconds and sends GET only. The second lists what was added, removed or
-changed between two snapshots, field by field.
+about 75 seconds and sends GET only. `--list` shows the snapshots, and `--compare`
+lists what was added, removed or changed between two of them, field by field.
+In Claude Desktop, `take_snapshot` and `compare_snapshots` do the same
+(the logic is in `lightspeed_mcp/snapshots.py`). A snapshot folder is complete
+once it has `manifest.json`; if one stopped, `FAILED.txt` in it says why.
+Normal store activity (sales change stock and timestamps) shows up in a comparison too.
 
 Lightspeed has no "restore from file", so a snapshot is not a one-click undo.
 It is an exact record of every value, to check changes against and, if needed,

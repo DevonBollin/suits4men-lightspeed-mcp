@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from lightspeed_mcp.client import BucketLimiter, LightspeedClient
+from lightspeed_mcp.snapshots import BACKUP_DIR
 from lightspeed_mcp.secret_store import AppConfig, SecretStore, Tokens
 from lightspeed_mcp.tokens import TokenManager
 from lightspeed_mcp.write_path import WRITE_LOG_PATH, WRITE_SWITCH_PATH, WriteClient, WriteLog, WriteSwitch
@@ -106,13 +107,16 @@ def make_client(fake_api, clock):
 
 @pytest.fixture(autouse=True)
 def real_write_switch_untouched():
-    """No test may create, remove or use the real write switch or write log in state/."""
+    """No test may create, remove or use the real write switch, write log or backups/ folder."""
     switch_before = WRITE_SWITCH_PATH.exists()
     log_before = WRITE_LOG_PATH.stat().st_size if WRITE_LOG_PATH.exists() else None
+    backups_before = sorted(p.name for p in BACKUP_DIR.iterdir()) if BACKUP_DIR.is_dir() else []
     yield
     assert WRITE_SWITCH_PATH.exists() == switch_before, "a test changed the real write switch"
     assert (WRITE_LOG_PATH.stat().st_size if WRITE_LOG_PATH.exists() else None) == log_before, \
         "a test wrote to the real write log"
+    assert (sorted(p.name for p in BACKUP_DIR.iterdir()) if BACKUP_DIR.is_dir() else []) == backups_before, \
+        "a test changed the real backups folder"
 
 
 @pytest.fixture

@@ -120,9 +120,43 @@ class WriteLog:
                 f.write(line + "\n")
 
     def entries(self) -> list[dict]:
+        """Every line, oldest first. A line that isn't valid JSON (e.g. cut short by a crash) is skipped."""
         if not self.path.exists():
             return []
-        return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        found = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            try:
+                found.append(json.loads(line))
+            except ValueError:
+                if line.strip():
+                    log.warning("Skipped an unreadable line in %s.", self.path)
+        return found
+
+
+def write_log_report(switch: WriteSwitch, write_log: WriteLog, limit: int = 20) -> dict:
+    """The switch state and the logged writes, one row per write, newest first."""
+    writes: dict[str, dict] = {}
+    for e in write_log.entries():
+        w = writes.setdefault(e.get("write_id", "?"), {
+            "write_id": e.get("write_id"), "tool": e.get("tool"), "method": e.get("method"), "path": e.get("path"),
+            "confirm_code": e.get("confirm_code")})
+        if e.get("event") == "sending":
+            w["sent"] = e.get("time")
+            w["payload"] = e.get("payload")
+        elif e.get("event") == "done":
+            w.update(outcome="done", status=e.get("status"), affected_ids=e.get("affected_ids"))
+        elif e.get("event") == "failed":
+            w.update(outcome="failed", status=e.get("status"), error=e.get("error"))
+    for w in writes.values():
+        # A "sending" line with no answer: the process stopped while the request was out.
+        w.setdefault("outcome", "unknown: no answer was recorded; check the record in Lightspeed")
+    rows = list(reversed(list(writes.values())))
+    limit = max(1, min(int(limit), 500))
+    result = {"writes_enabled": switch.is_on(), "log_file": str(write_log.path), "writes_logged": len(rows),
+              "writes": rows[:limit]}
+    if not rows:
+        result["note"] = "No write has ever been sent from this computer."
+    return result
 
 
 def route_allows(route: Route, method: str, relative_path: str) -> bool:
