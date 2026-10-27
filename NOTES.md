@@ -742,8 +742,43 @@ No real write was made.
    the tags read back with `load_relations ["Tags","TagRelations"]`.
 4. `set_upcs` / `reassign_items`: plain Item PUTs of documented fields.
 
+## Rules from the draft, batch archiving, sibling tags (2026-10-27)
+
+The store rules now follow the owner's draft inventory structure (§2 matrix types,
+§3 category tree, §4 garment types); the owner asked for it after reviewing which
+tools the restructure needs. No real write was made.
+
+- **Garment table** (`rules.GARMENTS`): 16 types, each with a matrix type, a size
+  format, the words a matrix description names it with, and the category names
+  that hold it. Accessories (belt, accessory) are the draft's provisional §4.15.
+- **Matrix types** are matched by attribute names in order, not set IDs: MT1
+  Color/Size/Fit = set 5, MT2 Color/Size/Width = a store-made set (not created
+  yet: shoe matrices are refused until it is), MT3 Color/Size = built-in 1, MT4
+  Color = built-in 3. This replaces the owner's 2026-10-26 rule "never a built-in
+  set": the draft uses them for MT3/MT4. Renaming a set's attributes changes its
+  matrix type (the dry run says so).
+- **Garment type of an existing matrix**: its category (nearest level that names
+  a garment type), else its description (specific phrases first; a bare "jacket"
+  decides nothing). Live: matrix 7 "Caravelli" (Suits/Suit) is a suit; 9 "Angelo
+  Rossi" (Suits/Suit, built-in Color) and 10 "Caravelli Tux" (Suits/Tuxedos,
+  built-in Color) are on the wrong type, so they take no new items (rebuild).
+- **create_matrix** refuses a category that holds another garment type (the draft:
+  "the leaf is the garment type"), and picks the set itself. In today's tree,
+  tux jackets, outerwear jackets, casual vests, casual pants and tux shirts have
+  no category yet: create them (create_category / move_category) first.
+- **Sizes**: only new size values are checked (sizes a matrix already has are left
+  alone). Portly is a Fit value ("Portly", Mantoni) until the draft decides; a
+  length code like 44PS is refused for now.
+- **Fit is never blank** on new items: "Standard" when the vendor names none (§2
+  rule 4). Matching existing items still accepts a blank fit (legacy items).
+- **archive_items**: archive_item's checks for up to 100 items; one per call until
+  an archive (either tool) is logged done.
+- **Sibling tags**: new variants get the tags every active item of the matrix has,
+  only after a set_item_tags write is logged done (before that, a warning names
+  them), so an unconfirmed tag format can't make an item POST fail.
+
 ## Tooling
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
   `check_tools.py --dry-runs` calls every write tool on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (679 tests).
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (711 tests).

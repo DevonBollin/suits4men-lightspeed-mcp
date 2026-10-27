@@ -92,11 +92,12 @@ Phase 2 changed the scopes (`employee:inventory` replaces
 `employee:inventory_read`, plus `employee:manufacturers`), and bootstrap was
 re-run afterwards.
 
-**Pending:** tags (`set_item_tags`) need `employee:tags`, added afterwards. Run
-bootstrap once more on each computer before the first tag change (everything
-else works with the current token; `server_info` lists the login's
-permissions). Re-authorizing changes no inventory data. Run it from a normal
-PowerShell window: from the Claude app's Terminal panel, open one with
+Tags (`set_item_tags`) need `employee:tags`, added afterwards. Bootstrap was
+re-run for it on the developer's computer (2026-10-27); **the store's computer
+needs the same re-run** after updating, before the first tag change
+(`server_info` lists the login's permissions). Re-authorizing changes no
+inventory data. Run it from a normal PowerShell window: from the Claude app's
+Terminal panel, open one with
 `Start-Process powershell -WorkingDirectory "C:\Development\Suits 4 Men Inventory"`.
 
 ## Two computers: developing here, running at the store
@@ -237,7 +238,7 @@ across several entries and switched over atomically. See
 
 | Tool | What it sends | What it never does |
 |---|---|---|
-| `create_matrix` | `POST ItemMatrix.json`: a new, empty matrix under attribute set 5 Color/Size/Fit | Update or archive an existing matrix |
+| `create_matrix` | `POST ItemMatrix.json`: a new, empty matrix on its garment type's matrix type, in its garment type's category | Update or archive an existing matrix |
 | `add_matrix_variants` | `POST Item.json` per new child item (color, size, fit, own custom SKU, the price and cost you give) | Touch the matrix or its existing items |
 | `update_item_fields` | `PUT Item/<id>.json` with only the changed fields among custom SKU, default cost, description | Change prices, stock or anything else |
 | `add_po_lines` | `POST OrderLine.json` per new line on an open PO | Receive anything |
@@ -245,6 +246,7 @@ across several entries and switched over atomically. See
 | `move_items_into_matrix` | `PUT Item/<id>.json` per item: its matrix and Color/Size/Fit, plus (unless told not to) the matrix's description pattern, category, manufacturer and vendor | Send prices, cost, SKU or stock |
 | `assign_custom_skus` | `PUT Item/<id>.json` per item with only `customSku`, for items that have none; empty ones get the next free SKU | Replace an existing SKU |
 | `archive_item` | `DELETE Item/<id>.json` for **one** item with stock exactly 0 and on no open PO (Lightspeed archives on DELETE) | Archive a matrix, or an item with stock |
+| `archive_items` | The same `DELETE` for up to 100 items in one approval, each with `archive_item`'s checks | Archive a matrix; (until a first archive is checked) more than one item |
 | `create_items` | `POST Item.json` per new item outside any matrix (shirts, ties, shoes), own SKU, cost, price | Create pants (they go in a pants matrix) |
 | `create_purchase_order` | `POST Order.json`: a new, empty PO with the vendor's reference and shipping/other costs | Reuse a reference the vendor already has on a PO |
 | `update_purchase_order` | `PUT Order/<id>.json`: reference, costs, ordered date (→ Ordered), received date (→ Check In) | Mark a PO finished or archive it |
@@ -357,6 +359,8 @@ such as fabric, finish and construction (`wool`, `super-150s`, `non-iron`,
 `half-canvas`). Tags are lowercase words joined by hyphens, so `Wool` and
 `wool` never become two tags. Each item's whole tag list is sent (kept + added),
 which gives the same result whether Lightspeed replaces the list or adds to it.
+New variants (`add_matrix_variants`, `intake_invoice`) get the tags every
+active item of their matrix has, once a first tag write has been checked.
 Lightspeed's current docs show tags only as a relation (`TagRelations`) and no
 way to write them, so the tool uses the older API's form and does **one item per
 call until a first tag write has been done and checked**. A matrix's tags in
@@ -390,14 +394,29 @@ before the first matrix update and compare after.
 
 #### Attribute sets (matrix types)
 
-An attribute set names the 1–3 dimensions a matrix's items differ by: set 5
-is Color / Size / Fit. **Suits, tuxedos, vests, pants and sport coats always use
-set 5.** Other garments (shirts, shoes) may use a set the store makes with
-`create_attribute_set`, e.g. Color / Neck / Sleeve, never one of Lightspeed's
-built-in sets 1–4, and **every set has Color**, so a matrix never splits by color.
-`create_matrix` takes `attribute_set_id` (5 by default); variants and moves take
-their values by the matrix's attribute names (`{"Neck": "15.5"}`), or
-color/size/fit for set 5.
+The rules follow the owner's draft "Suits 4 Men — Lightspeed R-Series Inventory
+Structure" (§2, §3, §4), table in `GARMENTS` in `lightspeed_mcp/rules.py`. Every
+garment type has one **matrix type**, an attribute set by its attribute names in
+order, and **every set has Color**, so a matrix never splits by color:
+
+| Matrix type | Attributes | Set | Garment types |
+|---|---|---|---|
+| MT1 | Color / Size / Fit | 5 (the store's) | suit, tuxedo, tux jacket, sport coat, vest (suit and tux), topcoat, pants (dress), dress shirt, tux shirt |
+| MT2 | Color / Size / Width | store-made: create it with `create_attribute_set` first | shoes |
+| MT3 | Color / Size | Lightspeed's built-in 1 | jacket (outerwear), casual vest, casual pants and denim, sweater, belt |
+| MT4 | Color | Lightspeed's built-in 3 | accessory (ties, pocket squares, ...; provisional) |
+
+`create_matrix` takes the garment type and picks the set; the category must be
+the one that holds that garment type when it holds one (Suits/Tuxedos holds
+tuxedos, so a tux jacket matrix waits for a Tux & Dinner Jackets category).
+Existing matrices take their garment type from their category. Variants and
+moves take values by the matrix's attribute names (`{"Width": "W"}`), or
+color/size/fit for slots 1–3. New sizes follow the garment type's format:
+`40R` (suits, jackets, vests, topcoats), the waist alone for pants (`34`;
+casual pants shipped hemmed `34S`), `15.5 34/35` for shirts, `10.5` for shoes,
+`S`–`6XL` for the rest. Fit is never blank: `Standard` when the vendor names
+none. A matrix on the wrong type (the Color-only tuxedo matrix 10) takes no new
+items: build a new matrix and move its items.
 
 While matrices use a set, `update_attribute_set` may rename it or its attributes
 (every matrix on it shows the new names; the dry run lists them) or add one, but
@@ -408,10 +427,10 @@ themselves, so the first one may be refused.
 
 The tools refuse (and say which rule) anything that breaks the store's rules:
 
-- suiting outside attribute set 5; a built-in set, or a set without Color, for any matrix;
-- a matrix description that names a color, lacks the garment type, or holds a vendor code;
+- a matrix off its garment type's matrix type, or in another garment type's category; a set without Color;
+- a matrix description that names a color, lacks the garment (shoes: the style name stands in), or holds a vendor code;
 - 3-piece or boys' items;
-- pants sizes that aren't waist-only;
+- sizes outside the garment type's format; a blank fit;
 - a custom SKU that isn't 6 digits or is already used (archived items included);
 - a duplicate variant;
 - receiving more than was ordered;
