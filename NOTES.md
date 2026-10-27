@@ -595,4 +595,4 @@ new_item.new_brand=…)`.
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
   `check_tools.py --dry-runs` calls every write tool on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (478 tests).
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (505 tests).
