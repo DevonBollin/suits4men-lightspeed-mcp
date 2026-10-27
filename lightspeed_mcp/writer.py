@@ -1645,7 +1645,11 @@ class InventoryWriter:
                     if (str(other.get("itemMatrixID")) != str(matrix_id) and not fmt.flag(other.get("archived"))
                             and (fmt.text(other.get("description")) or "").lower() == desc.lower()):
                         raise RuleViolation(f"Refused: matrix {other.get('itemMatrixID')} is already called '{desc}'.")
-                if desc != current_desc:
+                if desc != current_desc and not children:
+                    body["description"] = desc
+                    changes.append(f"description '{current_desc}' -> '{desc}'")
+                    warnings.append("The matrix has no items, so no item is renamed.")
+                elif desc != current_desc:
                     body["description"] = desc
                     changes.append(f"description '{current_desc}' -> '{desc}'")
                     examples = []
