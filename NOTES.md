@@ -674,8 +674,76 @@ set; never a built-in set (1-4); every set has Color. `rules.py` holds it
 - A third snapshot (2026-10-26_211318) taken through the runner compared
   identical to 203912: still 0 differences, so nothing changed in Lightspeed.
 
+## Items, vendor codes, UPCs, categories, stock, tags (2026-10-26/27)
+
+Built against the draft inventory structure (the owner's artifact "Suits 4 Men
+— Lightspeed R-Series Inventory Structure"), easiest and best documented first.
+No real write was made.
+
+### What the docs and the account say
+
+- **Item fields**: the Item docs list `categoryID`, `manufacturerID`,
+  `defaultVendorID`, `upc` and `ean` as writable on POST and PUT; `upc`/`ean`
+  "Must be 11-14 digits". Item PUT merges (confirmed live earlier).
+- **Archiving**: "If you archive an item with inventory, the inventory will be
+  zeroed out." So archiving answers the structure draft's question; the tool
+  still only archives items at 0 (adjust_stock settles them first).
+- **Stock**: not in the current Item or ItemShop docs (ItemShop PUT takes only
+  reorder settings). Lightspeed staff on the developer forum (2015): update qoh
+  with `<Item><ItemShops><ItemShop><qoh>` naming the shop; "ItemShop Id 0 is
+  read-only" (the all-shops total). The Item docs: "Either the itemShopID or
+  shopID field must be provided when making updates." The Cost control help
+  lists "quantity added through the API" among adjustments costed by that
+  setting. Item history labels API changes. **Unconfirmed**: the inventory log
+  reason Lightspeed records, and the cost it gives added stock.
+- **Categories**: the Category PUT lists `name`, `fullPathName`, `parentID`.
+  The Retail help moves a category by changing its Parent; moving a parent
+  carries its subcategories. **Unconfirmed**: whether the API recomputes
+  `fullPathName` (sent anyway) and subcategories' paths (hence leaf moves only).
+  The real tree is 32 categories, depth 2; every move the structure draft needs
+  (Tuxedos, Sport Coats, Top Coats, Sweaters, the vests' leaves) is a leaf.
+- **Tags**: Item and ItemMatrix list `TagRelations` / `TagRelations.Tag` as
+  relations only; the Tag endpoint renames or deletes a tag ("removed from all
+  records"). No documented way to put a tag on an item; the scope is
+  `employee:tags` ("View, create, update, and archive product tags").
+  `load_relations ["Tags","TagRelations"]` is accepted on Item and ItemMatrix;
+  no item or matrix 7 has tags. **Unconfirmed**: the write form (the older
+  API's `{"Tags": {"tag": [...]}}` is used) and the read shape.
+- **Vendors**: every one of the 677 vendors has `updatePrice`, `updateCost`,
+  `updateDescription` and `shareSellThrough` false (snapshot 2026-10-26_221615),
+  so "Update From Catalog" is already off everywhere.
+- **UPCs**: none of the 830 items has a `upc`, `ean` or `manufacturerSku`. The
+  `upc` filter is applied by the API (a `>,0` filter returned nothing, where an
+  ignored filter would return every item).
+- Inventory log `reason` values seen: `removeInventoryForTransaction`,
+  `removeInventoryForLayaway` (sales and layaways).
+
+### Decisions
+
+- **Shared vendor codes**: the structure draft keeps a vendor's style-color
+  code (Renoir `201-19`) on every size and fit and across garments of one
+  fabric, matching by matrix + attributes. The one-item-per-number rule is gone;
+  one number per vendor per item stays. Cost: Lightspeed's own Vendor ID
+  lookups (PO import) find several items.
+- **Stock** gets its own route (`ItemShops` only, one row by `itemShopID`, never
+  row 0, whole-number qoh) and tool; the confirm code covers the stock read, so
+  a sale after the dry run is never overwritten. One item per call until a
+  first change is logged done.
+- **Tags**: lowercase-hyphen names; the whole list is sent; one item per call
+  until a first tag write is logged done.
+
+### To confirm on the first real writes (each approved by the owner)
+
+1. `adjust_stock` on one item: snapshot before/after, `get_stock_history`
+   (reason recorded, cost change).
+2. `move_category` (e.g. Suits/Tuxedos to the top level): its path, and its
+   13 items and 2 matrices still in it.
+3. `set_item_tags` on one item, after re-running bootstrap for `employee:tags`:
+   the tags read back with `load_relations ["Tags","TagRelations"]`.
+4. `set_upcs` / `reassign_items`: plain Item PUTs of documented fields.
+
 ## Tooling
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
   `check_tools.py --dry-runs` calls every write tool on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (588 tests).
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (679 tests).

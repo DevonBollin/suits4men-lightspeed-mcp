@@ -65,19 +65,20 @@ DRY_RUNS = [
                        "manufacturer_id": 1, "default_cost": 20.5, "price": 159.95}),
     # Two sizes matrix 7 doesn't have yet. Its own price is 61.21 (= cost); its items sell at 599.95.
     ("add_matrix_variants", {"matrix_id": 7, "price": 599.95, "cost": 63.5, "variants": [
-        {"color": "Cobalt", "size": "58R", "fit": "Slim", "custom_sku": "013471"},
-        {"color": "Midnight Blue", "size": "58R", "fit": "Slim", "custom_sku": "013472"}]}),
-    # One of the 57 items without a custom SKU.
-    ("update_item_fields", {"item_id": 2321, "custom_sku": "013473"}),
+        {"color": "Cobalt", "size": "58R", "fit": "Slim", "custom_sku": "013472"},
+        {"color": "Midnight Blue", "size": "58R", "fit": "Slim", "custom_sku": "013473"}]}),
+    # One of the 56 items without a custom SKU (2321 got 013471 in the first real write).
+    ("update_item_fields", {"item_id": 2322, "custom_sku": "013474"}),
     # Open PO 853 (San Malone).
     ("add_po_lines", {"order_id": 853, "lines": [{"item_id": 1345, "quantity": 1}]}),
     ("receive_po_lines", {"order_id": 853, "lines": [{"order_line_id": 2684, "quantity": 1},
                                                      {"order_line_id": 2692, "quantity": 3}]}),
-    # Item 2321 "Caravelli Burgundy 58L Slim" is not in matrix 7, where it belongs.
-    ("move_items_into_matrix", {"matrix_id": 7, "items": [{"item_id": 2321, "color": "Burgundy", "size": "58L",
-                                                           "fit": "Slim"}]}),
-    # Five of the items without a custom SKU; the SKUs are picked automatically.
-    ("assign_custom_skus", {"items": [{"item_id": i} for i in (2321, 2322, 2323, 2324, 2325)]}),
+    # Item 2335 "Caravelli Burgundy 54L Classic" is not in matrix 7, where it belongs (2321 was moved in the
+    # third real write).
+    ("move_items_into_matrix", {"matrix_id": 7, "items": [{"item_id": 2335, "color": "Burgundy", "size": "54L",
+                                                           "fit": "Classic"}]}),
+    # Five of the items without a custom SKU (Stacy Adams shoes); the SKUs are picked automatically.
+    ("assign_custom_skus", {"items": [{"item_id": i} for i in (2322, 2323, 2324, 2325, 2326)]}),
     # Only to show the request: 1345 has stock 0 and is on no open PO.
     ("archive_item", {"item_id": 1345}),
     # A shirt outside any matrix, like item 1468 "Premium Dress Shirts" (Christopher Lena, vendor 11).
