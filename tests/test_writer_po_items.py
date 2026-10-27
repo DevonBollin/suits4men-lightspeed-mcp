@@ -343,8 +343,8 @@ def test_style_codes_on_several_lines_are_saved_on_each_item(writer):
      "give its selling price"),
     (dict(vendor_id=21, order_id=853), "another vendor"),
     (dict(lines=[{"item_id": 2000, "quantity": 1, "unit_cost": 1}]), "boys"),
-    (dict(lines=[{"matrix_id": 12, "color": "Black", "size": "34x32", "quantity": 1, "unit_cost": 20, "price": 99}]),
-     "waist only"),
+    (dict(lines=[{"matrix_id": 12, "color": "Black", "size": "34x32", "fit": "Standard", "quantity": 1,
+                  "unit_cost": 20, "price": 99}]), "waist alone"),
     (dict(lines=[]), "lines"),
 ])
 def test_intake_rules(writer, fake_api, overrides, message):
@@ -574,10 +574,11 @@ def test_matrix_category_change_counts_affected_items(writer):
 
 
 @pytest.mark.parametrize("kwargs, message", [
-    (dict(description="Caravelli Classic"), "doesn't say what garment"),
+    (dict(description="Caravelli Classic"), "holds suit matrices, so its description names the garment"),
+    (dict(description="Caravelli Pants"), "names the garment"),          # in Suits/Suit
+    (dict(category_id=81), "shoes matrices use matrix type MT2"),
     (dict(description="Caravelli Black Suit"), "names the color 'Black'"),
     (dict(description="Caravelli 320-0S2 Suit"), "vendor code"),
-    (dict(description="Caravelli Pants"), "already called"),
     (dict(description="Caravelli"), "nothing to change"),
     (dict(category_id=83), "nothing to change"),
     (dict(matrix_id=404, price=1), "not found"),
@@ -587,3 +588,9 @@ def test_matrix_update_rules(writer, fake_api, kwargs, message):
     with pytest.raises(RuleViolation, match=message):
         writer.update_matrix(**{"matrix_id": 7, **kwargs})
     assert fake_api.requests == []
+
+
+def test_matrix_update_refuses_another_matrixs_name(writer, reads):
+    reads.data["ItemMatrix"][1]["description"] = "Giorgio Fiorelli Suit"     # matrix 8
+    with pytest.raises(RuleViolation, match="already called"):
+        writer.update_matrix(7, description="Giorgio Fiorelli Suit")

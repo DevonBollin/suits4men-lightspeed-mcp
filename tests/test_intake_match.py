@@ -53,7 +53,7 @@ def test_a_code_used_in_several_matrices_asks_for_the_garment_type(reads):
     [m] = match(reads, {"vendor_number": "CV-100", "color": "Black", "size": "36", "quantity": 1, "unit_cost": 30})
     assert m.status == "unresolved" and "matrices 7 'Caravelli', 12 'Caravelli Pants'" in m.reason
     [m] = match(reads, {"vendor_number": "CV-100", "matrix_id": 12, "color": "Black", "size": "34",
-                        "quantity": 1, "unit_cost": 30})
+                        "fit": "Standard", "quantity": 1, "unit_cost": 30})
     assert m.status == "existing" and m.item["itemID"] == "1801"
 
 

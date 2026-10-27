@@ -4,17 +4,25 @@ The write tools call these before they build a payload. Each check raises
 RuleViolation with a message that says what was refused and why, so Claude
 can pass it straight on. Nothing here talks to Lightspeed.
 
-The rules (from the store owner):
-  * Suits, tuxedos, vests, pants and sport coats use the store's attribute set
-    5 "Color/Size/Fit". Other garments (shirts, shoes, ...) may use another set
-    the store made, never one of Lightspeed's built-in sets (owner, 2026-10-26).
+The rules (from the store owner, and since 2026-10-27 the owner's draft "Suits 4 Men —
+Lightspeed R-Series Inventory Structure", §1, §2 and §4):
+  * Every garment type has one matrix type (GARMENTS below), and every matrix of
+    that garment type uses it: MT1 Color/Size/Fit (the store's set 5) for tailored
+    clothing and dress and tux shirts, MT2 Color/Size/Width for shoes, MT3
+    Lightspeed's built-in Color/Size for garments without a fit (casual vests,
+    outerwear jackets, casual pants and denim, sweaters, belts), MT4 the built-in
+    Color for one-size accessories. Attributes are always in that order.
   * Every attribute set the store uses has Color: color is an attribute
     value, never a separate matrix.
   * Matrices are split by garment type (suit, tuxedo, pants, ...), never by color.
+    A matrix sits in the category of its garment type (§3), and its description
+    names the garment (shoes: the style name stands in).
   * Color and fit values use each vendor's own naming. They are sent exactly
-    as given (outer spaces trimmed), never re-cased or "corrected".
-  * Pants are separate items with their own matrices, stocked uncut and
-    sized by waist only.
+    as given (outer spaces trimmed), never re-cased or "corrected". A line with
+    one unnamed fit uses Fit "Standard"; Fit and Width are never blank.
+  * Size is the one attribute with a store format, per garment type (SIZE_FORMATS):
+    40R for jackets, suits and vests; the waist alone for pants (stocked uncut);
+    '15.5 34/35' for shirts; 10.5 for shoes; S-6XL for the rest.
   * No 3-piece items: a 3pc is stored as a suit plus a vest.
   * No boys' items.
   * Matrix descriptions are plain language, with no vendor codes.
@@ -27,6 +35,7 @@ patterns are below; if a legitimate word gets refused, adjust its pattern.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from .errors import LightspeedError
 
@@ -40,27 +49,84 @@ CUSTOM_SKU_PATTERN = re.compile(r"^\d{6}$")
 # Lightspeed's limit on description fields.
 MAX_DESCRIPTION_LENGTH = 255
 
-# Garment types a matrix can be. A matrix holds exactly one garment type, and
-# its description must name it, so anyone reading the matrix list can tell
-# what it is. "suit" means a 2-piece suit (jacket and pants).
-GARMENT_WORDS = {
-    "suit": ("suit", "suits", "2pc"),
-    "tuxedo": ("tux", "tuxedo", "tuxedos"),
-    "vest": ("vest", "vests"),
-    "pants": ("pant", "pants", "trouser", "trousers", "slacks"),
-    "sport coat": ("sport coat", "sportcoat", "blazer", "jacket"),
-    "shirt": ("shirt", "shirts"),
-    "shoes": ("shoe", "shoes", "oxford", "oxfords", "loafer", "loafers"),
+# ---- garment types and matrix types (the draft, §2 "Matrix types" and §4) ----------------------------
+
+# A matrix type is the attribute set a garment's matrices use: its attribute names, in order.
+MATRIX_TYPES = {
+    "MT1": ("Color", "Size", "Fit"),    # tailored: the store's set 5
+    "MT2": ("Color", "Size", "Width"),  # footwear: a store-made set (create_attribute_set "Color/Size/Width")
+    "MT3": ("Color", "Size"),           # sized, no fit: Lightspeed's built-in set "Color/Size"
+    "MT4": ("Color",),                  # one size, tracked by color: Lightspeed's built-in set "Color"
 }
 
-# These garments always use set 5 (Color/Size/Fit); the others may use another store set.
-SUITING_GARMENTS = ("suit", "tuxedo", "vest", "pants", "sport coat")
+# The store's size formats: (pattern, how to say it). Values are compared as given (no re-casing).
+SIZE_FORMATS = {
+    "jacket": (re.compile(r"^\d{2}(S|R|L|XL)$"), "chest and length, e.g. 40R, 42L, 44XL"),
+    "waist": (re.compile(r"^\d{2}$"), "the waist alone, e.g. 34 (pants are stocked uncut)"),
+    "waist or hemmed": (re.compile(r"^\d{2}[SRL]?$"), "the waist, e.g. 34, or for pants shipped hemmed 34S / 34R / 34L"),
+    "shirt": (re.compile(r"^\d{2}(\.5)? \d{2}/\d{2}$"), "neck and sleeve, e.g. '15.5 34/35'"),
+    "shoe": (re.compile(r"^\d{1,2}(\.5)?$"), "a shoe size, e.g. 10.5"),
+    "alpha": (re.compile(r"^(XS|S|M|L|XL|[2-6]XL)$"), "S, M, L, XL, 2XL ... 6XL"),
+}
+
+
+@dataclass(frozen=True)
+class Garment:
+    """One garment type (§4): its matrix type, size format, the words a matrix description names it
+    with (none for shoes: the style name stands in), and the category names that hold it (§3)."""
+
+    name: str
+    matrix_type: str
+    size: str | None
+    words: tuple[str, ...]
+    categories: tuple[str, ...]
+
+
+GARMENTS = {g.name: g for g in (
+    Garment("suit", "MT1", "jacket", ("suit", "suits", "2pc"), ("suits", "suit")),
+    Garment("tuxedo", "MT1", "jacket", ("tuxedo", "tuxedos", "tux", "tailcoat"), ("tuxedos",)),
+    Garment("tux jacket", "MT1", "jacket", ("tuxedo jacket", "tux jacket", "dinner jacket"), ("tux & dinner jackets",)),
+    Garment("sport coat", "MT1", "jacket", ("sport coat", "sportcoat", "blazer", "jacket"),
+            ("sport coats & blazers", "sport coats")),
+    Garment("vest", "MT1", "jacket", ("vest", "vests"), ("suit vests", "tux vests", "vests")),
+    Garment("topcoat", "MT1", "jacket", ("topcoat", "top coat", "car coat", "raincoat", "overcoat"), ("top coats",)),
+    Garment("jacket", "MT3", "alpha", ("jacket",), ("jackets",)),
+    Garment("casual vest", "MT3", "alpha", ("vest",), ("casual vests",)),
+    Garment("pants", "MT1", "waist", ("pants", "pant", "trousers", "trouser", "slacks"), ("dress pants", "pants")),
+    Garment("casual pants", "MT3", "waist or hemmed", ("pants", "pant", "denim", "jeans"), ("casual pants & denim",)),
+    Garment("dress shirt", "MT1", "shirt", ("shirt",), ("dress shirts", "shirts")),
+    Garment("tux shirt", "MT1", "shirt", ("tuxedo shirt", "tux shirt"), ("tux shirts",)),
+    Garment("sweater", "MT3", "alpha", ("sweater", "quarter-zip", "cardigan"), ("sweaters",)),
+    Garment("shoes", "MT2", "shoe", (), ("shoes",)),
+    # Accessories are deferred in the draft (§4.15); these two are its provisional types.
+    Garment("belt", "MT3", "waist", ("belt", "belts"), ("belts",)),
+    Garment("accessory", "MT4", None, ("tie", "ties", "bow tie", "bowtie", "pocket square", "suspenders", "scarf"),
+            ("neck ties", "bowties", "bow ties", "pocket squares", "suspenders", "scarves")),
+)}
+
+# Other names for a garment type, as create_matrix may be given it.
+GARMENT_ALIASES = {
+    "2pc": "suit", "2pc suit": "suit", "2-piece suit": "suit", "two piece suit": "suit", "tux": "tuxedo",
+    "tuxedo jacket": "tux jacket", "dinner jacket": "tux jacket", "blazer": "sport coat", "suit vest": "vest",
+    "tux vest": "vest", "tuxedo vest": "vest", "top coat": "topcoat", "outerwear jacket": "jacket",
+    "dress pants": "pants", "denim": "casual pants", "jeans": "casual pants", "shirt": "dress shirt",
+    "tuxedo shirt": "tux shirt", "shoe": "shoes", "tie": "accessory",
+}
+
+# Telling an existing matrix's garment type from its description when its category doesn't say:
+# the more specific phrases first. A bare "jacket" (sport coat or outerwear?) decides nothing.
+DESCRIPTION_GARMENTS = (
+    ("tuxedo jacket", "tux jacket"), ("tux jacket", "tux jacket"), ("dinner jacket", "tux jacket"),
+    ("tuxedo shirt", "tux shirt"), ("tux shirt", "tux shirt"), ("tuxedo vest", "vest"), ("tux vest", "vest"),
+    ("sport coat", "sport coat"), ("sportcoat", "sport coat"), ("blazer", "sport coat"), ("topcoat", "topcoat"),
+    ("top coat", "topcoat"), ("car coat", "topcoat"), ("raincoat", "topcoat"), ("overcoat", "topcoat"),
+    ("sweater", "sweater"), ("cardigan", "sweater"), ("quarter-zip", "sweater"), ("denim", "casual pants"),
+    ("jeans", "casual pants"), ("shirt", "dress shirt"), ("vest", "vest"), ("pants", "pants"), ("pant", "pants"),
+    ("trousers", "pants"), ("slacks", "pants"), ("belt", "belt"), ("tuxedo", "tuxedo"), ("tux", "tuxedo"),
+    ("tailcoat", "tuxedo"), ("suit", "suit"), ("suits", "suit"), ("2pc", "suit"),
+)
 
 PANTS_WORDS = re.compile(r"\b(pant|pants|trouser|trousers|slack|slacks)\b", re.IGNORECASE)
-
-# Pants are stocked uncut, so the size is the waist alone: "32", "34", "40".
-# "34x32", "34R" or "34/30" carry a length and are refused.
-WAIST_SIZE_PATTERN = re.compile(r"^\d{2}$")
 
 # "3pc", "3 pc", "3-piece", "three piece", "3pcs" ...
 THREE_PIECE_PATTERN = re.compile(r"\b(3|three)\s*-?\s*(pc|pcs|pce|piece|pieces)\b", re.IGNORECASE)
@@ -144,48 +210,67 @@ def check_plain_description(description: str, what: str = "description", allow_s
 # ---- matrices -----------------------------------------------------------------------
 
 
-def check_garment_type(garment_type: str, description: str) -> str:
-    """The garment type is one of GARMENT_WORDS and the description names it."""
-    garment = clean(garment_type).lower()
-    check_not_three_piece(garment)
-    check_not_boys(garment)
-    if garment in ("2pc", "2pc suit", "2-piece suit", "two piece suit"):
-        garment = "suit"
-    if garment in ("tux",):
-        garment = "tuxedo"
-    if garment not in GARMENT_WORDS:
+def names_garment(garment: Garment, description: str) -> bool:
+    """Does the description name this garment type? (Shoes: always; the style name stands in.)"""
+    return not garment.words or any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", description or "", re.IGNORECASE)
+                                    for w in garment.words)
+
+
+def garment_for_category(category_path: str) -> Garment | None:
+    """The garment type a category holds (§3), from its own name or the nearest parent that says."""
+    by_category = {c: g for g in GARMENTS.values() for c in g.categories}
+    for part in reversed([p.strip().lower() for p in (category_path or "").split("/") if p.strip()]):
+        if part in by_category:
+            return by_category[part]
+    return None
+
+
+def garment_of(description: str, category_path: str = "") -> Garment | None:
+    """An existing matrix's garment type: its category says (§3); failing that, its description."""
+    garment = garment_for_category(category_path)
+    if garment:
+        return garment
+    for phrase, name in DESCRIPTION_GARMENTS:
+        if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", description or "", re.IGNORECASE):
+            return GARMENTS[name]
+    return None
+
+
+def check_garment_type(garment_type: str, description: str, category_path: str | None = None) -> Garment:
+    """A new matrix's garment type: one of GARMENTS (or an alias), named in its description, and (when its
+    category holds a garment type) the one its category holds."""
+    name = clean(garment_type).lower()
+    check_not_three_piece(name)
+    check_not_boys(name)
+    name = GARMENT_ALIASES.get(name, name)
+    if name not in GARMENTS:
         raise RuleViolation(
-            f"Refused: garment type '{garment_type}' is not one of {', '.join(GARMENT_WORDS)}. Matrices are split by "
+            f"Refused: garment type '{garment_type}' is not one of {', '.join(GARMENTS)}. Matrices are split by "
             "garment type; a 3pc is a suit plus a vest."
         )
-    words = GARMENT_WORDS[garment]
-    if not any(re.search(rf"\b{re.escape(w)}\b", description, re.IGNORECASE) for w in words):
+    garment = GARMENTS[name]
+    if not names_garment(garment, description):
         raise RuleViolation(
-            f"Refused: the matrix description '{description}' does not say it is a {garment}. Put the garment type "
-            f"in the description (one of: {', '.join(words)}), e.g. 'Caravelli {words[0].title()}'."
+            f"Refused: the matrix description '{description}' does not say it is a {garment.name}. Put the garment in "
+            f"the description (one of: {', '.join(garment.words)}), e.g. 'Caravelli {garment.words[0].title()}'."
+        )
+    held = garment_for_category(category_path) if category_path is not None else None
+    if held and held is not garment:
+        raise RuleViolation(
+            f"Refused: category '{category_path}' holds {held.name} matrices, not {garment.name}. Every matrix sits in "
+            f"its garment type's category: create or move that category first (create_category, move_category)."
         )
     return garment
 
 
-def is_suiting(description: str) -> bool:
-    """Does a matrix description name a suit, tuxedo, vest, pants or sport coat?"""
-    return any(re.search(rf"\b{re.escape(w)}\b", description or "", re.IGNORECASE)
-               for garment in SUITING_GARMENTS for w in GARMENT_WORDS[garment])
-
-
-def check_matrix_attribute_set(attribute_set: dict | None, suiting: bool) -> dict[int, str]:
-    """The set a matrix may use: set 5 for suiting; otherwise a store-made set with Color.
-    Returns its attribute names by slot, e.g. {1: "Color", 2: "Size", 3: "Fit"}."""
+def check_matrix_attribute_set(attribute_set: dict | None, garment: Garment | None) -> dict[int, str]:
+    """The set a matrix uses: the matrix type of its garment type (attribute names in that order; built-in
+    sets included, as the draft uses them for MT3 and MT4), with Color. A matrix whose garment type isn't
+    known needs only Color. Returns its attribute names by slot, e.g. {1: "Color", 2: "Size", 3: "Fit"}."""
     if not attribute_set:
         raise RuleViolation("Refused: that attribute set doesn't exist.")
     set_id = str(attribute_set.get("itemAttributeSetID"))
     label = f"attribute set {set_id} '{attribute_set.get('name')}'"
-    if suiting and set_id != str(STORE_ATTRIBUTE_SET_ID):
-        raise RuleViolation(f"Refused: this uses {label}. Suits, tuxedos, vests, pants and sport coats use the store's "
-                            f"set {STORE_ATTRIBUTE_SET_ID} 'Color/Size/Fit'.")
-    if set_id != str(STORE_ATTRIBUTE_SET_ID) and str(attribute_set.get("system")).lower() == "true":
-        raise RuleViolation(f"Refused: this uses {label}, one of Lightspeed's built-in sets. Matrices use the store's "
-                            "own sets (set 5, or one made with create_attribute_set).")
     if str(attribute_set.get("archived")).lower() == "true":
         raise RuleViolation(f"Refused: {label} is archived.")
     slots = {i: clean(attribute_set.get(f"attributeName{i}")) for i in (1, 2, 3)}
@@ -193,6 +278,14 @@ def check_matrix_attribute_set(attribute_set: dict | None, suiting: bool) -> dic
     if not any(name.lower() == "color" for name in slots.values()):
         raise RuleViolation(f"Refused: {label} has no Color attribute. Color is always an attribute, never its own "
                             "matrix.")
+    if garment:
+        wanted = MATRIX_TYPES[garment.matrix_type]
+        if [slots.get(i, "").lower() for i in range(1, len(wanted) + 1)] != [w.lower() for w in wanted] \
+                or len(slots) != len(wanted):
+            raise RuleViolation(
+                f"Refused: {garment.name} matrices use matrix type {garment.matrix_type} ({' / '.join(wanted)}, in that "
+                f"order), but {label} is {' / '.join(slots.values())}."
+                + (" Create that set first (create_attribute_set)." if garment.matrix_type == "MT2" else ""))
     return slots
 
 
@@ -260,13 +353,14 @@ def is_pants(*texts: str) -> bool:
     return any(text and PANTS_WORDS.search(text) for text in texts)
 
 
-def check_waist_sizes(sizes: list[str]) -> None:
-    """Pants are stocked uncut: sizes are the waist alone."""
-    bad = [s for s in sizes if not WAIST_SIZE_PATTERN.match(s)]
+def check_sizes(garment: Garment | None, sizes: list[str]) -> None:
+    """New Size values follow the garment type's size format (§4). Unknown garment type: not checked."""
+    if not garment or not garment.size:
+        return
+    pattern, format_text = SIZE_FORMATS[garment.size]
+    bad = [s for s in sizes if not pattern.match(s)]
     if bad:
-        raise RuleViolation(
-            f"Refused: pants are stocked uncut and sized by waist only, e.g. '32' or '34'. Not valid: {', '.join(bad)}."
-        )
+        raise RuleViolation(f"Refused: {garment.name} sizes are {format_text}. Not valid: {', '.join(bad)}.")
 
 
 # ---- SKUs ---------------------------------------------------------------------------

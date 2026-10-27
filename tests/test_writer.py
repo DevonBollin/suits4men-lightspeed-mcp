@@ -25,22 +25,29 @@ from lightspeed_mcp.writer import InventoryWriter
 from tests.conftest import turn_on
 
 ATTRIBUTE_SETS = [
+    # Lightspeed's built-in sets used as matrix types MT3 and MT4.
+    {"itemAttributeSetID": "1", "name": "Color/Size", "attributeName1": "Color", "attributeName2": "Size",
+     "attributeName3": "", "system": "true", "archived": "false"},
     {"itemAttributeSetID": "3", "name": "Color", "attributeName1": "Color", "attributeName2": "", "attributeName3": "",
      "system": "true", "archived": "false"},
     {"itemAttributeSetID": "5", "name": "Color/Size/Fit", "attributeName1": "Color", "attributeName2": "Size",
      "attributeName3": "Fit", "system": "false", "archived": "false"},
-    # Made by the store for shirts (create_attribute_set), and one without Color.
-    {"itemAttributeSetID": "6", "name": "Color/Neck/Sleeve", "attributeName1": "Color", "attributeName2": "Neck",
-     "attributeName3": "Sleeve", "system": "false", "archived": "false"},
+    # Made by the store for shoes (MT2, create_attribute_set), and one without Color.
+    {"itemAttributeSetID": "6", "name": "Color/Size/Width", "attributeName1": "Color", "attributeName2": "Size",
+     "attributeName3": "Width", "system": "false", "archived": "false"},
     {"itemAttributeSetID": "7", "name": "Neck/Sleeve", "attributeName1": "Neck", "attributeName2": "Sleeve",
      "attributeName3": "", "system": "false", "archived": "false"},
 ]
 CATEGORIES = [
     {"categoryID": "79", "name": "Pants", "fullPathName": "Pants", "archived": "false"},
+    {"categoryID": "81", "name": "Shoes", "fullPathName": "Shoes", "archived": "false"},
     {"categoryID": "82", "name": "Suits", "fullPathName": "Suits", "archived": "false"},
     {"categoryID": "83", "name": "Suit", "fullPathName": "Suits/Suit", "archived": "false"},
     {"categoryID": "84", "name": "Tuxedos", "fullPathName": "Suits/Tuxedos", "archived": "false"},
     {"categoryID": "116", "name": "Standard", "fullPathName": "Dress Shirts, Sweaters, & Vests/Vests/Standard", "archived": "false"},
+    {"categoryID": "118", "name": "Standard", "fullPathName": "Dress Shirts, Sweaters, & Vests/Dress Shirts/Standard",
+     "archived": "false"},
+    {"categoryID": "130", "name": "Sweaters", "fullPathName": "Sweaters", "archived": "false"},
 ]
 VENDORS = [{"vendorID": "1", "name": "San Malone", "archived": "false"},
            {"vendorID": "21", "name": "Fiorelli Supply", "archived": "false"}]
@@ -76,8 +83,8 @@ def fresh_data() -> dict:
                    price="61.21", cost="61.21"),
             matrix(8, "Giorgio Fiorelli", 5, 83, ["Black", "Navy"], [], []),
             matrix(9, "Angelo Rossi", 3, 83, ["Black"]),
-            matrix(12, "Caravelli Pants", 5, 79, ["Black"], ["34"], []),
-            matrix(13, "Christopher Lena Dress Shirt", 6, 116, ["White"], ["15.5"], ["32/33"]),
+            matrix(12, "Caravelli Pants", 5, 79, ["Black"], ["34"], ["Standard"]),
+            matrix(13, "Stacy Adams Dickinson", 6, 81, ["Cognac"], ["10.5"], ["M"]),
         ],
         "Item": [
             item(1644, "Caravelli Black 42R Slim", "002427", 7, ("Black", "42R", "Slim"), qoh=-27),
@@ -85,7 +92,7 @@ def fresh_data() -> dict:
             item(1186, "Caravelli Suits", "", qoh=-16, cost="61.21"),
             item(2000, "Boy's Suit", "009001"),
             item(1700, "Old Caravelli Black 40R Slim", "013000", 7, ("Black", "40R", "Slim"), archived=True),
-            item(1801, "Caravelli Pants Black 34", "013100", 12, ("Black", "34", "")),
+            item(1801, "Caravelli Pants Black 34 Standard", "013100", 12, ("Black", "34", "Standard")),
             item(1346, "Caravelli Black 40R Classic", "013050", 7, ("Black", "40R", "Classic"), qoh=3),
             item(2321, "Caravelli Burgundy 58L Slim", "", category="82"),  # belongs in matrix 7 but isn't
         ],
@@ -345,19 +352,22 @@ def test_vendor_naming_is_kept_exactly(writer):
     assert attrs["attribute1"] == "Lt. Grey Sharkskin" and attrs["attribute3"] == "Modern-Slim"
 
 
-def test_pants_take_waist_sizes_and_may_have_no_fit(writer):
+def test_pants_take_waist_sizes_and_a_fit(writer):
     result = call(writer, "add_matrix_variants", matrix_id=12, price=129.95, cost=30, variants=[
-        {"color": "Black", "size": "36", "custom_sku": "013471"}])
+        {"color": "Black", "size": "36", "fit": "Standard", "custom_sku": "013471"}])
     body = result["requests"][0]["body"]
-    assert body["description"] == "Caravelli Pants Black 36"
-    assert "attribute3" not in body["ItemAttributes"]
+    assert body["description"] == "Caravelli Pants Black 36 Standard"
+    assert body["ItemAttributes"]["attribute3"] == "Standard"
 
 
 @pytest.mark.parametrize("overrides, message", [
     (dict(matrix_id=9), "attribute set 3"),
     (dict(matrix_id=404), "not found"),
-    (dict(matrix_id=12, variants=[{"color": "Black", "size": "34x32", "custom_sku": "013471"}]), "waist only"),
-    (dict(matrix_id=12, variants=[{"color": "Black", "size": "34R", "custom_sku": "013471"}]), "waist only"),
+    (dict(matrix_id=12, variants=[{"color": "Black", "size": "34x32", "fit": "Standard", "custom_sku": "013471"}]),
+     "waist alone"),
+    (dict(matrix_id=12, variants=[{"color": "Black", "size": "34R", "fit": "Standard", "custom_sku": "013471"}]),
+     "waist alone"),
+    (dict(variants=[{"color": "Navy", "size": "42", "fit": "Slim", "custom_sku": "013471"}]), "suit sizes are"),
     (dict(variants=[{"color": "Navy", "size": "42R", "fit": "Slim", "custom_sku": "002427"}]), "already in use"),
     (dict(variants=[{"color": "Navy", "size": "42R", "fit": "Slim", "custom_sku": "013000"}]), "already in use"),
     (dict(variants=[{"color": "Navy", "size": "42R", "fit": "Slim", "custom_sku": "12345"}]), "6-digit"),
@@ -368,7 +378,7 @@ def test_pants_take_waist_sizes_and_may_have_no_fit(writer):
     (dict(variants=[{"color": "Black", "size": "40R", "fit": "Slim", "custom_sku": "013471"}]), "archived item"),
     (dict(variants=[{"color": "black", "size": "44R", "fit": "Slim", "custom_sku": "013471"}]), "only in capitals"),
     (dict(variants=[{"color": "Navy", "size": "42R", "fit": "Slim", "custom_sku": "013471"},
-                    {"color": "Navy", "size": "42r", "fit": "slim", "custom_sku": "013472"}]), "listed twice"),
+                    {"color": "navy", "size": "42R", "fit": "slim", "custom_sku": "013472"}]), "listed twice"),
     (dict(variants=[{"color": "Navy", "size": "42R", "fit": "3pc Slim", "custom_sku": "013471"}]), "3-piece"),
     (dict(variants=[{"color": "Navy", "size": "Boys 12", "fit": "Slim", "custom_sku": "013471"}]), "boys"),
     (dict(variants=[{"color": "", "size": "42R", "fit": "Slim", "custom_sku": "013471"}]), "needs a color"),
@@ -516,15 +526,16 @@ def test_move_never_sends_prices_cost_sku_or_stock(writer):
 
 
 def test_move_out_of_another_matrix_is_flagged(writer):
-    result = call(writer, "move_items_into_matrix", items=[{"item_id": 1801, "color": "Black", "size": "36"}])
+    result = call(writer, "move_items_into_matrix", items=[{"item_id": 1801, "color": "Black", "size": "36R",
+                                                            "fit": "Slim"}])
     assert any("moves out of matrix 12" in w for w in result["warnings"])
     body = result["requests"][0]["body"]
-    assert body["description"] == "Caravelli Black 36" and "attribute3" not in body["ItemAttributes"]
+    assert body["description"] == "Caravelli Black 36R Slim" and body["ItemAttributes"]["attribute3"] == "Slim"
 
 
 def test_first_move_is_one_item_until_a_move_has_been_done(writer, write_log):
     two = [{"item_id": 2321, "color": "Burgundy", "size": "58L", "fit": "Slim"},
-           {"item_id": 1801, "color": "Black", "size": "36"}]
+           {"item_id": 1801, "color": "Black", "size": "36R", "fit": "Slim"}]
     with pytest.raises(RuleViolation, match="Move one item first"):
         call(writer, "move_items_into_matrix", items=two)
     write_log.append({"write_id": "x", "tool": "move_items_into_matrix", "event": "done", "status": 200})
@@ -537,10 +548,11 @@ def test_first_move_is_one_item_until_a_move_has_been_done(writer, write_log):
     (dict(items=[{"item_id": 1644, "color": "Black", "size": "42R", "fit": "Slim"}]), "already in matrix 7"),
     (dict(items=[{"item_id": 2321, "color": "Black", "size": "42R", "fit": "Slim"}]), "already has an item"),
     (dict(items=[{"item_id": 2321, "color": "burgundy", "size": "40R", "fit": "slim"}]), "only in capitals"),
-    (dict(items=[{"item_id": 2000, "color": "Navy", "size": "12", "fit": ""}]), "boys"),
+    (dict(items=[{"item_id": 2000, "color": "Navy", "size": "42R", "fit": "Slim"}]), "boys"),
     (dict(items=[{"item_id": 1700, "color": "Navy", "size": "42R", "fit": "Slim"}]), "archived"),
     (dict(items=[{"item_id": 99999, "color": "Navy", "size": "42R", "fit": "Slim"}]), "not found"),
-    (dict(matrix_id=12, items=[{"item_id": 2321, "color": "Black", "size": "34x32"}]), "waist only"),
+    (dict(matrix_id=12, items=[{"item_id": 2321, "color": "Black", "size": "34x32", "fit": "Standard"}]),
+     "waist alone"),
     (dict(items=[{"item_id": 2321, "color": "", "size": "58L"}]), "needs a color"),
     (dict(items=[]), "at least one"),
 ])

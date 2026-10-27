@@ -136,10 +136,13 @@ How every write tool works:
    confirm_code. An approval covers that one change only. If anything changed in between, the code no longer
    matches and the call is refused: run the dry run again.
 Real writes are refused while the store owner has writes turned off on this computer; say so and stop. The
-store's rules (suits, tuxedos, vests, pants and sport coats on attribute set 5 Color/Size/Fit, other garments on
-a store-made set, every set with Color; matrices by garment type not color; vendor naming kept as is; pants by
-waist only; no 3-piece or boys' items; plain descriptions; one unique 6-digit custom SKU per item) are
-enforced: a refusal says which rule.
+store's rules (the owner's draft inventory structure: each garment type has one matrix type, MT1 Color/Size/Fit
+for tailored clothing and dress and tux shirts, MT2 Color/Size/Width for shoes, MT3 Color/Size for garments
+without a fit, MT4 Color for one-size accessories; a matrix sits in its garment type's category and its
+description names the garment; matrices by garment type, never color; vendor naming kept as is, Fit 'Standard'
+when the vendor names none; sizes in the store's format: 40R, waist only for pants, '15.5 34/35' for shirts,
+10.5 for shoes, S-6XL otherwise; no 3-piece or boys' items; plain descriptions; one unique 6-digit custom SKU
+per item) are enforced: a refusal says which rule.
 """
 
 
@@ -444,7 +447,7 @@ class InvoiceLine(BaseModel):
     vendor_number: Annotated[str | None, Field(description="The vendor's style / item number as printed.")] = None
     matrix_id: Annotated[int | None, Field(description="For an item in a matrix (suit, tux, vest, pants, or a shirt/shoe matrix): the matrix.")] = None
     color: Annotated[str | None, Field(description="With matrix_id: color exactly as the vendor names it.")] = None
-    size: Annotated[str | None, Field(description="With matrix_id: size, e.g. '42R'; pants: waist only.")] = None
+    size: Annotated[str | None, Field(description="With matrix_id: size in the store's format, e.g. '42R'; pants: waist only; shirts '15.5 34/35'; shoes '10.5'.")] = None
     fit: Annotated[str | None, Field(description="With matrix_id: fit as the vendor names it.")] = None
     values: AttributeValues = None
     description: Annotated[str | None, Field(description="The invoice's own text for the line (helps suggest matches).")] = None
@@ -511,8 +514,8 @@ def compare_snapshots(
 class Variant(BaseModel):
     custom_sku: Annotated[str, Field(description="A new, unused 6-digit custom SKU, as text so leading zeros stay, e.g. '013471'.")]
     color: Annotated[str | None, Field(description="Color exactly as the vendor names it, e.g. 'Midnight Blue'. Sent as given, never re-cased.")] = None
-    size: Annotated[str | None, Field(description="Size, e.g. '42R' for suits. Pants: waist only, e.g. '34'.")] = None
-    fit: Annotated[str | None, Field(description="Fit exactly as the vendor names it, e.g. 'Slim'. May be blank.")] = None
+    size: Annotated[str | None, Field(description="Size in the store's format: '42R' for suits, jackets and vests; pants the waist alone, e.g. '34'; shirts '15.5 34/35'; shoes '10.5'; others S-6XL.")] = None
+    fit: Annotated[str | None, Field(description="Fit exactly as the vendor names it, e.g. 'Slim'; 'Standard' when the vendor names none.")] = None
     values: AttributeValues = None
     upc: Annotated[str | None, Field(description="The barcode number on its box or tag (11-14 digits), if any.")] = None
 
@@ -526,8 +529,8 @@ class NewPoLine(BaseModel):
 class MoveItem(BaseModel):
     item_id: Annotated[int, Field(description="The existing item to put into the matrix.")]
     color: Annotated[str | None, Field(description="Its color, exactly as the vendor names it.")] = None
-    size: Annotated[str | None, Field(description="Its size, e.g. '58L'. Pants: waist only.")] = None
-    fit: Annotated[str | None, Field(description="Its fit, exactly as the vendor names it. May be blank.")] = None
+    size: Annotated[str | None, Field(description="Its size in the store's format, e.g. '58L'. Pants: waist only.")] = None
+    fit: Annotated[str | None, Field(description="Its fit, exactly as the vendor names it; 'Standard' when the vendor names none.")] = None
     values: AttributeValues = None
 
 
@@ -545,22 +548,26 @@ class Receipt(BaseModel):
 @write_tool
 def create_matrix(
     description: Annotated[str, Field(description="Plain-language matrix description naming the garment type, no vendor codes or colors, e.g. 'Giorgio Fiorelli Vest'.")],
-    garment_type: Annotated[str, Field(description="One of: suit (2-piece), tuxedo, vest, pants, sport coat, shirt, shoes. No 3-piece.")],
+    garment_type: Annotated[str, Field(description="The draft's garment type: suit (2-piece), tuxedo, tux jacket, sport coat, vest (suit or tux vest), topcoat, jacket (outerwear), casual vest, pants (dress), casual pants (and denim), dress shirt, tux shirt, sweater, shoes, belt, accessory. No 3-piece.")],
     category_id: Annotated[int, Field(description="Category for the matrix (list_categories), e.g. 83 Suits/Suit.")],
     vendor_id: Annotated[int, Field(description="Default vendor (list_vendors).")],
     manufacturer_id: Annotated[int | None, Field(description="Manufacturer / brand (list_manufacturers).")] = None,
     default_cost: Annotated[float | None, Field(description="The matrix's default cost.")] = None,
     price: Annotated[float | None, Field(description="The matrix's Default selling price. Left unset unless given.")] = None,
-    attribute_set_id: Annotated[int, Field(description="Its attribute set (list_attribute_sets): 5 Color/Size/Fit, required for suits, tuxedos, vests, pants and sport coats; shirts or shoes may use another store-made set with Color.")] = 5,
+    attribute_set_id: Annotated[int | None, Field(description="Leave empty: the set of the garment type's matrix type is used (MT1 set 5 Color/Size/Fit, MT2 the store's Color/Size/Width, MT3 built-in Color/Size, MT4 built-in Color). A set given must be that one.")] = None,
     dry_run: DryRun = True,
     confirm_code: ConfirmCode = None,
 ) -> str:
-    """Create a new, empty item matrix. Suiting (suits, tuxedos, vests, pants, sport coats) uses the
-    store's attribute set 5 (Color/Size/Fit); other garments may use another set the store made
-    (create_attribute_set), never one of Lightspeed's built-in sets, and every set has Color.
-    One matrix per brand line and garment type; values are added later by add_matrix_variants
-    (Lightspeed adds each variant's values to the matrix by itself). Refuses a description with
-    a vendor code or a color, a 3-piece or boys' matrix, or a description that is already used."""
+    """Create a new, empty item matrix for one vendor line and garment type (the owner's draft, §4).
+    The garment type decides the matrix type and so the attribute set: MT1 Color/Size/Fit (suits,
+    tuxedos, tux jackets, sport coats, suit and tux vests, topcoats, dress pants, dress and tux
+    shirts), MT2 Color/Size/Width (shoes; create that set first), MT3 Color/Size (outerwear jackets,
+    casual vests, casual pants and denim, sweaters, belts), MT4 Color (accessories). The category
+    must be the one that holds that garment type when it holds one (e.g. Suits/Tuxedos holds
+    tuxedos). Description: '{Brand} {Line} {Garment}', e.g. 'Mantoni Wool Suit'; shoes
+    '{Brand} {Style}', e.g. 'Stacy Adams Dickinson'. Values are added later by add_matrix_variants.
+    Refuses a description with a vendor code or a color, a 3-piece or boys' matrix, or a
+    description that is already used."""
     return run(lambda w: w.create_matrix(description, garment_type, category_id, vendor_id, manufacturer_id,
                                          default_cost, price, dry_run, confirm_code, attribute_set_id), writer)
 
@@ -573,7 +580,7 @@ def create_attribute_set(
     confirm_code: ConfirmCode = None,
 ) -> str:
     """Create an attribute set (a matrix type: the 1-3 dimensions its items differ by) for garments
-    other than suiting, e.g. dress shirts by Color / Neck / Sleeve or shoes by Color / Size / Width.
+    the store needs, e.g. shoes by Color / Size / Width (matrix type MT2 in the draft).
     Every set has Color. Refuses a name or a list of attributes another set already has.
     Lightspeed's docs on writing sets are contradictory, so the first one may be refused."""
     return run(lambda w: w.create_attribute_set(name, attribute_names, dry_run, confirm_code), writer)
@@ -597,19 +604,21 @@ def update_attribute_set(
 
 @write_tool
 def add_matrix_variants(
-    matrix_id: Annotated[int, Field(description="The matrix to add items to (must use attribute set 5).")],
+    matrix_id: Annotated[int, Field(description="The matrix to add items to (on its garment type's matrix type).")],
     variants: Annotated[list[Variant], Field(description="The new items: color, size, fit and custom SKU each (max 100).")],
     price: Annotated[float, Field(description="Default selling price for every new item (not the matrix's own price).")],
     cost: Annotated[float, Field(description="Default cost for every new item.")],
     dry_run: DryRun = True,
     confirm_code: ConfirmCode = None,
 ) -> str:
-    """Add new child items (variants) to a Color/Size/Fit matrix: one item per color/size/fit,
-    each with its own new custom SKU, the given price and cost, and the matrix's category,
-    vendor, manufacturer and tax. Descriptions are '<matrix description> <color> <size> <fit>'.
-    Stock starts at 0. Never changes the matrix or its existing items. Refuses duplicate SKUs
-    or variants, pants sizes that are not waist-only, and 3-piece or boys' values. Warns about
-    new color/size/fit spellings and prices that differ from the matrix's other items."""
+    """Add new child items (variants) to a matrix: one item per combination of its attributes
+    (Color/Size/Fit, or Color/Size/Width for shoes, ...), each with its own new custom SKU, the given
+    price and cost, and the matrix's category, vendor, manufacturer and tax. Descriptions are
+    '<matrix description> <values>'. Stock starts at 0. Never changes the matrix or its existing
+    items. Refuses duplicate SKUs or variants, a matrix not on its garment type's matrix type (a
+    Color-only tuxedo matrix is rebuilt instead), new sizes outside the garment type's size format,
+    a blank fit ('Standard' when the vendor names none), and 3-piece or boys' values. Warns about new
+    spellings and prices that differ from the matrix's other items."""
     return run(lambda w: w.add_matrix_variants(matrix_id, [v.model_dump() for v in variants], price, cost,
                                                dry_run, confirm_code), writer)
 
@@ -658,16 +667,17 @@ def receive_po_lines(
 
 @write_tool
 def move_items_into_matrix(
-    matrix_id: Annotated[int, Field(description="The Color/Size/Fit matrix (attribute set 5) to put the items in.")],
+    matrix_id: Annotated[int, Field(description="The matrix to put the items in (on its garment type's matrix type).")],
     items: Annotated[list[MoveItem], Field(description="Existing items and their color, size and fit (max 100; one until a first move has been checked).")],
-    only_matrix_and_attributes: Annotated[bool, Field(description="True: change only the matrix and Color/Size/Fit. False (default): also give each item the matrix's description pattern, category, manufacturer and vendor.")] = False,
+    only_matrix_and_attributes: Annotated[bool, Field(description="True: change only the matrix and the attribute values. False (default): also give each item the matrix's description pattern, category, manufacturer and vendor.")] = False,
     dry_run: DryRun = True,
     confirm_code: ConfirmCode = None,
 ) -> str:
     """Put existing items (not in a matrix, or in another one, e.g. a Color-only matrix) into a
-    Color/Size/Fit matrix, with their color, size and fit. Never sends prices, cost, SKUs or
-    stock. Refuses a combination the matrix already has, spellings that differ from the matrix's
-    only in capitals, non-waist pants sizes, and 3-piece or boys' items. Lightspeed's docs don't
+    matrix, with their values (color, size and fit for a Color/Size/Fit matrix). Never sends prices,
+    cost, SKUs or stock. Refuses a combination the matrix already has, spellings that differ from the
+    matrix's only in capitals, sizes outside the garment type's format, a blank fit, and 3-piece or
+    boys' items. Lightspeed's docs don't
     describe moving existing items, so until one move has been done and checked, it moves one
     item per call."""
     return run(lambda w: w.move_items_into_matrix(matrix_id, [i.model_dump() for i in items],

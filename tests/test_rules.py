@@ -60,22 +60,68 @@ def test_sizes_are_allowed_in_item_descriptions_only():
         rules.check_plain_description("Caravelli Black 42R Slim")
 
 
-@pytest.mark.parametrize("size, ok", [("32", True), ("40", True), ("34x32", False), ("34R", False), ("34/30", False),
-                                      ("3", False), ("100", False)])
-def test_waist_sizes(size, ok):
-    if ok:
-        rules.check_waist_sizes([size])
-    else:
-        with pytest.raises(RuleViolation, match="waist only"):
-            rules.check_waist_sizes([size])
+@pytest.mark.parametrize("garment, good, bad", [
+    ("pants", ["32", "40"], ["34x32", "34R", "34/30", "3", "100"]),                 # stocked uncut
+    ("casual pants", ["34", "34S", "34R", "34L"], ["34XL", "34x32"]),               # Pellagio ships hemmed
+    ("suit", ["40R", "41L", "50S", "44XL"], ["40", "40 R", "40r", "44PS", "M"]),
+    ("vest", ["40R"], ["M"]),                                                        # by jacket size
+    ("dress shirt", ["15.5 34/35", "16 32/33", "22 36/37"], ["15.5", "15.5/34", "M"]),
+    ("shoes", ["10", "10.5", "7"], ["10 1/2", "10.5W", "M"]),
+    ("sweater", ["S", "M", "XL", "2XL", "6XL"], ["Medium", "42", "7XL"]),
+    ("belt", ["36"], ["M"]),
+])
+def test_sizes_by_garment_type(garment, good, bad):
+    rules.check_sizes(rules.GARMENTS[garment], good)
+    for size in bad:
+        with pytest.raises(RuleViolation, match=f"{garment} sizes are"):
+            rules.check_sizes(rules.GARMENTS[garment], [size])
+
+
+def test_sizes_of_an_unknown_garment_or_one_size_items_are_not_checked():
+    rules.check_sizes(None, ["anything"])
+    rules.check_sizes(rules.GARMENTS["accessory"], ["anything"])
 
 
 def test_garment_type_aliases_and_description():
-    assert rules.check_garment_type("2pc", "Caravelli Suit") == "suit"
-    assert rules.check_garment_type("Tux", "Caravelli Tuxedo") == "tuxedo"
-    assert rules.check_garment_type("pants", "Caravelli Slacks") == "pants"
+    assert rules.check_garment_type("2pc", "Caravelli Suit").name == "suit"
+    assert rules.check_garment_type("Tux", "Caravelli Tuxedo").name == "tuxedo"
+    assert rules.check_garment_type("pants", "Caravelli Slacks").name == "pants"
+    assert rules.check_garment_type("dinner jacket", "Mantoni Velvet Dinner Jacket").name == "tux jacket"
+    assert rules.check_garment_type("denim", "Enzo Tovare Milan Denim").name == "casual pants"
+    assert rules.check_garment_type("shirt", "Marquis Dress Shirt").name == "dress shirt"
+    # Shoes: the style name stands in for the garment word.
+    assert rules.check_garment_type("shoes", "Stacy Adams Dickinson").name == "shoes"
     with pytest.raises(RuleViolation, match="does not say"):
         rules.check_garment_type("pants", "Caravelli Suit")
+    with pytest.raises(RuleViolation, match="not one of"):
+        rules.check_garment_type("hat", "Caravelli Hat")
+
+
+def test_a_matrix_goes_in_its_garment_types_category():
+    assert rules.check_garment_type("tuxedo", "Caravelli Tuxedo", "Suits/Tuxedos").name == "tuxedo"
+    assert rules.check_garment_type("sweater", "Pellagio Sweater", "Services").name == "sweater"   # says nothing
+    with pytest.raises(RuleViolation, match="holds tuxedo matrices, not tux jacket"):
+        rules.check_garment_type("tux jacket", "Mantoni Dinner Jacket", "Suits/Tuxedos")
+    with pytest.raises(RuleViolation, match="holds vest matrices, not casual vest"):
+        rules.check_garment_type("casual vest", "Pellagio Puffer Vest", "Dress Shirts, Sweaters, & Vests/Vests/Specialty")
+
+
+@pytest.mark.parametrize("description, category, garment", [
+    ("Caravelli", "Suits/Suit", "suit"),                                        # the category decides
+    ("Caravelli Tux", "Suits/Tuxedos", "tuxedo"),
+    ("Mantoni Vest", "Dress Shirts, Sweaters, & Vests/Vests/Standard", "vest"),
+    ("Marquis Dress Shirt", "Dress Shirts, Sweaters, & Vests/Dress Shirts/Non Iron", "dress shirt"),
+    ("Pellagio Puffer Vest", "Vests/Casual Vests", "casual vest"),
+    ("Enzo Tovare Ace Jacket", "Outerwear/Jackets", "jacket"),
+    ("Mantoni Velvet Jacket", "Sport Coats & Blazers", "sport coat"),
+    ("Stacy Adams Dickinson", "Shoes/Dress", "shoes"),
+    ("Mantoni Velvet Tuxedo Jacket", "", "tux jacket"),                         # no category: the description
+    ("Renoir Linen Pants", "", "pants"),
+    ("Enzo Tovare Ace Jacket", "", None),                                       # a bare "jacket" decides nothing
+])
+def test_garment_of_an_existing_matrix(description, category, garment):
+    found = rules.garment_of(description, category)
+    assert (found.name if found else None) == garment
 
 
 def test_values_are_trimmed_but_never_recased():
