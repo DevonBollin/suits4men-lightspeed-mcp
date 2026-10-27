@@ -85,11 +85,10 @@ prompts to keep the saved ones. Re-authorize when:
 - the server wasn't used for **30 days**, which is how long Lightspeed lets an unused refresh token live;
 - the scopes change (`SCOPES` in `lightspeed_mcp/config.py`).
 
-**Pending:** Phase 2 changed the scopes (`employee:inventory` replaces
-`employee:inventory_read`). Reads and dry runs work with the current token,
-but run bootstrap once more before the first real write. Re-authorizing
-changes no inventory data. Run it from a normal PowerShell window: from the
-Claude app's Terminal panel, open one with
+Phase 2 changed the scopes (`employee:inventory` replaces
+`employee:inventory_read`), and bootstrap was re-run on 2026-10-26: the
+saved token has all 9 scopes. Re-authorizing changes no inventory data. Run it
+from a normal PowerShell window: from the Claude app's Terminal panel, open one with
 `Start-Process powershell -WorkingDirectory "C:\Development\Suits 4 Men Inventory"`.
 
 ## Revoke access

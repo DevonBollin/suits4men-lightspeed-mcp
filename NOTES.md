@@ -293,9 +293,10 @@ account yet**: the first real write (with the owner's approval) is the first tes
 ### Scopes
 
 - `SCOPES` now has `employee:inventory` (view, create, update and archive items)
-  in place of `employee:inventory_read`. **Takes effect only after bootstrap.py
-  is re-run**; until then the saved token still has `inventory_read`, which is
-  enough for every read and dry run.
+  in place of `employee:inventory_read`. Bootstrap was re-run at 20:43 on
+  2026-10-26; the token's `scope` claim lists all 9, `employee:inventory`
+  included. After that, all 26 read calls and all 5 write-tool dry runs passed
+  live (`check_tools.py`, `--dry-runs`).
 - `employee:product_edit` exists ("create, update and archive products") but
   is **not requested**: the ItemMatrix page names only `employee:product_cost`
   (held). If the first matrix creation answers 403, add it and re-run bootstrap.
