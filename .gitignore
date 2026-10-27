@@ -1,0 +1,14 @@
+# Python environment and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local runtime files: token lock, write switch, write log (never committed)
+state/
+
+# Snapshots of Lightspeed data (contain costs and sales; kept local)
+backups/
+
+# Config backups made by install_claude_desktop.py
+*.bak-*
