@@ -110,6 +110,7 @@ DRY_RUNS = [
     ("create_inventory_count", {"name": "Neck ties check", "items": [{"item_id": 1387, "counted": 150}]}),
     # Belt and silk scarf: off the archived "Ties, Boxers & Socks" (51) onto the active "Ties, Boxers, and Socks" (2).
     ("reassign_items", {"items": [{"item_id": 1380, "vendor_id": 2}, {"item_id": 1390, "vendor_id": 2}]}),
+    ("set_upcs", {"items": [{"item_id": 1345, "upc": "036000291452"}]}),  # a sample UPC with a valid check digit
 ]
 
 

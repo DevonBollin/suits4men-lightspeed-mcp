@@ -282,6 +282,24 @@ def check_custom_sku_format(sku: str) -> str:
     return sku
 
 
+def check_upc(upc) -> str:
+    """A barcode number as printed on the box or tag (UPC or EAN). Lightspeed's rule: 11-14 digits.
+    With 12-14 digits the last one is a check digit (GTIN), so a misread digit is caught here
+    instead of making the label unscannable."""
+    code = clean(upc).replace(" ", "").replace("-", "")
+    if not re.fullmatch(r"\d{11,14}", code):
+        raise RuleViolation(f"Refused: UPC '{upc}' must be 11 to 14 digits (Lightspeed's rule), as printed under the "
+                            "barcode.")
+    if len(code) >= 12:
+        body, check = code[:-1], int(code[-1])
+        # GTIN: from the right, the digits before the check digit are weighted 3, 1, 3, 1, ...
+        total = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(body)))
+        if (10 - total % 10) % 10 != check:
+            raise RuleViolation(f"Refused: UPC '{upc}' fails its check digit, so a digit is probably misread. Check "
+                                "the number under the barcode.")
+    return code
+
+
 # ---- vendor and brand names ---------------------------------------------------------------
 
 # Words that don't make two company names different: "San Malone" = "San Malone, Inc.".

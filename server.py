@@ -423,6 +423,7 @@ class NewItemDetails(BaseModel):
     price: Annotated[float, Field(description="Default selling price.")]
     custom_sku: Annotated[str | None, Field(description="6-digit SKU as text; empty = the next free one.")] = None
     manufacturer_id: Annotated[int | None, Field(description="Brand (list_manufacturers).")] = None
+    upc: Annotated[str | None, Field(description="The barcode number on its box or tag (11-14 digits), if any.")] = None
 
 
 class InvoiceNewItem(NewItemDetails):
@@ -438,6 +439,7 @@ class InvoiceLine(BaseModel):
     quantity: Annotated[int, Field(description="Units on this line (that arrived, for a packing slip).")]
     unit_cost: Annotated[float, Field(description="Unit cost on the invoice.")]
     item_id: Annotated[int | None, Field(description="The item, when already known.")] = None
+    upc: Annotated[str | None, Field(description="The barcode number printed for this line (shoe boxes), if any: matches the item that has it, and goes on a new item.")] = None
     vendor_number: Annotated[str | None, Field(description="The vendor's style / item number as printed.")] = None
     matrix_id: Annotated[int | None, Field(description="For an item in a matrix (suit, tux, vest, pants, or a shirt/shoe matrix): the matrix.")] = None
     color: Annotated[str | None, Field(description="With matrix_id: color exactly as the vendor names it.")] = None
@@ -511,6 +513,7 @@ class Variant(BaseModel):
     size: Annotated[str | None, Field(description="Size, e.g. '42R' for suits. Pants: waist only, e.g. '34'.")] = None
     fit: Annotated[str | None, Field(description="Fit exactly as the vendor names it, e.g. 'Slim'. May be blank.")] = None
     values: AttributeValues = None
+    upc: Annotated[str | None, Field(description="The barcode number on its box or tag (11-14 digits), if any.")] = None
 
 
 class NewPoLine(BaseModel):
@@ -1053,6 +1056,25 @@ def reassign_items(
     fields are sent. Refuses items in a matrix (update_matrix changes a whole matrix) and archived items.
     Warns when an item's vendor number stays filed under the old vendor."""
     return run(lambda w: w.reassign_items([i.model_dump() for i in items], dry_run, confirm_code), writer)
+
+
+class UpcEntry(BaseModel):
+    item_id: Annotated[int, Field(description="The item.")]
+    upc: Annotated[str, Field(description="The barcode number under the barcode on its box or tag (11-14 digits).")]
+
+
+@write_tool
+def set_upcs(
+    items: Annotated[list[UpcEntry], Field(description="Items and their UPCs (max 100).")],
+    dry_run: DryRun = True,
+    confirm_code: ConfirmCode = None,
+) -> str:
+    """Save the barcode number (UPC) from items' boxes or tags, e.g. shoes per size and width, so
+    scanning the box finds the item and invoices printing the UPC match it. Only the UPC is sent.
+    Refuses a UPC that isn't 11-14 digits, fails its check digit (a misread digit), or is already on
+    another item (archived ones included). Warns when it replaces an item's UPC. New items get their
+    UPC when created (add_matrix_variants, create_items, intake_invoice)."""
+    return run(lambda w: w.set_upcs([i.model_dump() for i in items], dry_run, confirm_code), writer)
 
 
 if __name__ == "__main__":

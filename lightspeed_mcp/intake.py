@@ -4,6 +4,7 @@ Claude reads the document and passes each line as a dict:
 
     quantity, unit_cost            what arrived and what it cost (required)
     item_id                        if the item is already known
+    upc                            the barcode number (shoe boxes), if printed
     vendor_number                  the vendor's style / item number printed on the invoice
     matrix_id, color, size, fit    a variant of a Color/Size/Fit matrix
     description                    the invoice's own text (used to suggest candidates)
@@ -12,7 +13,7 @@ Claude reads the document and passes each line as a dict:
                                    for an item outside any matrix that doesn't exist yet
 
 Each line is resolved, in this order, to:
-  * "existing": an active item, by item_id; or by vendor_number (the store's saved vendor
+  * "existing": an active item, by item_id; or by upc; or by vendor_number (the store's saved vendor
     item numbers for this vendor) plus color/size/fit when the number covers several items;
     or by matrix_id + color/size/fit;
   * "new_variant": matrix_id + color/size/fit that the matrix doesn't have yet (needs price);
@@ -157,6 +158,16 @@ class InvoiceMatcher:
             if item is None:
                 return LineMatch(number, line, "unresolved", reason=f"Item {line['item_id']} was not found.")
             return found(item)
+
+        # A barcode belongs to one item (set_upcs and the create tools refuse a second), so it decides.
+        upc = clean(line.get("upc")).replace(" ", "").replace("-", "")
+        if upc:
+            holders = [i for i in self.items if fmt.text(i.get("upc")) == upc]
+            if len(holders) == 1:
+                return found(holders[0])
+            if holders:
+                return LineMatch(number, line, "unresolved", candidates=[item_summary(i) for i in holders],
+                                 reason=f"UPC {upc} is on {len(holders)} items; give item_id.")
 
         spans: list[int] = []  # the matrices a shared vendor number is used in, when more than one
         if vendor_number:

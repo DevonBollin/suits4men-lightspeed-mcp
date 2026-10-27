@@ -141,7 +141,7 @@ class CannedReads:
         if params.get("archived") != "true":
             rows = [r for r in rows if r.get("archived") != "true"]
         for field in ("itemMatrixID", "customSku", "orderID", "defaultVendorID", "manufacturerID", "categoryID",
-                      "complete", "inventoryCountID"):
+                      "complete", "inventoryCountID", "upc"):
             if field in params:
                 rows = [r for r in rows if r.get(field) == params[field]]
         for field in ("itemID", "vendorID"):
@@ -175,6 +175,7 @@ GOOD_CALLS = {
     "assign_custom_skus": dict(items=[{"item_id": 1186}, {"item_id": 2321, "custom_sku": "013200"}]),
     "archive_item": dict(item_id=1345),
     "reassign_items": dict(items=[{"item_id": 1186, "vendor_id": 21, "manufacturer_id": 3, "category_id": 84}]),
+    "set_upcs": dict(items=[{"item_id": 1345, "upc": "036000291452"}]),
 }
 
 

@@ -116,7 +116,7 @@ UPDATE_MATRIX = Route("PUT", re.compile(r"ItemMatrix/\d+\.json"),
                       frozenset({"description", "categoryID", "manufacturerID", "defaultVendorID", "defaultCost",
                                  "Prices"}))
 NEW_MATRIX_ITEM = Route("POST", re.compile(r"Item\.json"),
-                        frozenset(ITEM_FIELDS | {"itemMatrixID", "customSku", "ItemAttributes", "ItemVendorNums"}))
+                        frozenset(ITEM_FIELDS | {"itemMatrixID", "customSku", "upc", "ItemAttributes", "ItemVendorNums"}))
 ITEM_SKU_COST_DESCRIPTION = Route("PUT", re.compile(r"Item/\d+\.json"),
                                   frozenset({"customSku", "defaultCost", "description"}))  # never prices or stock
 # Put an existing item into a matrix: its matrix, Color/Size/Fit, and (optionally) the
@@ -155,7 +155,10 @@ NEW_COUNT_ITEM = Route("POST", re.compile(r"InventoryCountItem\.json"),
 # Lightspeed archives a PO on DELETE. Only POs with nothing received (archive_purchase_order checks).
 ARCHIVE_ORDER = Route("DELETE", re.compile(r"Order/\d+\.json"), frozenset())
 # A new item outside any matrix (shirts, ties, shoes): no itemMatrixID, no ItemAttributes.
-NEW_STANDALONE_ITEM = Route("POST", re.compile(r"Item\.json"), frozenset(ITEM_FIELDS | {"customSku", "ItemVendorNums"}))
+NEW_STANDALONE_ITEM = Route("POST", re.compile(r"Item\.json"),
+                            frozenset(ITEM_FIELDS | {"customSku", "upc", "ItemVendorNums"}))
+# The barcode number (UPC) on an existing item, and nothing else.
+ITEM_UPC = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"upc"}))
 # The vendor's own item number(s) on an existing item. The body lists the item's existing vendor
 # numbers too, so they are kept whether Lightspeed merges or replaces the list.
 ITEM_VENDOR_NUMBERS = Route("PUT", re.compile(r"Item/\d+\.json"), frozenset({"ItemVendorNums"}))
@@ -222,6 +225,7 @@ WRITE_ROUTES: dict[str, tuple[Route, ...]] = {
     "create_attribute_set": (NEW_ATTRIBUTE_SET,),
     "update_attribute_set": (UPDATE_ATTRIBUTE_SET,),
     "reassign_items": (ITEM_VENDOR_BRAND_CATEGORY,),
+    "set_upcs": (ITEM_UPC,),
 }
 
 

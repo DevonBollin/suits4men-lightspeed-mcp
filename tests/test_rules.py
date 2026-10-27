@@ -100,6 +100,28 @@ def test_custom_sku_format(sku, ok):
             rules.check_custom_sku_format(sku)
 
 
+@pytest.mark.parametrize("upc, expected", [
+    ("036000291452", "036000291452"),       # UPC-A, check digit 2
+    (" 0 36000 29145 2 ", "036000291452"),  # spaced as printed under the barcode
+    ("4006381333931", "4006381333931"),     # EAN-13
+    ("03600029145", "03600029145"),         # 11 digits: no check digit to test
+])
+def test_upc_accepted(upc, expected):
+    assert rules.check_upc(upc) == expected
+
+
+@pytest.mark.parametrize("upc, message", [
+    ("036000291453", "check digit"),        # one digit misread
+    ("4006381333932", "check digit"),
+    ("0360002914", "11 to 14 digits"),
+    ("03600029145A", "11 to 14 digits"),
+    ("", "11 to 14 digits"),
+])
+def test_upc_refused(upc, message):
+    with pytest.raises(RuleViolation, match=message):
+        rules.check_upc(upc)
+
+
 @pytest.mark.parametrize("a, b", [("San Malone, Inc.", "San Malone"), ("SAN  MALONE LLC", "san malone"),
                                   ("Johnston & Murphy", "Johnston and Murphy")])
 def test_same_company_names(a, b):

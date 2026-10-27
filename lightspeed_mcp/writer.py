@@ -369,6 +369,37 @@ class InventoryWriter:
                     found.setdefault(sku, []).append(r)
         return {sku: found.get(sku, []) for sku in skus}
 
+    def _upc_holders(self, upcs: list[str], items: list[dict] | None = None) -> dict[str, list[dict]]:
+        """{upc: [items that already have it]}, archived items too (an old box may still be scanned)."""
+        found: dict[str, list[dict]] = {}
+        if items is None and len(upcs) <= 8:
+            for upc in upcs:  # exact-match lookups
+                rows, _ = self.client.get_all("Item.json", {"upc": upc, "archived": "true"}, max_records=10)
+                found[upc] = [r for r in rows if fmt.text(r.get("upc")) == upc]
+            return found
+        if items is None:  # many UPCs: one pass over every item is fewer requests
+            items, _ = self.client.get_all("Item.json", {"archived": "true"})
+        wanted = set(upcs)
+        for r in items:
+            if fmt.text(r.get("upc")) in wanted:
+                found.setdefault(fmt.text(r.get("upc")), []).append(r)
+        return {upc: found.get(upc, []) for upc in upcs}
+
+    def _check_upcs_free(self, upcs: list[tuple[str | None, str]], items: list[dict] | None = None) -> None:
+        """Refuse a UPC listed twice, or already on another item. upcs: (item ID, or None for a new item; UPC)."""
+        seen: set[str] = set()
+        for _, upc in upcs:
+            if upc in seen:
+                raise RuleViolation(f"Refused: UPC {upc} is listed twice. A barcode belongs to one item.")
+            seen.add(upc)
+        holders = self._upc_holders([upc for _, upc in upcs], items)
+        for item_id, upc in upcs:
+            others = [h for h in holders[upc] if str(h.get("itemID")) != str(item_id)]
+            if others:
+                raise RuleViolation(f"Refused: UPC {upc} is already on {item_label(others[0])}"
+                                    + (" (archived)" if fmt.flag(others[0].get("archived")) else "")
+                                    + ". A barcode belongs to one item, so scanning it finds the right one.")
+
     def _tax_fields(self, warnings: list[str]) -> dict:
         """Taxable, with the store's tax class, like every existing matrix and item (one tax class: 1 "Item")."""
         tax_classes, _ = self.client.get_all("TaxClass.json")
@@ -429,6 +460,8 @@ class InventoryWriter:
             warnings.append(f"'{desc}': the price {price_text} is not above the cost {cost_text}.")
         body.update(customSku=skus.take(entry.get("custom_sku")), defaultCost=cost_text,
                     Prices=default_price(price_text))
+        if rules.clean(entry.get("upc")):
+            body["upc"] = rules.check_upc(entry["upc"])  # checked against other items by the caller
         return body, desc
 
     @staticmethod
@@ -501,10 +534,10 @@ class InventoryWriter:
 
     @classmethod
     def _variant_body(cls, matrix: dict, matrix_desc: str, values: tuple[str, str, str], sku: str, cost_text: str,
-                      price_text: str) -> dict:
+                      price_text: str, upc: str | None = None) -> dict:
         """The POST Item.json body for a new item in a matrix: '<matrix description> <values>' (for set 5:
-        color, size, fit), the given SKU, cost and Default price, and the matrix's category, vendor,
-        manufacturer and tax."""
+        color, size, fit), the given SKU, cost, Default price and UPC (if any), and the matrix's category,
+        vendor, manufacturer and tax."""
         attributes = cls._item_attributes(matrix, values)
         body = {
             "description": " ".join(p for p in (matrix_desc, *values) if p),
@@ -515,6 +548,8 @@ class InventoryWriter:
             "ItemAttributes": attributes,
             "Prices": default_price(price_text),
         }
+        if upc:
+            body["upc"] = upc
         for key in ("categoryID", "manufacturerID", "defaultVendorID", "taxClassID"):
             if fmt.ref_id(matrix.get(key)):
                 body[key] = str(matrix.get(key))
@@ -761,12 +796,15 @@ class InventoryWriter:
                 values = self._clean_values(v, f"variant {n}", slots)
                 cleaned.append((*values, rules.check_custom_sku_format(v.get("custom_sku"))))
             rules.check_skus_unique_in_request([sku for *_, sku in cleaned])
+            upcs = [rules.check_upc(v["upc"]) if rules.clean(v.get("upc")) else None for v in variants]
             children = self._check_matrix_values(matrix_id, matrix, pants, [c[:3] for c in cleaned], warnings, slots)
 
             taken = {sku: items for sku, items in self._items_with_skus([s for *_, s in cleaned]).items() if items}
             if taken:
                 raise RuleViolation("Refused: custom SKU already in use: " + "; ".join(
                     f"{sku} by {item_label(items[0])}" for sku, items in taken.items()) + ". Every item gets its own SKU.")
+            if any(upcs):
+                self._check_upcs_free([(None, upc) for upc in upcs if upc])
 
             if float(price_text) <= float(cost_text):
                 warnings.append(f"The price {price_text} is not above the cost {cost_text}.")
@@ -777,9 +815,10 @@ class InventoryWriter:
                 warnings.append(f"Most items in this matrix sell at {common:.2f}; these would sell at {price_text}.")
 
             requests = []
-            for *values, sku in cleaned:
-                body = self._variant_body(matrix, matrix_desc, tuple(values), sku, cost_text, price_text)
-                requests.append(PlannedRequest(f"create '{body['description']}' (SKU {sku})", "POST", "Item.json", body))
+            for (*values, sku), upc in zip(cleaned, upcs):
+                body = self._variant_body(matrix, matrix_desc, tuple(values), sku, cost_text, price_text, upc)
+                requests.append(PlannedRequest(f"create '{body['description']}' (SKU {sku}"
+                                               + (f", UPC {upc})" if upc else ")"), "POST", "Item.json", body))
 
             summary = (f"Create {len(requests)} new item(s) in matrix {matrix_id} '{matrix_desc}'"
                        + (" (pants: sized by waist)" if pants else "")
@@ -1185,6 +1224,9 @@ class InventoryWriter:
                 requests.append(PlannedRequest(f"create '{desc}' (SKU {body['customSku']}, cost {body['defaultCost']}, "
                                                f"price {body['Prices']['ItemPrice'][0]['amount']})", "POST",
                                                "Item.json", body))
+            upcs = [r.body["upc"] for r in requests if r.body.get("upc")]
+            if upcs:
+                self._check_upcs_free([(None, upc) for upc in upcs], list(skus.items_by_id.values()))
             summary = (f"Create {len(requests)} new item(s) outside any matrix, each with its own custom SKU"
                        f"{skus.picked_note()}, the cost and Default price given, and the store's tax class. Stock "
                        "starts at 0.")
@@ -1552,16 +1594,19 @@ class InventoryWriter:
                         save_number = True
                     except RuleViolation as e:
                         warnings.append(f"Line {m.number}: vendor number not saved. {str(e).removeprefix('Refused: ')}")
+                upc = rules.clean(m.line.get("upc"))
                 if m.status == "new_variant":
                     matrix, matrix_desc = matrix_info[str(m.matrix.get("itemMatrixID"))]
                     if m.line.get("price") is None:
                         raise RuleViolation(f"Refused: line {m.number} is a new item in matrix "
                                             f"{matrix.get('itemMatrixID')} '{matrix_desc}': give its selling price.")
                     body = self._variant_body(matrix, matrix_desc, m.values, skus.take(m.line.get("custom_sku")), cost,
-                                              money(m.line["price"], f"line {m.number} price"))
+                                              money(m.line["price"], f"line {m.number} price"),
+                                              rules.check_upc(upc) if upc else None)
                 elif m.status == "new_item":
                     entry = {**m.line["new_item"], "cost": m.line.get("unit_cost"), "vendor_ref": vendor_ref}
                     entry["custom_sku"] = entry.get("custom_sku") or m.line.get("custom_sku")
+                    entry["upc"] = entry.get("upc") or upc
                     if rules.clean(entry.get("new_brand")):
                         entry["brand_ref"] = brand_refs[rules.name_key(entry["new_brand"])]
                     body, _ = self._standalone_item(entry, skus, tax, taken_desc, matrices, warnings)
@@ -1571,6 +1616,12 @@ class InventoryWriter:
                     rules.check_not_three_piece(desc)
                     rules.check_not_boys(desc)
                     item_refs[m.number] = str(item.get("itemID"))
+                    has = fmt.text(item.get("upc"))
+                    if upc and not has:
+                        warnings.append(f"Line {m.number}: {item_label(item)} has no UPC; set_upcs can save {upc}.")
+                    elif upc and has != upc.replace(" ", "").replace("-", ""):
+                        warnings.append(f"Line {m.number}: the document's UPC {upc} differs from {item_label(item)}'s "
+                                        f"{has}. Check the box.")
                     if save_number:
                         numbers_saved += 1
                         requests.append(PlannedRequest(
@@ -1594,6 +1645,9 @@ class InventoryWriter:
                     f"line {m.number}: create '{body['description']}' (SKU {body['customSku']}, cost {cost}, price "
                     f"{body['Prices']['ItemPrice'][0]['amount']})", "POST", "Item.json", body, creates=name))
                 item_refs[m.number] = new_ref(name)
+            new_upcs = [r.body["upc"] for r in requests if r.path == "Item.json" and r.body.get("upc")]
+            if new_upcs:
+                self._check_upcs_free([(None, u) for u in new_upcs], matcher.items)
 
             # 4. The PO lines: what arrived, at the invoice's unit cost.
             units, total = 0, 0.0
@@ -2463,3 +2517,41 @@ class InventoryWriter:
             return Plan("reassign_items", summary, requests, warnings)
 
         return self._run("reassign_items", dry_run, confirm_code, build)
+
+    # ---- 23. UPCs (the barcode number on a box or tag) ---------------------------------------------------------
+
+    def set_upcs(self, items: list[dict], dry_run: bool = True, confirm_code: str | None = None) -> dict:
+        """Save the barcode number from items' boxes or tags (shoes), so scanning it finds the item and
+        invoices that print it match by it."""
+
+        def build() -> Plan:
+            if not items:
+                raise RuleViolation("Refused: give at least one item.")
+            if len(items) > MAX_REQUESTS_PER_CALL:
+                raise RuleViolation(f"Refused: {len(items)} items; the limit is {MAX_REQUESTS_PER_CALL} per call.")
+            ids = [str(int(entry.get("item_id"))) for entry in items]
+            if len(set(ids)) != len(ids):
+                raise RuleViolation("Refused: the same item is listed twice.")
+            upcs = [rules.check_upc(entry.get("upc")) for entry in items]
+            found = self._items_by_id(ids)
+            requests, warnings = [], []
+            for item_id, upc in zip(ids, upcs):
+                item = found.get(item_id)
+                if item is None:
+                    raise RuleViolation(f"Refused: item {item_id} was not found.")
+                if fmt.flag(item.get("archived")):
+                    raise RuleViolation(f"Refused: {item_label(item)} is archived.")
+                old = fmt.text(item.get("upc"))
+                if old == upc:
+                    raise RuleViolation(f"Refused: {item_label(item)} already has UPC {upc}.")
+                if old:
+                    warnings.append(f"{item_label(item)}: replaces UPC {old}; a box printed with it will no longer "
+                                    "scan as this item.")
+                requests.append(PlannedRequest(f"{item_label(item)}: UPC {upc}", "PUT", f"Item/{item_id}.json",
+                                               {"upc": upc}))
+            self._check_upcs_free(list(zip(ids, upcs)))
+            summary = (f"Save the UPC on {len(requests)} item(s), as listed. Only the UPC is sent; each one is on no "
+                       "other item (archived ones included) and passes its check digit.")
+            return Plan("set_upcs", summary, requests, warnings)
+
+        return self._run("set_upcs", dry_run, confirm_code, build)

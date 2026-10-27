@@ -264,6 +264,7 @@ across several entries and switched over atomically. See
 | `create_inventory_count` | `POST InventoryCount.json` + one `POST InventoryCountItem.json` per counted item | **Reconcile** (the step that changes stock stays a click in Lightspeed) |
 | `create_attribute_set` / `update_attribute_set` | `POST`/`PUT ItemAttributeSet`: a set's name and its 1-3 attribute names (one is always Color) | Touch Lightspeed's built-in sets 1-4; remove, swap or move Color in a set that matrices use |
 | `reassign_items` | `PUT Item/<id>.json` per item: default vendor, brand and/or category, only what changes | Touch an item in a matrix (`update_matrix` does the whole matrix), or prices, cost, stock and vendor numbers |
+| `set_upcs` | `PUT Item/<id>.json` per item with only `upc`: the barcode number from its box or tag | Save a UPC that fails its check digit or is already on another item (archived ones too) |
 
 `receive_po_lines` marks goods as received on the PO. Stock on hand changes
 only when someone presses **Add Received To Inventory** on that PO in
@@ -317,6 +318,12 @@ per item). Invoice lines are matched by matrix and color/size/fit, not by the
 code alone: when a code is used in several matrices, the line needs the matrix
 for its garment type. The trade-off: Lightspeed's own lookups by Vendor ID
 (its purchase-order import) find several items for such a code.
+
+UPCs (barcode numbers, e.g. on shoe boxes): a line with a UPC matches the item
+that has it. A new item or variant created by the intake gets the line's UPC,
+and `add_matrix_variants`, `create_items` and `set_upcs` take one too. A UPC
+must be 11-14 digits (Lightspeed's rule), pass its check digit, and belong to
+one item only.
 
 #### Inventory counts
 
