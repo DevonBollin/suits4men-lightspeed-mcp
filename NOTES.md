@@ -318,7 +318,8 @@ retried, since a write might have gone through.
 
 ### To confirm on the first real writes (each approved by the owner)
 
-1. Status code of a successful POST/PUT (200 or 201?) and the response shape.
+1. ~~Status code of a successful POST/PUT (200 or 201?) and the response shape.~~ **PUT: 200**, record
+   under its key (`{"Item": {...}}`), see "First real write" below. POST still to see.
 2. Creating a matrix with `employee:product_cost` + `employee:inventory`, without `product_edit`.
 3. A new child sent with only a Default price: what MSRP and Online become.
 4. Whether a child's description is kept as sent.
@@ -327,6 +328,20 @@ retried, since a write might have gone through.
 7. The real request cost of a write (`x-ls-api-request-cost`).
 
 Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
+
+### First real write (2026-10-26 22:06, approved by the owner)
+
+- The owner turned writes on by hand, approved the dry run in chat, and turned
+  writes off again right after.
+- `update_item_fields`: `PUT /API/V3/Account/304581/Item/2321.json` with
+  `{"customSku": "013471"}` (confirm code `ae0bdb8e3b`). **HTTP 200**; the reply
+  held the item under `Item`. Write log: one `sending` and one `done` line
+  (write_id `ad4251f81bb3`).
+- **A PUT merges, confirmed live:** snapshots 2026-10-26_220504 (before) and
+  2026-10-26_220635 (after) differ in exactly one record and two fields: item
+  2321's `customSku` ("" → "013471") and `timeStamp`. Prices, cost, stock,
+  category and every other record were untouched.
+- 56 active items are now without a custom SKU; the highest SKU in use is 013471.
 
 ### Data findings (2026-10-26, from the snapshot)
 
