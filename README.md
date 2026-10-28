@@ -36,6 +36,7 @@ file in this folder, and not in the Claude Desktop config.
 | `state/` | Token-refresh lock, the write switch (when on) and the write log. Not in git |
 | `backups/` | Snapshots from `backup_lightspeed.py`. Not in git (they contain costs) |
 | `NOTES.md` | How the real API and the store's data behave |
+| `docs/inventory-structure.md` | The owner's draft inventory structure (matrix types, categories, garment types, vendors, intake, migration), copied from its claude.ai page |
 
 The folder is a git repository (branch `main`, nothing pushed anywhere).
 `.venv/`, `state/` and `backups/` are never committed, and no secrets are in any file.
@@ -400,7 +401,8 @@ before the first matrix update and compare after.
 #### Attribute sets (matrix types)
 
 The rules follow the owner's draft "Suits 4 Men — Lightspeed R-Series Inventory
-Structure" (§2, §3, §4), table in `GARMENTS` in `lightspeed_mcp/rules.py`. Every
+Structure" ([docs/inventory-structure.md](docs/inventory-structure.md), §2, §3,
+§4), table in `GARMENTS` in `lightspeed_mcp/rules.py`. Every
 garment type has one **matrix type**, an attribute set by its attribute names in
 order, and **every set has Color**, so a matrix never splits by color:
 

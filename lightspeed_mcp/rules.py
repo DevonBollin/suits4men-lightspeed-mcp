@@ -5,7 +5,7 @@ RuleViolation with a message that says what was refused and why, so Claude
 can pass it straight on. Nothing here talks to Lightspeed.
 
 The rules (from the store owner, and since 2026-10-27 the owner's draft "Suits 4 Men —
-Lightspeed R-Series Inventory Structure", §1, §2 and §4):
+Lightspeed R-Series Inventory Structure", docs/inventory-structure.md, §1, §2 and §4):
   * Every garment type has one matrix type (GARMENTS below), and every matrix of
     that garment type uses it: MT1 Color/Size/Fit (the store's set 5) for tailored
     clothing and dress and tux shirts, MT2 Color/Size/Width for shoes, MT3
