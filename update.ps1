@@ -13,7 +13,8 @@ on GitHub. The developer's computer works on "main" and releases by pushing to "
 What it does:
   1. Refuses to run if files tracked here were edited on this computer.
   2. Fetches "stable" from GitHub and moves to it (fast-forward only, never a merge).
-  3. Installs any new or changed packages into .venv (uv sync).
+  3. Installs any new or changed packages into .venv (uv sync, checking HTTPS against the Windows
+     certificate store, as the browser does: antivirus such as Norton re-signs HTTPS traffic).
   4. Runs the tests. If any fail, goes back to the version it started from and says so.
   5. Tells you to restart Claude Desktop, which loads the new version.
 
@@ -72,8 +73,8 @@ Write-Host ""
 Write-Host "New in this version:"
 git log --oneline "$before..$after"
 
-# 3. Packages, into .venv only.
-uv sync
+# 3. Packages, into .venv only. --system-certs: trust what Windows trusts (Norton re-signs HTTPS).
+uv sync --system-certs
 Run "uv sync"
 
 # 4. Tests. A version that fails them doesn't stay.
@@ -83,7 +84,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "The tests failed, so this computer goes back to $($before.Substring(0, 7))." -ForegroundColor Red
     # Safe here: step 1 made sure nothing tracked was edited on this computer.
     git reset --hard $before
-    uv sync
+    uv sync --system-certs
     Fail "Nothing was updated. Tell the developer which tests failed (shown above)."
 }
 

@@ -210,3 +210,36 @@ def test_http_errors_carry_lightspeed_message(client_with_valid_token, fake_api)
     with pytest.raises(ApiError, match="Item not found") as e:
         client.get("Item/999.json")
     assert e.value.status_code == 404
+
+
+# ---- certificates: the Windows certificate store, never certifi alone ---------------------------------
+
+
+def test_https_is_checked_against_the_windows_certificate_store():
+    """Norton 360 on the store's computer re-signs HTTPS with a root only Windows trusts."""
+    import truststore
+
+    from lightspeed_mcp.client import make_api_http, make_http, tls_context
+
+    assert isinstance(tls_context(), truststore.SSLContext)
+    for client in (make_http(), make_api_http()):
+        with client:
+            assert client._transport._pool._ssl_context.__class__ is truststore.SSLContext
+
+
+def test_every_httpx_client_in_the_project_gets_the_windows_store():
+    """Every httpx.Client(...) outside the tests passes verify=tls_context()."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    files = [root / name for name in ("server.py", "bootstrap.py", "backup_lightspeed.py", "check_tools.py")]
+    files += sorted((root / "lightspeed_mcp").glob("*.py"))
+    found = 0
+    for path in files:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in ("httpx.Client", "httpx.AsyncClient"):
+                found += 1
+                verify = next((k.value for k in node.keywords if k.arg == "verify"), None)
+                assert verify is not None and ast.unparse(verify) == "tls_context()", f"{path.name}:{node.lineno}"
+    assert found == 3          # make_http, make_api_http, make_write_http

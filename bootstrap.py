@@ -31,8 +31,8 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
-from lightspeed_mcp.client import as_list, make_api_http
-from lightspeed_mcp.config import API_ROOT, AUTHORIZE_URL, HTTP_TIMEOUT_SECONDS, SCOPES, TOKEN_URL
+from lightspeed_mcp.client import as_list, make_api_http, make_http
+from lightspeed_mcp.config import API_ROOT, AUTHORIZE_URL, SCOPES, TOKEN_URL
 from lightspeed_mcp.errors import LightspeedError
 from lightspeed_mcp.secret_store import AppConfig, SecretStore
 from lightspeed_mcp.tokens import token_lock, tokens_from_response
@@ -182,7 +182,7 @@ def run(store: SecretStore) -> None:
     pasted = input("Paste the address (or just the code) and press Enter: ")
     code = extract_code(pasted, state)
 
-    with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as auth_http:
+    with make_http() as auth_http:
         tokens, body = exchange_code(auth_http, client_id, client_secret, code)
 
     # Save first, use second. Hold the token lock so a running server cannot

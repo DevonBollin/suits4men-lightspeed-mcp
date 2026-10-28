@@ -46,9 +46,14 @@ You need [uv](https://docs.astral.sh/uv/), which is already on the store compute
 Open PowerShell in the project folder:
 
 ```powershell
-uv sync
+uv sync --system-certs
 .venv\Scripts\python.exe install_claude_desktop.py
 ```
+
+`--system-certs` makes uv check HTTPS against the Windows certificate store, as
+the browser and Git do. The server and scripts do the same (`truststore`), because
+antivirus that inspects HTTPS (Norton 360 on the store's computer) re-signs every
+connection with a root certificate only Windows trusts.
 
 `install_claude_desktop.py` backs up `%APPDATA%\Claude\claude_desktop_config.json`
 and adds a `lightspeed` entry to it. Other servers and settings are left alone.
@@ -130,7 +135,7 @@ switch and per-write approval are what keep testing safe.
    ```powershell
    git clone -b stable https://github.com/DevonBollin/suits4men-lightspeed-mcp.git "C:\Suits 4 Men\Lightspeed"
    cd "C:\Suits 4 Men\Lightspeed"
-   uv sync
+   uv sync --system-certs
    .venv\Scripts\python.exe -m pytest -q
    .venv\Scripts\python.exe install_claude_desktop.py
    ```
@@ -174,7 +179,7 @@ setting. The script:
 
 1. refuses to run if files were edited on that computer;
 2. moves to the newest `stable` (fast-forward only);
-3. runs `uv sync`;
+3. runs `uv sync --system-certs`;
 4. runs the tests, and if any fail, goes back to the version it started from;
 5. tells you to restart Claude Desktop.
 

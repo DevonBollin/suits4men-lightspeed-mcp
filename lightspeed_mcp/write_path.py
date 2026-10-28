@@ -43,7 +43,7 @@ from pathlib import Path
 import httpx
 from filelock import FileLock
 
-from .client import BucketLimiter, _error_message
+from .client import BucketLimiter, _error_message, tls_context
 from .config import API_ROOT, HTTP_TIMEOUT_SECONDS, STATE_DIR, USER_AGENT
 from .errors import (ApiError, AuthError, LightspeedError, RateLimitedError, WriteBlockedError,
                      WriteOutcomeUnknown, WritesDisabledError)
@@ -342,6 +342,7 @@ def make_write_http(base_url: str, switch: WriteSwitch, transport: httpx.BaseTra
         headers={"Accept": "application/json", "User-Agent": USER_AGENT},
         event_hooks={"request": [check_request]},
         follow_redirects=False,
+        verify=tls_context(),
         transport=transport,
     )
 

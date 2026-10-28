@@ -21,11 +21,13 @@ Three things happen here:
 from __future__ import annotations
 
 import logging
+import ssl
 import threading
 import time
 from urllib.parse import urlsplit
 
 import httpx
+import truststore
 
 from .config import API_ROOT, HTTP_TIMEOUT_SECONDS, USER_AGENT
 from .errors import ApiError, AuthError, RateLimitedError, WriteBlockedError
@@ -42,6 +44,19 @@ def _refuse_non_get(request: httpx.Request) -> None:
         raise WriteBlockedError(f"Blocked a {request.method} request: the read client only sends GET.")
 
 
+def tls_context() -> ssl.SSLContext:
+    """HTTPS certificates are checked against Windows' own certificate store, the way the browser and
+    Git check them, not against certifi's bundle. Antivirus that inspects HTTPS (Norton 360 on the
+    store's computer) re-signs every connection with its own root certificate, which only Windows
+    trusts. Every httpx client in this project gets this (tests/test_client.py checks)."""
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def make_http() -> httpx.Client:
+    """A plain httpx client (for Lightspeed's token endpoint)."""
+    return httpx.Client(timeout=HTTP_TIMEOUT_SECONDS, verify=tls_context())
+
+
 def make_api_http(transport: httpx.BaseTransport | None = None) -> httpx.Client:
     """An httpx client for api.lightspeedapp.com that can only send GET requests.
 
@@ -53,6 +68,7 @@ def make_api_http(transport: httpx.BaseTransport | None = None) -> httpx.Client:
         headers={"Accept": "application/json", "User-Agent": USER_AGENT},
         event_hooks={"request": [_refuse_non_get]},
         follow_redirects=False,
+        verify=tls_context(),
         transport=transport,
     )
 

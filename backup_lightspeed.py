@@ -16,11 +16,9 @@ import argparse
 import sys
 from pathlib import Path
 
-import httpx
 
 from lightspeed_mcp import snapshots
-from lightspeed_mcp.client import LightspeedClient
-from lightspeed_mcp.config import HTTP_TIMEOUT_SECONDS
+from lightspeed_mcp.client import LightspeedClient, make_http
 from lightspeed_mcp.secret_store import SecretStore
 from lightspeed_mcp.tokens import TokenManager
 
@@ -31,7 +29,7 @@ def make_client() -> LightspeedClient:
     app = store.load_app()
     if app is None or not app.account_id:
         sys.exit("This computer has not been connected to Lightspeed yet. Run bootstrap.py first.")
-    tokens = TokenManager(store, httpx.Client(timeout=HTTP_TIMEOUT_SECONDS))
+    tokens = TokenManager(store, make_http())
     return LightspeedClient(app.account_id, tokens)
 
 

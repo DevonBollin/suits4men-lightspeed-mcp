@@ -20,15 +20,13 @@ import sys
 import threading
 from typing import Annotated
 
-import httpx
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from lightspeed_mcp import info, intake, snapshots
-from lightspeed_mcp.client import LightspeedClient
-from lightspeed_mcp.config import HTTP_TIMEOUT_SECONDS
+from lightspeed_mcp.client import LightspeedClient, make_http
 from lightspeed_mcp.errors import LightspeedError, NotBootstrappedError
 from lightspeed_mcp.reader import PO_STATUSES, InventoryReader
 from lightspeed_mcp.secret_store import SecretStore
@@ -82,7 +80,7 @@ def reader() -> InventoryReader:
             app = store.load_app()
             if app is None or not app.account_id:
                 raise NotBootstrappedError("This computer has not been connected to Lightspeed yet.")
-            tokens = TokenManager(store, httpx.Client(timeout=HTTP_TIMEOUT_SECONDS))
+            tokens = TokenManager(store, make_http())
             _reader = InventoryReader(LightspeedClient(app.account_id, tokens))
         return _reader
 
