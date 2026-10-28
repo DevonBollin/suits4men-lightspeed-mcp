@@ -187,11 +187,12 @@ NEW_VENDOR = Route("POST", re.compile(r"Vendor\.json"), frozenset({"name", "acco
 NEW_BRAND = Route("POST", re.compile(r"Manufacturer\.json"), frozenset({"name"}))
 # A new, empty purchase order (lines are added separately; the docs don't allow lines in this POST).
 NEW_ORDER = Route("POST", re.compile(r"Order\.json"),
-                  frozenset({"vendorID", "shopID", "refNum", "shipCost", "otherCost"}))
-# A PO's own fields. orderedDate moves it to Ordered, receivedDate to Check In. Never `complete`
+                  frozenset({"vendorID", "shopID", "refNum", "shipCost", "otherCost", "stockInstructions"}))
+# A PO's own fields. orderedDate moves it to Ordered, receivedDate to Check In. stockInstructions (the
+# note for receiving staff) holds the breakdown of the document's incidentals. Never `complete`
 # or `archived`: finishing a PO stays a click in Lightspeed, after Add Received To Inventory.
 ORDER_HEADER = Route("PUT", re.compile(r"Order/\d+\.json"),
-                     frozenset({"refNum", "shipCost", "otherCost", "orderedDate", "receivedDate"}))
+                     frozenset({"refNum", "shipCost", "otherCost", "stockInstructions", "orderedDate", "receivedDate"}))
 # A line's quantity and unit cost (price = originalPrice = the invoice's unit cost; Lightspeed
 # spreads shipping into price later, by the PO's own setting).
 ORDER_LINE_EDIT = Route("PUT", re.compile(r"OrderLine/\d+\.json"), frozenset({"quantity", "price", "originalPrice"}))

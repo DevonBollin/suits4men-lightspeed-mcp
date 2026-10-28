@@ -69,10 +69,9 @@ DRY_RUNS = [
         {"color": "Midnight Blue", "size": "58R", "fit": "Slim", "custom_sku": "013473"}]}),
     # One of the 56 items without a custom SKU (2321 got 013471 in the first real write).
     ("update_item_fields", {"item_id": 2322, "custom_sku": "013474"}),
-    # Open PO 853 (San Malone).
-    ("add_po_lines", {"order_id": 853, "lines": [{"item_id": 1345, "quantity": 1}]}),
-    ("receive_po_lines", {"order_id": 853, "lines": [{"order_line_id": 2684, "quantity": 1},
-                                                     {"order_line_id": 2692, "quantity": 3}]}),
+    # Open PO 847 (vendor 89; one line, 2632, nothing received). 853 was finished in Lightspeed on 2026-10-27.
+    ("add_po_lines", {"order_id": 847, "lines": [{"item_id": 1345, "quantity": 1}]}),
+    ("receive_po_lines", {"order_id": 847, "lines": [{"order_line_id": 2632, "quantity": 2}]}),
     # Item 2335 "Caravelli Burgundy 54L Classic" is not in matrix 7, where it belongs (2321 was moved in the
     # third real write).
     ("move_items_into_matrix", {"matrix_id": 7, "items": [{"item_id": 2335, "color": "Burgundy", "size": "54L",
@@ -84,10 +83,13 @@ DRY_RUNS = [
     # A shirt outside any matrix, like item 1468 "Premium Dress Shirts" (Christopher Lena, vendor 11).
     ("create_items", {"items": [{"description": "Dress Shirt White 15.5 32/33", "category_id": 118, "vendor_id": 11,
                                  "cost": 15, "price": 59.5}]}),
-    ("create_purchase_order", {"vendor_id": 1, "ref_num": "112500", "ship_cost": 58.82}),
-    ("update_purchase_order", {"order_id": 853, "ordered_date": "2026-10-20"}),
-    ("update_po_lines", {"order_id": 853, "lines": [{"order_line_id": 2695, "quantity": 2}]}),
-    ("remove_po_lines", {"order_id": 853, "order_line_ids": [2695]}),
+    ("create_purchase_order", {"vendor_id": 1, "ref_num": "112500", "incidentals": [
+        {"label": "Freight", "amount": 58.82}, {"label": "Hangers", "amount": 6}, {"label": "Credit", "amount": -10}]}),
+    # Its shipping 21.85 and other 2.50, itemized: only the breakdown note changes.
+    ("update_purchase_order", {"order_id": 847, "incidentals": [{"label": "Freight", "amount": 21.85},
+                                                               {"label": "Handling", "amount": 2.5}]}),
+    ("update_po_lines", {"order_id": 847, "lines": [{"order_line_id": 2632, "quantity": 5}]}),
+    ("remove_po_lines", {"order_id": 847, "order_line_ids": [2632]}),
     ("set_vendor_numbers", {"vendor_id": 1, "items": [{"item_id": 1622, "vendor_number": "SM-CV-BEI-54R-C"}]}),
     # A made-up San Malone packing slip: an existing suit, a size matrix 7 lacks, and a new tie.
     ("intake_invoice", {"vendor_id": 1, "invoice_number": "SM-DRYRUN-1", "invoice_date": "2026-10-24",

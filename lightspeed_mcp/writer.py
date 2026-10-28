@@ -182,6 +182,51 @@ def iso_date(value, what: str) -> str:
     return text
 
 
+# Incidentals whose label says they are freight go to the PO's Shipping, which Lightspeed spreads onto
+# the items' cost at check-in (live: PO 219). The rest go to Other.
+SHIPPING_WORDS = re.compile(r"\b(freight|shipping|ship|delivery|postage|courier|ups|fedex|usps|dhl)\b", re.IGNORECASE)
+INCIDENTALS_PREFIX = "Incidentals: "
+MAX_INSTRUCTIONS_LENGTH = 255
+
+
+def incidental_totals(entries: list[dict]) -> tuple[str, str, str]:
+    """Labeled extra charges on a document (freight, handling, hangers, a credit ...) as the PO's Shipping
+    and Other cost, plus the line that records the breakdown on the PO. Each entry: label, amount, and
+    kind "shipping" or "other" (by default from the label). Other may be negative (a discount or credit,
+    per Lightspeed's Order docs); Shipping may not."""
+    ship, other, parts = 0.0, 0.0, []
+    for n, entry in enumerate(entries, 1):
+        label = rules.clean(entry.get("label"))
+        if not label:
+            raise RuleViolation(f"Refused: incidental {n} needs a label, e.g. 'Freight' or 'Hangers'.")
+        if len(label) > 40 or ";" in label:
+            raise RuleViolation(f"Refused: incidental label '{label}' (at most 40 characters, no ';').")
+        kind = rules.clean(entry.get("kind")).lower() or ("shipping" if SHIPPING_WORDS.search(label) else "other")
+        if kind not in ("shipping", "other"):
+            raise RuleViolation(f"Refused: incidental '{label}': kind is 'shipping' or 'other', not '{entry.get('kind')}'.")
+        amount = float(signed_money(entry.get("amount"), f"incidental '{label}'"))
+        if amount == 0:
+            raise RuleViolation(f"Refused: incidental '{label}' is 0.")
+        if kind == "shipping" and amount < 0:
+            raise RuleViolation(f"Refused: incidental '{label}' is a credit; credits go under other costs (kind 'other').")
+        if kind == "shipping":
+            ship += amount
+        else:
+            other += amount
+        parts.append(f"{label} {amount:.2f}" + (" (shipping)" if kind == "shipping" else ""))
+    return f"{round(ship, 2):.2f}", f"{round(other, 2):.2f}", INCIDENTALS_PREFIX + "; ".join(parts)
+
+
+def with_incidentals_note(current: str | None, note: str) -> str:
+    """A PO's stockInstructions with the incidentals line replaced; any other instructions on it are kept."""
+    kept = [line for line in (current or "").splitlines() if line.strip() and not line.startswith(INCIDENTALS_PREFIX)]
+    text = "\n".join(kept + [note])
+    if len(text) > MAX_INSTRUCTIONS_LENGTH:
+        raise RuleViolation(f"Refused: the PO's instructions with the incidentals would be {len(text)} characters; "
+                            f"keep it under {MAX_INSTRUCTIONS_LENGTH} (shorter labels).")
+    return text
+
+
 def default_price(amount: str) -> dict:
     """The Prices block for a Default price only. MSRP and Online are never sent."""
     return {"ItemPrice": [{"amount": amount, "useTypeID": "1", "useType": "Default"}]}
@@ -1363,7 +1408,39 @@ class InventoryWriter:
             raise RuleViolation(f"Refused: the account has {len(shops)} shops readable; this tool expects exactly one.")
         return shops[0]
 
-    def _new_order(self, vendor_id, ref_num, ship_cost=None, other_cost=None) -> tuple[dict, str, list[str]]:
+    @staticmethod
+    def _order_costs(ship_cost, other_cost, incidentals: list[dict] | None,
+                     order: dict | None = None) -> tuple[dict, list[str]]:
+        """A PO's cost fields, from either the two totals or labeled incidentals (whose breakdown also goes in
+        the PO's stockInstructions, the note its receiving staff see), and summary parts. For a new PO (no
+        `order`) both costs are always sent; for an existing one only what changes."""
+        fields: dict = {}
+        if incidentals:
+            if ship_cost is not None or other_cost is not None:
+                raise RuleViolation("Refused: give either ship_cost / other_cost or incidentals, not both.")
+            ship_text, other_text, note = incidental_totals(incidentals)
+            fields = {"shipCost": ship_text, "otherCost": other_text,
+                      "stockInstructions": with_incidentals_note(fmt.text((order or {}).get("stockInstructions")), note)}
+        else:
+            if order is None or ship_cost is not None:
+                fields["shipCost"] = money_or_zero(ship_cost, "shipping cost")
+            if order is None or other_cost is not None:  # negative: a discount or credit
+                fields["otherCost"] = "0.00" if other_cost in (None, "") else signed_money(other_cost, "other cost")
+        if order is None:
+            parts = [f"shipping {fields['shipCost']}", f"other costs {fields['otherCost']}"]
+            return fields, parts + ([fields["stockInstructions"]] if "stockInstructions" in fields else [])
+        changed, parts = {}, []
+        for key, label in (("shipCost", "shipping"), ("otherCost", "other costs")):
+            if key in fields and abs(float(fields[key]) - (fmt.number(order.get(key)) or 0)) > 0.001:
+                changed[key] = fields[key]
+                parts.append(f"{label} {fmt.number(order.get(key)) or 0:.2f} -> {fields[key]}")
+        if "stockInstructions" in fields and fields["stockInstructions"] != (fmt.text(order.get("stockInstructions")) or ""):
+            changed["stockInstructions"] = fields["stockInstructions"]
+            parts.append(fields["stockInstructions"].splitlines()[-1])
+        return changed, parts
+
+    def _new_order(self, vendor_id, ref_num, ship_cost=None, other_cost=None,
+                   incidentals: list[dict] | None = None) -> tuple[dict, str, list[str]]:
         """The POST Order.json body for a new, empty PO; the vendor's name; summary parts."""
         vendor = self._active_vendor(vendor_id)
         ref = rules.clean(ref_num)
@@ -1377,16 +1454,15 @@ class InventoryWriter:
         if same:
             raise RuleViolation(f"Refused: {fmt.text(vendor.get('name'))} reference {ref} is already purchase order "
                                 f"{same[0].get('orderID')}. Use that PO instead of making a second one.")
-        body = {"vendorID": str(vendor.get("vendorID")), "shopID": self._single_shop(), "refNum": ref,
-                "shipCost": money_or_zero(ship_cost, "shipping cost"), "otherCost": money_or_zero(other_cost, "other cost")}
-        parts = [f"shipping {body['shipCost']}", f"other costs {body['otherCost']}"]
+        costs, parts = self._order_costs(ship_cost, other_cost, incidentals)
+        body = {"vendorID": str(vendor.get("vendorID")), "shopID": self._single_shop(), "refNum": ref, **costs}
         return body, fmt.text(vendor.get("name")) or "", parts
 
     def create_purchase_order(self, vendor_id: int, ref_num: str, ship_cost: float | None = None,
                               other_cost: float | None = None, dry_run: bool = True,
-                              confirm_code: str | None = None) -> dict:
+                              confirm_code: str | None = None, incidentals: list[dict] | None = None) -> dict:
         def build() -> Plan:
-            body, vendor_name, parts = self._new_order(vendor_id, ref_num, ship_cost, other_cost)
+            body, vendor_name, parts = self._new_order(vendor_id, ref_num, ship_cost, other_cost, incidentals)
             summary = (f"Create a new, empty purchase order for {vendor_name}, reference {body['refNum']}, "
                        f"{', '.join(parts)}. Add its lines with add_po_lines. Lightspeed only lets a PO be marked "
                        "ordered or received once it has lines.")
@@ -1440,7 +1516,7 @@ class InventoryWriter:
     def update_purchase_order(self, order_id: int, ref_num: str | None = None, ship_cost: float | None = None,
                               other_cost: float | None = None, ordered_date: str | None = None,
                               received_date: str | None = None, dry_run: bool = True,
-                              confirm_code: str | None = None) -> dict:
+                              confirm_code: str | None = None, incidentals: list[dict] | None = None) -> dict:
         def build() -> Plan:
             order = self._open_order(order_id)
             body: dict = {}
@@ -1457,13 +1533,9 @@ class InventoryWriter:
                                             "for this vendor.")
                     body["refNum"] = ref
                     changes.append(f"reference {fmt.text(order.get('refNum')) or '-'} -> {ref}")
-            for value, key, label, convert in ((ship_cost, "shipCost", "shipping", money_or_zero),
-                                               (other_cost, "otherCost", "other costs", signed_money)):
-                if value is not None:
-                    text = convert(value, label)
-                    if abs(float(text) - (fmt.number(order.get(key)) or 0)) > 0.001:
-                        body[key] = text
-                        changes.append(f"{label} {fmt.number(order.get(key)) or 0:.2f} -> {text}")
+            costs, cost_changes = self._order_costs(ship_cost, other_cost, incidentals, order)
+            body.update(costs)
+            changes += cost_changes
             for value, key, label in ((ordered_date, "orderedDate", "ordered date (status Ordered)"),
                                       (received_date, "receivedDate", "received date (status Check In)")):
                 if value is not None:
@@ -1587,9 +1659,10 @@ class InventoryWriter:
         confirm_code: str | None = None,
         new_vendor: dict | None = None,
         allow_similar_names: bool = False,
+        incidentals: list[dict] | None = None,
     ) -> dict:
         """See intake.py for how lines are matched. The plan, in order: a new vendor and brands if the
-        document has them, the PO (new, or the one given),
+        document has them, the PO (new, or the one given, with the document's shipping and other costs),
         new items, vendor numbers, PO lines with what arrived, and the PO's dates (ordered = the
         invoice date, received = today, which puts it in Check In)."""
 
@@ -1657,12 +1730,10 @@ class InventoryWriter:
                     ref = rules.clean(invoice_number)
                     if not ref:
                         raise RuleViolation("Refused: give the invoice or order number (invoice_number).")
-                    body = {"vendorID": vendor_ref, "shopID": self._single_shop(), "refNum": ref,
-                            "shipCost": money_or_zero(ship_cost, "shipping cost"),
-                            "otherCost": money_or_zero(other_cost, "other cost")}
-                    parts = [f"shipping {body['shipCost']}", f"other costs {body['otherCost']}"]
+                    costs, parts = self._order_costs(ship_cost, other_cost, incidentals)
+                    body = {"vendorID": vendor_ref, "shopID": self._single_shop(), "refNum": ref, **costs}
                 else:
-                    body, _, parts = self._new_order(vendor_id, invoice_number, ship_cost, other_cost)
+                    body, _, parts = self._new_order(vendor_id, invoice_number, ship_cost, other_cost, incidentals)
                 requests.append(PlannedRequest(f"create a PO for {vendor_name}, ref {body['refNum']} ({', '.join(parts)})",
                                                "POST", "Order.json", body, creates="order"))
                 order, order_ref, on_po = {}, new_ref("order"), []
@@ -1821,12 +1892,7 @@ class InventoryWriter:
             # 5. The PO's own fields: costs on an existing PO, ordered date, Check In.
             header: dict = {}
             if order_id is not None:
-                for value, key, label, convert in ((ship_cost, "shipCost", "shipping", money_or_zero),
-                                                   (other_cost, "otherCost", "other costs", signed_money)):
-                    if value is not None:
-                        text = convert(value, label)
-                        if abs(float(text) - (fmt.number(order.get(key)) or 0)) > 0.001:
-                            header[key] = text
+                header, _ = self._order_costs(ship_cost, other_cost, incidentals, order)
             if invoice_day and not fmt.date(order.get("orderedDate")):
                 header["orderedDate"] = invoice_day
             if mark_received and not fmt.date(order.get("receivedDate")):

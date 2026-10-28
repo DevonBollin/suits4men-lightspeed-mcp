@@ -254,8 +254,8 @@ across several entries and switched over atomically. See
 | `archive_item` | `DELETE Item/<id>.json` for **one** item with stock exactly 0 and on no open PO (Lightspeed archives on DELETE) | Archive a matrix, or an item with stock |
 | `archive_items` | The same `DELETE` for up to 100 items in one approval, each with `archive_item`'s checks | Archive a matrix; (until a first archive is checked) more than one item |
 | `create_items` | `POST Item.json` per new item outside any matrix (shirts, ties, shoes), own SKU, cost, price | Create pants (they go in a pants matrix) |
-| `create_purchase_order` | `POST Order.json`: a new, empty PO with the vendor's reference and shipping/other costs | Reuse a reference the vendor already has on a PO |
-| `update_purchase_order` | `PUT Order/<id>.json`: reference, costs, ordered date (→ Ordered), received date (→ Check In) | Mark a PO finished or archive it |
+| `create_purchase_order` | `POST Order.json`: a new, empty PO with the vendor's reference and shipping/other costs, or itemized incidentals | Reuse a reference the vendor already has on a PO |
+| `update_purchase_order` | `PUT Order/<id>.json`: reference, costs or incidentals, ordered date (→ Ordered), received date (→ Check In) | Mark a PO finished or archive it |
 | `update_po_lines` | `PUT OrderLine/<id>.json`: quantity ordered and/or unit cost | Go below what was received, or re-cost what was checked in |
 | `remove_po_lines` | `DELETE OrderLine/<id>.json` for lines with nothing received (Lightspeed deletes them for good; logged first) | Remove a line with anything received |
 | `set_vendor_numbers` | `PUT Item/<id>.json` with the vendor's own number or style code (Lightspeed's Vendor ID), keeping the item's other vendor numbers | Give an item a second number for the same vendor |
@@ -312,6 +312,17 @@ Unarchiving may be possible but is not built.
 5. In Lightspeed, open the PO, check the received quantities against the
    goods, click **Add Received To Inventory**, then **Finished**. Lightspeed's API
    has no call for that step, so stock only changes when you click it.
+
+Extra charges on the document (freight, handling, hangers, fees, a credit) go
+in `incidentals`, one by one: `{"label": "Hangers", "amount": 6}`. Lightspeed
+has two cost fields per PO, so they are added up: freight-like labels
+(freight, shipping, delivery, postage) into **Shipping**, the rest into
+**Other**, where a negative amount is a discount or credit (`"kind"` overrides
+the choice). The breakdown, e.g. `Incidentals: Freight 25.00 (shipping);
+Hangers 6.00; Credit -10.00`, goes in the PO's stock instructions (the note
+receiving staff see), next to any other instructions on it. At check-in
+Lightspeed spreads Shipping onto the items' cost by the PO's own method (seen on
+PO 219); whether it spreads Other too is not confirmed.
 
 A vendor Lightspeed doesn't have yet (`new_vendor`), or a new brand on a new
 item (`new_brand`), is created first in the same plan, so a new supplier

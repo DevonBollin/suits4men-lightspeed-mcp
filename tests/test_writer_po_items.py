@@ -609,3 +609,59 @@ def test_matrix_update_refuses_another_matrixs_name(writer, reads):
     reads.data["ItemMatrix"][1]["description"] = "Giorgio Fiorelli Suit"     # matrix 8
     with pytest.raises(RuleViolation, match="already called"):
         writer.update_matrix(7, description="Giorgio Fiorelli Suit")
+
+
+# ---- incidentals: freight, handling, hangers, credits ----------------------------------------------------------
+
+INCIDENTALS = [{"label": "Freight", "amount": 25}, {"label": "Handling", "amount": 4},
+               {"label": "Hangers", "amount": 6.5}, {"label": "Credit", "amount": -10}]
+
+
+def test_incidentals_add_up_into_shipping_and_other_with_the_breakdown_on_the_po(writer):
+    result = writer.create_purchase_order(vendor_id=1, ref_num="INV-5522", incidentals=INCIDENTALS)
+    body = result["requests"][0]["body"]
+    assert body["shipCost"] == "25.00" and body["otherCost"] == "0.50"        # 4 + 6.50 - 10
+    assert body["stockInstructions"] == ("Incidentals: Freight 25.00 (shipping); Handling 4.00; Hangers 6.50; "
+                                         "Credit -10.00")
+
+
+def test_kind_can_be_given_and_a_discount_is_allowed_on_a_new_po(writer):
+    body = writer.create_purchase_order(vendor_id=1, ref_num="INV-5523", incidentals=[
+        {"label": "Fuel surcharge", "amount": 3, "kind": "shipping"}])["requests"][0]["body"]
+    assert body["shipCost"] == "3.00" and body["otherCost"] == "0.00"
+    body = writer.create_purchase_order(vendor_id=1, ref_num="INV-5524", other_cost=-15)["requests"][0]["body"]
+    assert body["otherCost"] == "-15.00" and "stockInstructions" not in body
+
+
+def test_intake_takes_incidentals(writer):
+    result = writer.intake_invoice(**{**INVOICE, "ship_cost": None, "incidentals": INCIDENTALS})
+    order = result["requests"][0]
+    assert order["path"].endswith("/Order.json")
+    assert order["body"]["shipCost"] == "25.00" and order["body"]["otherCost"] == "0.50"
+    assert order["body"]["stockInstructions"].startswith("Incidentals: Freight 25.00 (shipping)")
+
+
+def test_updating_incidentals_replaces_only_their_line(writer, reads):
+    reads.data["Order"][0].update(shipCost="10", otherCost="0",
+                                  stockInstructions="Count the vests twice\nIncidentals: Freight 10.00 (shipping)")
+    result = writer.update_purchase_order(853, incidentals=[{"label": "Freight", "amount": 12},
+                                                           {"label": "Hangers", "amount": 6}])
+    body = result["requests"][0]["body"]
+    assert body == {"shipCost": "12.00", "otherCost": "6.00",
+                    "stockInstructions": "Count the vests twice\nIncidentals: Freight 12.00 (shipping); Hangers 6.00"}
+    assert "shipping 10.00 -> 12.00" in result["summary"]
+
+
+@pytest.mark.parametrize("kwargs, message", [
+    (dict(incidentals=[{"label": "Freight", "amount": 5}], ship_cost=5), "not both"),
+    (dict(incidentals=[{"label": "", "amount": 5}]), "needs a label"),
+    (dict(incidentals=[{"label": "Freight", "amount": 0}]), "is 0"),
+    (dict(incidentals=[{"label": "Freight refund", "amount": -5}]), "credits go under other"),
+    (dict(incidentals=[{"label": "Hangers", "amount": 5, "kind": "misc"}]), "kind is 'shipping' or 'other'"),
+    (dict(incidentals=[{"label": "Hangers; boxes", "amount": 5}]), "no ';'"),
+    (dict(incidentals=[{"label": "Hangers", "amount": "five"}]), "not a number"),
+])
+def test_incidental_rules(writer, fake_api, kwargs, message):
+    with pytest.raises(RuleViolation, match=message):
+        writer.create_purchase_order(vendor_id=1, ref_num="INV-5525", **kwargs)
+    assert fake_api.requests == []

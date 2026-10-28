@@ -740,20 +740,30 @@ def create_items(
     return run(lambda w: w.create_items([i.model_dump() for i in items], dry_run, confirm_code), writer)
 
 
+class Incidental(BaseModel):
+    label: Annotated[str, Field(description="What the charge is, as on the document, e.g. 'Freight', 'Handling', 'Hangers', 'Credit'.")]
+    amount: Annotated[float, Field(description="The amount; negative for a discount or credit.")]
+    kind: Annotated[str | None, Field(description="'shipping' (spread onto the items' cost at check-in) or 'other'. Empty: 'shipping' when the label says freight, shipping, delivery or postage, else 'other'.")] = None
+
+
+Incidentals = Annotated[list[Incidental] | None, Field(description="Instead of ship_cost / other_cost: the document's extra charges one by one (freight, handling, hangers, fees, credits). They are added up into the PO's Shipping and Other cost, and the breakdown is kept on the PO (its stock instructions).")]
+
+
 @write_tool
 def create_purchase_order(
     vendor_id: Annotated[int, Field(description="The vendor (list_vendors).")],
     ref_num: Annotated[str, Field(description="The vendor's invoice or order number.")],
     ship_cost: Annotated[float | None, Field(description="Shipping on the invoice.")] = None,
-    other_cost: Annotated[float | None, Field(description="Other charges on the invoice.")] = None,
+    other_cost: Annotated[float | None, Field(description="Other charges on the invoice (negative = a discount).")] = None,
+    incidentals: Incidentals = None,
     dry_run: DryRun = True,
     confirm_code: ConfirmCode = None,
 ) -> str:
     """Create a new, empty purchase order. Refuses a reference number this vendor already has on a PO
     (so one invoice can't be entered twice). Lines are added with add_po_lines; for a whole invoice,
     intake_invoice does everything in one approval."""
-    return run(lambda w: w.create_purchase_order(vendor_id, ref_num, ship_cost, other_cost, dry_run, confirm_code),
-               writer)
+    return run(lambda w: w.create_purchase_order(vendor_id, ref_num, ship_cost, other_cost, dry_run, confirm_code,
+                                                 [i.model_dump() for i in incidentals or []]), writer)
 
 
 @write_tool
@@ -764,14 +774,17 @@ def update_purchase_order(
     other_cost: Annotated[float | None, Field(description="New other costs (negative = a discount).")] = None,
     ordered_date: Annotated[str | None, Field(description="YYYY-MM-DD; puts the PO in Ordered.")] = None,
     received_date: Annotated[str | None, Field(description="YYYY-MM-DD; puts the PO in Check In.")] = None,
+    incidentals: Incidentals = None,
     dry_run: DryRun = True,
     confirm_code: ConfirmCode = None,
 ) -> str:
-    """Change a PO's reference, shipping or other costs, or its ordered / received date (which move it to
-    Ordered / Check In; Lightspeed needs at least one line for that). Never marks it finished: that and
-    Add Received To Inventory stay clicks in Lightspeed."""
+    """Change a PO's reference, shipping or other costs (or its itemized incidentals, which replace the
+    breakdown kept on it), or its ordered / received date (which move it to Ordered / Check In;
+    Lightspeed needs at least one line for that). Never marks it finished: that and Add Received To
+    Inventory stay clicks in Lightspeed."""
     return run(lambda w: w.update_purchase_order(order_id, ref_num, ship_cost, other_cost, ordered_date,
-                                                 received_date, dry_run, confirm_code), writer)
+                                                 received_date, dry_run, confirm_code,
+                                                 [i.model_dump() for i in incidentals or []]), writer)
 
 
 class PoLineEdit(BaseModel):
@@ -834,7 +847,8 @@ def intake_invoice(
     allow_similar_names: Annotated[bool, Field(description="Only after the user confirms it: create a new vendor or brand even though an existing one has a similar name.")] = False,
     invoice_date: Annotated[str | None, Field(description="YYYY-MM-DD, the document's date (the PO's ordered date).")] = None,
     ship_cost: Annotated[float | None, Field(description="Shipping on the document.")] = None,
-    other_cost: Annotated[float | None, Field(description="Other charges on the document.")] = None,
+    other_cost: Annotated[float | None, Field(description="Other charges on the document (negative = a discount).")] = None,
+    incidentals: Incidentals = None,
     order_id: Annotated[int | None, Field(description="An existing unfinished PO this document belongs to; empty = create one.")] = None,
     mark_received: Annotated[bool, Field(description="True (default): the goods are here; mark each line received and put the PO in Check In.")] = True,
     save_vendor_numbers: Annotated[bool, Field(description="Save each line's vendor number on its item, unless the item already has one for this vendor. Shared style codes are saved on every item they're printed for.")] = True,
@@ -846,6 +860,7 @@ def intake_invoice(
     order_id; a reference already used for this vendor is refused), create missing items (variants
     in a matrix with their price, or standalone items), save vendor numbers, add or update the PO
     lines at the invoice's unit cost with what was received, and set the PO's ordered date and Check In.
+    The document's extra charges (freight, handling, hangers, credits) go in incidentals, one by one.
     Stock changes only when the user clicks Add Received To Inventory on the PO in Lightspeed (no API
     call exists for it): always tell them. A vendor (new_vendor) or brand (new_item.new_brand) that
     Lightspeed doesn't have yet is created first in the same plan; exact duplicates are refused, and
@@ -853,7 +868,8 @@ def intake_invoice(
     return run(lambda w: w.intake_invoice(vendor_id, invoice_number, [l.model_dump() for l in lines], invoice_date,
                                           ship_cost, other_cost, order_id, mark_received, save_vendor_numbers,
                                           dry_run, confirm_code,
-                                          new_vendor.model_dump() if new_vendor else None, allow_similar_names),
+                                          new_vendor.model_dump() if new_vendor else None, allow_similar_names,
+                                          [i.model_dump() for i in incidentals or []]),
                writer)
 
 
