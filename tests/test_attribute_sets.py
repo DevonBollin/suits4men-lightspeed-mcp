@@ -16,6 +16,7 @@ from lightspeed_mcp import rules
 from lightspeed_mcp.reader import InventoryReader
 from lightspeed_mcp.rules import RuleViolation
 from lightspeed_mcp.writer import InventoryWriter
+from tests.conftest import turn_on
 from tests.test_writer import CannedReads
 
 
@@ -84,6 +85,22 @@ def test_create_the_shoe_set(writer, no_shoe_set):
                                "attributeName3": "Width"}
     assert "matrix type MT2: create_matrix uses it for shoes" in result["summary"]
     assert any("contradictory" in w for w in result["warnings"])
+
+
+def test_a_new_set_is_logged_with_its_id_and_seen_at_once(writer, fake_api, write_log, write_switch, no_shoe_set,
+                                                          monkeypatch):
+    assert "6" not in writer.reader.attribute_sets()                  # cached without the new set
+    result = writer.create_attribute_set("Color/Size/Width", ["Color", "Size", "Width"])
+    fake_api.handler = lambda request: httpx.Response(200, json={"ItemAttributeSet": {
+        "itemAttributeSetID": "6", "name": "Color/Size/Width", "attributeName1": "Color", "attributeName2": "Size",
+        "attributeName3": "Width", "system": "false", "archived": "false"}})
+    turn_on(write_switch)
+    done = writer.create_attribute_set("Color/Size/Width", ["Color", "Size", "Width"], dry_run=False,
+                                       confirm_code=result["confirm_code"])
+    assert done["done"][0]["affected_ids"] == {"ItemAttributeSet": {"itemAttributeSetID": "6"}}
+    assert write_log.entries()[-1]["affected_ids"] == {"ItemAttributeSet": {"itemAttributeSetID": "6"}}
+    monkeypatch.undo()                                                # Lightspeed now has set 6
+    assert "6" in writer.reader.attribute_sets()                      # the write cleared the cache
 
 
 def test_a_set_of_no_matrix_type_says_so(writer):

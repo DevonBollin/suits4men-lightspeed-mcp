@@ -558,13 +558,28 @@ def test_matrix_rename_previews_every_item(writer):
     assert "all 3 item(s)" in renames and "-> 'Caravelli Suit Black 42R Slim'" in renames
 
 
-def test_matrix_price_keeps_other_levels_and_shows_what_items_sell_at(writer, reads):
-    reads.data["ItemMatrix"][0]["Prices"]["ItemPrice"].append({"amount": "995", "useTypeID": "2", "useType": "MSRP"})
+def test_matrix_price_keeps_other_levels_and_shows_every_value_items_would_get(writer, reads, three_levels):
+    reads.data["ItemMatrix"][0]["Prices"]["ItemPrice"] += [{"amount": "995", "useTypeID": "2", "useType": "MSRP"},
+                                                           {"amount": "0", "useTypeID": "3", "useType": "Online"}]
     result = writer.update_matrix(7, price=599.95)
     assert result["requests"][0]["body"] == {"Prices": {"ItemPrice": [
         {"amount": "599.95", "useTypeID": "1", "useType": "Default"},
-        {"amount": "995", "useTypeID": "2", "useType": "MSRP"}]}}
-    assert any("3 at 599.95" in w for w in result["warnings"])
+        {"amount": "995", "useTypeID": "2", "useType": "MSRP"},
+        {"amount": "0", "useTypeID": "3", "useType": "Online"}]}}
+    warning = next(w for w in result["warnings"] if "Reset Items To Defaults" in w)
+    assert "Default 599.95 (0 of 3 differ today: 3 at 599.95)" in warning
+    assert "MSRP 995.00 (3 of 3 differ today: 3 at 695.00)" in warning
+    assert "Online 0.00 (3 of 3 differ today: 3 at 549.95)" in warning
+    assert "Every price level is sent" in warning and "default cost" not in warning
+
+
+def test_matrix_cost_warning_names_only_the_cost(writer, reads):
+    reads.data["Item"][0]["defaultCost"] = "70"
+    result = writer.update_matrix(7, default_cost=70)
+    assert result["requests"][0]["body"] == {"defaultCost": "70.00"}
+    warning = next(w for w in result["warnings"] if "Reset Items To Defaults" in w)
+    assert "default cost 70.00 (" in warning and "differ today" in warning
+    assert "MSRP" not in warning and "Every price level is sent" not in warning
 
 
 def test_matrix_category_change_counts_affected_items(writer):

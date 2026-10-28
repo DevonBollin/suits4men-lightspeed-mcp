@@ -69,7 +69,7 @@ class PlannedRequest:
 # Which ID field a created record's ID is read from, by record type.
 CREATED_ID_FIELDS = {"Order": "orderID", "Item": "itemID", "OrderLine": "orderLineID", "ItemMatrix": "itemMatrixID",
                      "Vendor": "vendorID", "Manufacturer": "manufacturerID", "Category": "categoryID",
-                     "InventoryCount": "inventoryCountID"}
+                     "InventoryCount": "inventoryCountID", "ItemAttributeSet": "itemAttributeSetID"}
 
 
 def new_ref(name: str) -> str:
@@ -293,6 +293,13 @@ class InventoryWriter:
         return fmt.prune(result)
 
     def _execute(self, plan: Plan, code: str) -> dict:
+        try:
+            return self._send_plan(plan, code)
+        finally:
+            # Attribute sets, categories and vendor names are cached for minutes; a write may have changed them.
+            self.reader.forget_cached()
+
+    def _send_plan(self, plan: Plan, code: str) -> dict:
         done = []
         created: dict[str, str] = {}  # "{new:...}" name -> the ID Lightspeed gave the new record
         for index, r in enumerate(plan.requests):
@@ -1959,16 +1966,30 @@ class InventoryWriter:
                                                     *kept]}
                     changes.append(f"Default price {fmt.prices(matrix).get('Default')} -> {new_price}")
             if "defaultCost" in body or "Prices" in body:
-                selling: dict[float, int] = {}
-                for c in children:
-                    p = fmt.prices(c).get("Default")
-                    if p is not None:
-                        selling[p] = selling.get(p, 0) + 1
-                spread = ", ".join(f"{count} at {p:.2f}" for p, count in sorted(selling.items(), key=lambda s: -s[1]))
-                warnings.append("Lightspeed's help describes a matrix's price and cost as defaults for new items "
+                # Every value sent, beside what the items hold today: a cascade would set all of them, not only
+                # the one asked for.
+                sent = [(fmt.text(p.get("useType")) or f"useType{p.get('useTypeID')}", fmt.number(p.get("amount")),
+                         lambda c, t=fmt.text(p.get("useType")): fmt.prices(c).get(t))
+                        for p in (body.get("Prices") or {}).get("ItemPrice", [])]
+                if "defaultCost" in body:
+                    sent.append(("default cost", fmt.number(body["defaultCost"]),
+                                 lambda c: fmt.number(c.get("defaultCost"))))
+                parts = []
+                for label, value, held in sent:
+                    today: dict[float | None, int] = {}
+                    for c in children:
+                        v = held(c)
+                        today[v] = today.get(v, 0) + 1
+                    differ = sum(count for v, count in today.items() if v is None or abs(v - (value or 0)) > 0.001)
+                    spread = ", ".join(f"{count} at {v:.2f}" if v is not None else f"{count} with none"
+                                       for v, count in sorted(today.items(), key=lambda s: -s[1]))
+                    parts.append(f"{label} {value or 0:.2f} ({differ} of {n} differ today: {spread or 'no items'})")
+                warnings.append("Lightspeed's help describes a matrix's prices and cost as defaults for new items "
                                 "(existing items keep their own unless someone clicks Reset Items To Defaults). This "
-                                f"isn't documented for the API: if it did reach the items, all {n} would change. Today "
-                                f"they sell at: {spread or 'no prices'}.")
+                                "isn't documented for the API. If it did reach the items, they would get every value "
+                                "sent, not only the one changed: " + "; ".join(parts) + "."
+                                + (" Every price level is sent, because one left out might be blanked on the matrix."
+                                   if "Prices" in body else ""))
             if not body:
                 raise RuleViolation(f"Refused: nothing to change on matrix {matrix_id}.")
 

@@ -349,7 +349,7 @@ def make_write_http(base_url: str, switch: WriteSwitch, transport: httpx.BaseTra
 
 # The ID fields worth recording from a response record.
 ID_FIELDS = ("itemMatrixID", "itemID", "orderID", "orderLineID", "vendorID", "manufacturerID", "categoryID",
-             "inventoryCountID", "inventoryCountItemID", "itemShopID")
+             "inventoryCountID", "inventoryCountItemID", "itemShopID", "itemAttributeSetID")
 
 
 def affected_ids(body: dict) -> dict:

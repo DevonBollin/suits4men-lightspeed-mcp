@@ -152,6 +152,12 @@ class InventoryReader:
             self._cache[name] = (self.now() + CACHE_SECONDS, value)
         return value
 
+    def forget_cached(self) -> None:
+        """Drop every cached lookup, so the next read sees what a write just changed."""
+        with self._lock:
+            self._cache.clear()
+            self._vendor_names, self._vendor_names_since = {}, self.now()
+
     def attribute_sets(self) -> dict[str, dict]:
         def load():
             rows, _ = self.client.get_all("ItemAttributeSet.json", {"archived": "true"})

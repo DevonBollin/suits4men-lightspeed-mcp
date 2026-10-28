@@ -90,6 +90,7 @@ Expanded on 2026-10-26 to every read inventory management needs (all 9 confirmed
 | 3 | Color | Color / – / – | yes |
 | 4 | 3 Attributes | Attribute 1 / Attribute 2 / Attribute 3 | yes |
 | **5** | **Color/Size/Fit** | Color / Size / Fit | **no (the store's own)** |
+| **6** | **Color/Size/Width** | Color / Size / Width | **no** (created 2026-10-27 for shoes, MT2; see "Fourth real write") |
 
 Positions matter: the built-in "Size" set stores size in **attribute2**, not
 attribute1. `format.attribute_slots()` keeps positions for that reason. For
@@ -319,7 +320,8 @@ retried, since a write might have gone through.
 ### To confirm on the first real writes (each approved by the owner)
 
 1. ~~Status code of a successful POST/PUT (200 or 201?) and the response shape.~~ **PUT: 200**, record
-   under its key (`{"Item": {...}}`), see "First real write" below. POST still to see.
+   under its key (`{"Item": {...}}`), see "First real write" below. **POST: 200** too, record under
+   its key (`{"ItemAttributeSet": {...}}`), see "Fourth real write" below.
 2. Creating a matrix with `employee:product_cost` + `employee:inventory`, without `product_edit`.
 3. A new child sent with only a Default price: what MSRP and Online become.
 4. Whether a child's description is kept as sent.
@@ -378,6 +380,36 @@ Take a snapshot (`backup_lightspeed.py`) before and after, and compare.
   up to 100 items per call from here on (each call still needs approval).
 - Still unconfirmed for moves: what happens to the *old* matrix's attribute
   lists when an item leaves a matrix (2321 was in none).
+
+### Fourth real write: first POST, the shoe attribute set (2026-10-27 20:16, approved by the owner)
+
+The first step of the migration in `docs/inventory-structure.md` (Appendix C.2
+step 1, §13 "Immediate fixes": create `Color/Size/Width` for shoes).
+
+- `create_attribute_set`: `POST /API/V3/Account/304581/ItemAttributeSet.json` with
+  `{"name": "Color/Size/Width", "attributeName1": "Color", "attributeName2": "Size",
+  "attributeName3": "Width"}` (confirm code `811137a6a0`). **HTTP 200**, reply under
+  `ItemAttributeSet`. New set **6**, `system: false`, `archived: false`.
+- **Creating an attribute set works** with the current scopes; `employee:inventory_base`
+  (named on the docs page) isn't needed, and the docs' "only allowed names" rule
+  isn't enforced. The docs' "GET only" for this endpoint is wrong.
+- Snapshots 2026-10-27_201433 and 2026-10-27_201704 differ in exactly one record:
+  ItemAttributeSet 6 added. No item, matrix or other record changed.
+- Two tool gaps it showed (both fixed the same day):
+  - The write log's `affected_ids` came back `{"ItemAttributeSet": {}}`:
+    `write_path.ID_FIELDS` had no `itemAttributeSetID`, so the new ID wasn't recorded
+    (`CREATED_ID_FIELDS` in writer.py lacked it too). Both have it now.
+  - `list_attribute_sets` didn't show set 6 right after: the reader caches attribute
+    sets and categories for 10 minutes (`CACHE_SECONDS`), and nothing cleared the cache
+    after a write. The writer's checks read the same cache (e.g. a category made
+    moments ago, `writer.py` `reader.categories()`), so a tool run right after a
+    create could miss the new record. Now every real write ends with
+    `reader.forget_cached()` (attribute sets, categories, shops, vendor names).
+- Also fixed then: `update_matrix`'s price/cost warning named only the Default price,
+  though the PUT re-sends every level. It now lists each value sent beside what the
+  items hold today. Live for matrix 7 at 599.95: MSRP 995 differs on 235 of 400 items
+  (213 at 695, 18 at 795, …), Online 0 on all 400 (347 at 549.95, 53 at 599.95), so a
+  cascade would matter even though Default wouldn't change.
 
 ### Data findings (2026-10-26, from the snapshot)
 
@@ -650,7 +682,8 @@ set; never a built-in set (1-4); every set has Color. `rules.py` holds it
   example and by this store's set 5; scope `employee:inventory_base` (not on the
   scopes page). Fields: name, attributeName1-3, archived, system. DELETE not
   documented. **The first create/update is the test**; a 403 would mean adding a
-  scope (try `employee:inventory_base`) and re-running bootstrap.
+  scope (try `employee:inventory_base`) and re-running bootstrap. *Done 2026-10-27:
+  create works with the current scopes (set 6, "Fourth real write"); update still untested.*
 - A set used by matrices: removing an attribute is refused (a third-party
   integration reports item writes failing after a set's attribute count was
   reduced); moving Color or swapping names between slots is refused (items keep
@@ -752,8 +785,8 @@ tools the restructure needs. No real write was made.
   format, the words a matrix description names it with, and the category names
   that hold it. Accessories (belt, accessory) are the draft's provisional §4.15.
 - **Matrix types** are matched by attribute names in order, not set IDs: MT1
-  Color/Size/Fit = set 5, MT2 Color/Size/Width = a store-made set (not created
-  yet: shoe matrices are refused until it is), MT3 Color/Size = built-in 1, MT4
+  Color/Size/Fit = set 5, MT2 Color/Size/Width = a store-made set (set 6, created
+  2026-10-27; before that shoe matrices were refused), MT3 Color/Size = built-in 1, MT4
   Color = built-in 3. This replaces the owner's 2026-10-26 rule "never a built-in
   set": the draft uses them for MT3/MT4. Renaming a set's attributes changes its
   matrix type (the dry run says so).
@@ -781,4 +814,4 @@ tools the restructure needs. No real write was made.
 
 - `check_tools.py` calls every read tool over stdio against the live account (GET only, 29 calls, about 90 s).
   `check_tools.py --dry-runs` calls every write tool on real records, always with `dry_run=true`.
-- Unit tests: `.venv\Scripts\python.exe -m pytest` (711 tests).
+- Unit tests: `.venv\Scripts\python.exe -m pytest` (715 tests).
